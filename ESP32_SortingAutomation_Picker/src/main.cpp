@@ -93,13 +93,28 @@ void usToDuty(uint8_t ch, uint16_t us) {
 }
 
 void startMoveAbs(const uint16_t target[ServoCfg::NUM_JOINTS], uint16_t) {
-  for (uint8_t i = 0; i < ServoCfg::NUM_JOINTS; i++) targetUs[i] = target[i];
+  // DIPERBAIKI (bug kritis): target WAJIB dibatasi ke rentang servo SEBELUM disimpan --
+  // sebelumnya cuma currentUs yang dibatasi (baris updateTrajectory), targetUs dibiarkan
+  // bebas. Kalau target di luar rentang (misal dari offset kalibrasi terlalu besar),
+  // diff TIDAK PERNAH mencapai 0 (currentUs mentok di batas, target tetap di luar) --
+  // firmware TERUS mengira belum sampai, TERUS kirim sinyal dorong tanpa henti, servo
+  // menekan gear internal melawan batas mekanis terus-menerus -- inilah yang membuat
+  // gear MG996R aus. Constrain di sini memastikan diff BISA benar-benar mencapai 0.
+  for (uint8_t i = 0; i < ServoCfg::NUM_JOINTS; i++)
+    targetUs[i] = (uint16_t)constrain((int)target[i], (int)ServoCfg::MIN_US, (int)ServoCfg::MAX_US);
   moving = true;
   currentState = NodeState::RUNNING_OR_MOVING;
 }
 void startMoveDelta(const int16_t delta[ServoCfg::NUM_JOINTS], uint16_t durationMs) {
+  // DIPERBAIKI (bug kedua): hitung di ranah SIGNED (int32_t) dulu, BARU clamp -- kalau
+  // langsung disimpan ke uint16_t, hasil NEGATIF (currentUs kecil + delta negatif besar)
+  // akan WRAP-AROUND jadi angka besar positif (mis. -300 -> 65236), membuat constrain()
+  // di startMoveAbs() salah arah (mengira di ATAS batas, padahal harusnya DI BAWAH batas).
   uint16_t target[ServoCfg::NUM_JOINTS];
-  for (uint8_t i = 0; i < ServoCfg::NUM_JOINTS; i++) target[i] = currentUs[i] + delta[i];
+  for (uint8_t i = 0; i < ServoCfg::NUM_JOINTS; i++) {
+    int32_t raw = (int32_t)currentUs[i] + (int32_t)delta[i];
+    target[i] = (uint16_t)constrain(raw, (int32_t)ServoCfg::MIN_US, (int32_t)ServoCfg::MAX_US);
+  }
   startMoveAbs(target, durationMs);
 }
 
@@ -1097,7 +1112,12 @@ void loop() {
 
   handleSerialCommand();
 
-  if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > 5000) {
+  // DIPERBAIKI: timeout diperlebar dari 5000ms -- watchdog cuma reset saat command BARU
+  // dikirim, TIDAK ikut ter-reset oleh pembacaan status. Testing manual (baca status
+  // berulang sambil menunggu progres) wajar jeda lebih dari 5 detik -- nilai lama terlalu
+  // ketat. 30 detik cukup toleran, tetap berfungsi sbg pengaman komunikasi terputus total.
+  constexpr uint32_t COMM_TIMEOUT_MS = 30000;
+  if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > COMM_TIMEOUT_MS) {
     currentState = NodeState::FAULT; faultCode = (uint16_t)FaultCode::COMM_TIMEOUT;
   }
 

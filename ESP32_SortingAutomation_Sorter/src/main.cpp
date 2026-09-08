@@ -1265,7 +1265,12 @@ void loop() {
 
   handleSerialCommand();
 
-  if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > 5000) {
+  // DIPERBAIKI: timeout diperlebar dari 5000ms -- watchdog cuma reset saat command BARU
+  // dikirim, TIDAK ikut ter-reset oleh pembacaan status. Testing manual (baca status
+  // berulang sambil menunggu progres) wajar jeda lebih dari 5 detik -- nilai lama terlalu
+  // ketat. 30 detik cukup toleran, tetap berfungsi sbg pengaman komunikasi terputus total.
+  constexpr uint32_t COMM_TIMEOUT_MS = 30000;
+  if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > COMM_TIMEOUT_MS) {
     currentState = NodeState::FAULT; faultCode = (uint16_t)FaultCode::COMM_TIMEOUT;
   }
 

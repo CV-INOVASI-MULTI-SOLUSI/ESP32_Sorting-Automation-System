@@ -48,5 +48,6 @@ enum class Cmd : uint16_t {
   RUN_FULL_CYCLE = 2,     // arg: rack_idx 0-5 -- move->push->home, chaining penuh (O8)
   MOVE_TO_RACK = 3,       // arg: rack_idx 0-5 -- manual, tanpa auto-push
   PUSH_BOX = 4,           // manual
-  RESET_FAULT = 5
+  RESET_FAULT = 5,
+  GOTO_LOAD_POSITION = 6  // BARU -- manual, menuju Load Position (titik standby terima package)
 };

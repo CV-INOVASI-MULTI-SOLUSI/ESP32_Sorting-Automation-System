@@ -57,6 +57,10 @@ uint32_t lastStepMicros[3] = {0, 0, 0};
 
 struct RackPos { int32_t x, z; };
 RackPos RACK[6];
+// BARU: Load Position -- titik tunggal tempat lift "standby" menunggu robot arm
+// meletakkan/mengambil package, BEDA dari Home (limit switch, titik nol fisik)
+// dan Rack (6 slot penyimpanan akhir). Dikalibrasi manual, tersimpan NVS.
+RackPos loadPos = {0, 0};
 int32_t pushExtendSteps = 1000;
 
 enum class LiftState { HOMING, IDLE, MOVING, FAULT, ESTOPPED };
@@ -85,6 +89,7 @@ MenuState menuState = MenuState::NONE;
 void loadRackFromNvs() {
   prefs.begin("stocker_cal", true);
   if (prefs.isKey("rack")) prefs.getBytes("rack", RACK, sizeof(RACK));
+  if (prefs.isKey("loadPos")) prefs.getBytes("loadPos", &loadPos, sizeof(loadPos));   // BARU
   if (prefs.isKey("pushExt")) pushExtendSteps = prefs.getInt("pushExt", pushExtendSteps);
   if (prefs.isKey("stepIntv")) stepIntervalUs = prefs.getUShort("stepIntv", stepIntervalUs);
   if (prefs.isKey("homeIntv")) homingStepIntervalUs = prefs.getUShort("homeIntv", homingStepIntervalUs);
@@ -94,6 +99,7 @@ void loadRackFromNvs() {
   prefs.end();
 }
 void saveRackToNvs() { prefs.begin("stocker_cal", false); prefs.putBytes("rack", RACK, sizeof(RACK)); prefs.end(); }
+void saveLoadPosToNvs() { prefs.begin("stocker_cal", false); prefs.putBytes("loadPos", &loadPos, sizeof(loadPos)); prefs.end(); }   // BARU
 void savePushExtendToNvs() { prefs.begin("stocker_cal", false); prefs.putInt("pushExt", pushExtendSteps); prefs.end(); }
 void saveStepIntervalToNvs() { prefs.begin("stocker_cal", false); prefs.putUShort("stepIntv", stepIntervalUs); prefs.end(); }
 void saveHomingIntervalToNvs() { prefs.begin("stocker_cal", false); prefs.putUShort("homeIntv", homingStepIntervalUs); prefs.end(); }
@@ -105,6 +111,7 @@ void resetAllToDefault() {
   prefs.clear();
   prefs.end();
   for (uint8_t i = 0; i < 6; i++) RACK[i] = {0, 0};
+  loadPos = {0, 0};   // BARU
   pushExtendSteps = 1000;
   stepIntervalUs = 600; homingStepIntervalUs = 150;
   rampMinIntervalUs = 1200; rampSteps = 300; microstepMode = 2;
@@ -192,10 +199,15 @@ void setStepperEnabled(bool enable) {
 // sepenuhnya kalau arah tidak berubah) -- ini yang paling berdampak ke performa, bukan
 // pilihan native/MCP itu sendiri.
 void setAxisDirection(uint8_t axis, bool forward) {
-  if (axis >= 3 || dirState[axis] == forward) return;   // arah SAMA -- skip sepenuhnya
-  dirState[axis] = forward;
+  if (axis >= 3) return;
+  // BARU: terapkan invert per-axis SEBELUM dibandingkan/ditulis -- supaya cache (dirState)
+  // tetap konsisten dengan arah FISIK sesungguhnya, bukan arah yang "diminta" sebelum inversi
+  const bool invert[3] = {AxisInvert::X, AxisInvert::Y, AxisInvert::Z};
+  bool actualForward = forward != invert[axis];   // XOR -- balik kalau invert[axis]==true
+  if (dirState[axis] == actualForward) return;   // arah FISIK sama -- skip sepenuhnya
+  dirState[axis] = actualForward;
   const uint8_t dirPinsMcp[3] = {CH::DIR_1_MCP, CH::DIR_2_MCP, CH::DIR_3_MCP};
-  io.write(dirPinsMcp[axis], forward ? HIGH : LOW);
+  io.write(dirPinsMcp[axis], actualForward ? HIGH : LOW);
   lastStepMicros[axis] = micros();   // settling time -- TMC2209 butuh jeda setelah DIR berubah sebelum STEP pertama valid
 }
 
@@ -436,7 +448,10 @@ void handleCycle() {
     case CycleStage::RETRACT_Y:
       if (!yRetracting) {
         if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; return; }
-        tgtPos[0] = 0; tgtPos[2] = 0; state = LiftState::MOVING;
+        // DIUBAH: setelah RUN_FULL_CYCLE selesai, lift kembali ke LOAD POSITION
+        // (bukan Home lagi) -- siap langsung terima package berikutnya dari robot arm
+        // tanpa perlu re-homing tiap siklus. Home tetap ada, cuma dipakai referensi kalibrasi.
+        tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z; state = LiftState::MOVING;
         mb.Hreg(Reg::CURRENT_RACK_IDX, 0xFF);
         cycleStage = CycleStage::RETURNING_XZ;
       }
@@ -556,6 +571,14 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       currentState = NodeState::RUNNING_OR_MOVING;
       cycleStage = CycleStage::PUSHING_Y_STANDALONE;
       ackPending = true; pendingAckSeq = seq; return;
+    case Cmd::GOTO_LOAD_POSITION:   // BARU -- manual, menuju titik standby terima package
+      if (blockIfFaulted("GOTO_LOAD_POSITION", seq)) return;
+      if (!homed[0] || !homed[2]) { faultCode = (uint16_t)FaultCode::NOT_HOMED; mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
+      tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z;
+      state = LiftState::MOVING;
+      currentState = NodeState::RUNNING_OR_MOVING;
+      mb.Hreg(Reg::CURRENT_RACK_IDX, 0xFF);
+      ackPending = true; pendingAckSeq = seq; return;
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb sebelum di-nol-kan
       faultCode = 0; currentState = NodeState::IDLE; state = LiftState::IDLE;
@@ -612,9 +635,9 @@ void drawTopMenuStocker() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-constexpr uint8_t CAL_COUNT = 7;
+constexpr uint8_t CAL_COUNT = 8;
 const char* CAL_LABELS[CAL_COUNT] = { "AutoHome (wajib dulu)", "Jog Posisi (X/Y/Z)", "Test ke Rak",
-                                        "Simpan ke Slot Rak", "Simpan Jarak Dorong", "Kecepatan", "Reset ke Default" };
+                                        "Simpan ke Slot Rak", "Simpan Load Position", "Simpan Jarak Dorong", "Kecepatan", "Reset ke Default" };
 uint8_t calCursor = 0;
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
 
@@ -754,12 +777,18 @@ void handleCalListKey(char key) {
         menuState = MenuState::TEST_RACK_SELECT; testRackCursor = 0; lcd.clear(); drawTestRackSelect();
         break;
       case 3: menuState = MenuState::WAIT_SAVE_SLOT; lcdPrint(0, 3, "Simpan(X,Z)slot?0-5"); break;
-      case 4:
+      case 4:   // BARU: Simpan Load Position -- simpan X,Z SAAT INI, cuma 1 titik (bukan slot 0-5)
+        loadPos = {curPos[0], curPos[2]};
+        saveLoadPosToNvs();
+        lcdPrint(0, 3, "LoadPos disimpan!");
+        Serial.printf("[CAL] X=%ld Z=%ld -> loadPos\n", (long)curPos[0], (long)curPos[2]);
+        break;
+      case 5:
         if (curPos[1] <= 0) { lcdPrint(0, 3, "Y harus>0(jog dulu)"); }
         else { pushExtendSteps = curPos[1]; savePushExtendToNvs(); lcdPrint(0, 3, "PushExtend disimpan!"); Serial.printf("[CAL] pushExtendSteps=%ld\n", (long)pushExtendSteps); }
         break;
-      case 5: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenuStocker(); break;
-      case 6: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
+      case 6: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenuStocker(); break;
+      case 7: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuStocker(); }
 }
@@ -1079,12 +1108,13 @@ void handleTestIoCategoryKey(char key) {
 
 // --- LEVEL 1c: TEST COMMAND ---
 struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
-constexpr uint8_t CMD_TEST_COUNT = 5;
+constexpr uint8_t CMD_TEST_COUNT = 6;
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"HOME_ALL",             Cmd::HOME_ALL,       0},
   {"RUN_FULL_CYCLE(rak0)", Cmd::RUN_FULL_CYCLE, 0},
   {"MOVE_TO_RACK(rak0)",   Cmd::MOVE_TO_RACK,   0},
   {"PUSH_BOX",             Cmd::PUSH_BOX,       0},
+  {"GOTO_LOAD_POSITION",   Cmd::GOTO_LOAD_POSITION, 0},
   {"RESET_FAULT",          Cmd::RESET_FAULT,    0},
 };
 const char* CMD_TEST_LABELS_ONLY[CMD_TEST_COUNT];
@@ -1158,6 +1188,7 @@ void handleSerialCommand() {
     else Serial.println("[MOVE] Gagal -- cek homing/slot");
   }
   else if (cmd == "PUSH") { applyCommand((uint16_t)Cmd::PUSH_BOX, 0, 0); Serial.println("[PUSH] Extend+retract Y dimulai"); }
+  else if (cmd == "LOADPOS") { applyCommand((uint16_t)Cmd::GOTO_LOAD_POSITION, 0, 0); Serial.println("[LOADPOS] Menuju Load Position dimulai"); }
   else if (cmd == "FULLCYCLE") {
     uint8_t slot = line.substring(sp1 + 1).toInt();
     applyCommand((uint16_t)Cmd::RUN_FULL_CYCLE, slot, 0);
@@ -1414,7 +1445,15 @@ void loop() {
 
   handleSerialCommand();
 
-  if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > 5000) {
+  // DIPERBAIKI: timeout diperlebar dari 5000ms -- watchdog ini cuma reset saat command
+  // BARU dikirim (lastRs485Rx di-update di onCmdWrite()), TIDAK ikut ter-reset oleh
+  // pembacaan status (Modbus read register) yang tidak lewat callback itu. Testing manual
+  // via menu interaktif (baca status berulang sambil menunggu progres) WAJAR jeda lebih
+  // dari 5 detik antar command baru -- nilai lama terlalu ketat, sering false-trigger.
+  // 30 detik cukup toleran utk homing/gerak fisik + jeda manual, TAPI tetap berfungsi
+  // sbg pengaman kalau komunikasi BENAR-BENAR terputus total (kabel RS485 lepas, dst).
+  constexpr uint32_t COMM_TIMEOUT_MS = 30000;
+  if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > COMM_TIMEOUT_MS) {
     currentState = NodeState::FAULT; faultCode = (uint16_t)FaultCode::COMM_TIMEOUT;
   }
 

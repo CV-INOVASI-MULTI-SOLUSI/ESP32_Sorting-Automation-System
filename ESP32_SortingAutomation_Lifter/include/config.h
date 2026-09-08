@@ -78,6 +78,17 @@ namespace GP {
   constexpr uint8_t STEP_X = STEP_1, STEP_Y = STEP_2, STEP_Z = STEP_3;
 }
 
+// BARU: invert arah per-axis -- kalau motor berputar KEBALIK dari yang diperintahkan (misal
+// saat AutoHome menuju arah yang salah), ubah flag axis yang bersangkutan jadi true di sini.
+// TIDAK PERLU bongkar kabel motor/DIR fisik -- cukup ubah 1 baris ini + upload ulang.
+// Berlaku OTOMATIS ke SEMUA gerakan (homing, jog, RUN_FULL_CYCLE) karena diterapkan di
+// SATU titik (setAxisDirection()), bukan perlu diubah di banyak tempat.
+namespace AxisInvert {
+  constexpr bool X = true;   // ubah ke true kalau axis X (STEP_1) berputar kebalik
+  constexpr bool Y = true;   // ubah ke true kalau axis Y (STEP_2) berputar kebalik
+  constexpr bool Z = true;   // ubah ke true kalau axis Z (STEP_3) berputar kebalik
+}
+
 namespace LcdCfg {
   constexpr uint8_t COLS = 20;
   constexpr uint8_t ROWS = 4;
