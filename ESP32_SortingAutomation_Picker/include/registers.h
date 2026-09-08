@@ -25,7 +25,7 @@ namespace Reg {
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik PICKER ---
 enum class ActivityCode : uint16_t {
   DIAM = 0, MENUJU_HOME = 1, MENUJU_PASS = 2, MENUJU_REJECT = 3, MENUJU_LIFT = 4,
-  MENGAMBIL = 5, MELETAKKAN = 6, NAIK_CLEARANCE = 7, BERGERAK = 8,
+  MENGAMBIL = 5, MELETAKKAN = 6, NAIK_CLEARANCE = 7, BERGERAK = 8, POST_PLACE_GERAK = 9,
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
 };
 

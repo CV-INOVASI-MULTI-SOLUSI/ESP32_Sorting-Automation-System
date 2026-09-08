@@ -12,7 +12,7 @@
 namespace Pin {
   constexpr uint8_t I2C_SDA = 21;
   constexpr uint8_t I2C_SCL = 22;
-  constexpr uint32_t I2C_FREQ_HZ = 400000;
+  constexpr uint32_t I2C_FREQ_HZ = 100000;
 }
 
 namespace I2CAddr {
@@ -46,8 +46,8 @@ namespace CH {
   constexpr uint8_t PROX_2    = 19;   // spare
   constexpr uint8_t BUTTON_2  = 20;   // SORTER -- test pass
   constexpr uint8_t BUTTON_3  = 21;   // SORTER -- test reject
-  constexpr uint8_t LIM_1     = 22;   // STOCKER/Dispenser
-  constexpr uint8_t LIM_2     = 23;
+  constexpr uint8_t LIM_1     = 23;   // STOCKER/Dispenser
+  constexpr uint8_t LIM_2     = 22;
   constexpr uint8_t LIM_3     = 24;
   constexpr uint8_t LIM_4     = 25;
   constexpr uint8_t LIM_5     = 26;

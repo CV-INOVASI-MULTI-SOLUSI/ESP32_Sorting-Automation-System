@@ -51,8 +51,8 @@ namespace CH {
   constexpr uint8_t PROX_2    = 19;
   constexpr uint8_t BUTTON_2  = 20;   // SORTER
   constexpr uint8_t BUTTON_3  = 21;   // SORTER
-  constexpr uint8_t LIM_1     = 22;   // Dispenser=LIM_STOCK_EMPTY / STOCKER=LIM_X
-  constexpr uint8_t LIM_2     = 23;   // Dispenser=LIM_BOX_ARRIVED / STOCKER=LIM_Y
+  constexpr uint8_t LIM_1     = 23;   // Dispenser=LIM_STOCK_EMPTY / STOCKER=LIM_X
+  constexpr uint8_t LIM_2     = 22;   // Dispenser=LIM_BOX_ARRIVED / STOCKER=LIM_Y
   constexpr uint8_t LIM_3     = 24;   // Dispenser=LIM_PUSH_HOME   / STOCKER=LIM_Z
   constexpr uint8_t LIM_4     = 25;   // Dispenser=LIM_PUSH_EXTENDED / STOCKER=RACK_LIM[0]
   constexpr uint8_t LIM_5     = 26;

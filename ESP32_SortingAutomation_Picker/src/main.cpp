@@ -54,6 +54,9 @@ Pose POSES[4] = {
 int16_t PICK_OFFSET[ServoCfg::NUM_JOINTS]      = {0,0,-200,0,0,600};
 int16_t PLACE_OFFSET[ServoCfg::NUM_JOINTS]     = {0,0,-200,0,0,1000};
 int16_t CLEARANCE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,300,0,0,0};
+// BARU: gerakan tambahan setelah Place, sebelum kembali Home -- default 0 (TIDAK bergerak)
+// sampai dikalibrasi manual via menu Jog, supaya tidak ada asumsi arah gerakan yang salah.
+int16_t POST_PLACE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,0,0,0,0};
 
 uint16_t currentUs[ServoCfg::NUM_JOINTS];
 uint16_t targetUs[ServoCfg::NUM_JOINTS];
@@ -71,14 +74,16 @@ uint16_t rampSteps = 15;        // jumlah "langkah update" utk naik/turun kecepa
 uint16_t moveStepCount[ServoCfg::NUM_JOINTS] = {0};   // hitung sudah berapa kali joint ini di-update sejak mulai gerak
 bool jointWasMoving[ServoCfg::NUM_JOINTS] = {false};
 
-enum class QCmd : uint8_t { GOTO_POSE, PICK, PLACE, CLEARANCE };
+enum class QCmd : uint8_t { GOTO_POSE, PICK, PLACE, CLEARANCE, POST_PLACE };
 struct QItem { QCmd cmd; uint8_t poseIdx; };
 QItem cmdQueue[8]; uint8_t qHead = 0, qTail = 0;
 bool ackPending = false; uint16_t pendingAckSeq = 0;
 
 // --- Menu state (dideklarasikan di sini, SEBELUM onCmdWrite, supaya urutan kompilasi benar) ---
 enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_JOINT, WAIT_SAVE_SLOT, JOG_OFFSET, JOG_SPEED,
-                        TEST_IO_LIST, TEST_IO_ITEM, TEST_CMD_LIST, CONFIRM_RESET };
+                        TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
+                        TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
+                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET };
 MenuState menuState = MenuState::NONE;
 
 void usToDuty(uint8_t ch, uint16_t us) {
@@ -153,6 +158,7 @@ void processQueue() {
     case QCmd::PICK:  startMoveDelta(PICK_OFFSET, 400); break;
     case QCmd::PLACE: startMoveDelta(PLACE_OFFSET, 400); break;
     case QCmd::CLEARANCE: startMoveDelta(CLEARANCE_OFFSET, 400); break;
+    case QCmd::POST_PLACE: startMoveDelta(POST_PLACE_OFFSET, 400); break;
   }
 }
 void checkSequenceComplete() {
@@ -165,6 +171,7 @@ void loadPosesFromNvs() {
   if (prefs.isKey("pick"))  prefs.getBytes("pick", PICK_OFFSET, sizeof(PICK_OFFSET));
   if (prefs.isKey("place")) prefs.getBytes("place", PLACE_OFFSET, sizeof(PLACE_OFFSET));
   if (prefs.isKey("clear")) prefs.getBytes("clear", CLEARANCE_OFFSET, sizeof(CLEARANCE_OFFSET));
+  if (prefs.isKey("postplace")) prefs.getBytes("postplace", POST_PLACE_OFFSET, sizeof(POST_PLACE_OFFSET));
   if (prefs.isKey("trajStep")) trajStepUs = prefs.getUShort("trajStep", trajStepUs);
   if (prefs.isKey("trajIntv")) trajStepIntervalMs = prefs.getUShort("trajIntv", trajStepIntervalMs);
   if (prefs.isKey("rampMin")) rampMinStepUs = prefs.getUShort("rampMin", rampMinStepUs);   // BARU
@@ -200,9 +207,11 @@ void resetAllToDefault() {
   int16_t defPick[ServoCfg::NUM_JOINTS] = {0,0,-200,0,0,600};
   int16_t defPlace[ServoCfg::NUM_JOINTS] = {0,0,-200,0,0,1000};
   int16_t defClear[ServoCfg::NUM_JOINTS] = {0,0,300,0,0,0};
+  int16_t defPostPlace[ServoCfg::NUM_JOINTS] = {0,0,0,0,0,0};
   memcpy(PICK_OFFSET, defPick, sizeof(PICK_OFFSET));
   memcpy(PLACE_OFFSET, defPlace, sizeof(PLACE_OFFSET));
   memcpy(CLEARANCE_OFFSET, defClear, sizeof(CLEARANCE_OFFSET));
+  memcpy(POST_PLACE_OFFSET, defPostPlace, sizeof(POST_PLACE_OFFSET));
   trajStepUs = 20; trajStepIntervalMs = 20;
   rampMinStepUs = 4; rampSteps = 15;   // BARU
   Serial.println("[RESET] Semua kalibrasi PICKER dikembalikan ke default & NVS dihapus");
@@ -236,6 +245,7 @@ String activityText() {
     case QCmd::PICK: return "Mengambil (Pick)";
     case QCmd::PLACE: return "Meletakkan (Place)";
     case QCmd::CLEARANCE: return "Naik (Clearance)";
+    case QCmd::POST_PLACE: return "Post-Place";
   }
   return "Bergerak";
 }
@@ -257,6 +267,7 @@ ActivityCode activityCode() {
     case QCmd::PICK: return ActivityCode::MENGAMBIL;
     case QCmd::PLACE: return ActivityCode::MELETAKKAN;
     case QCmd::CLEARANCE: return ActivityCode::NAIK_CLEARANCE;
+    case QCmd::POST_PLACE: return ActivityCode::POST_PLACE_GERAK;
   }
   return ActivityCode::BERGERAK;
 }
@@ -300,6 +311,7 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       enqueue(QCmd::PICK);
       enqueue(QCmd::GOTO_POSE, 3);
       enqueue(QCmd::PLACE);
+      enqueue(QCmd::POST_PLACE);   // BARU -- gerakan tambahan sebelum kembali Home
       enqueue(QCmd::GOTO_POSE, 0);
       break;
     case Cmd::GOTO_HOME:   if (blockIfFaulted("GOTO_HOME")) return;   enqueue(QCmd::GOTO_POSE, 0); break;
@@ -369,8 +381,8 @@ void drawTopMenu() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-constexpr uint8_t CAL_COUNT = 6;
-const char* CAL_LABELS[CAL_COUNT] = { "Pose (Home/Pass/dll)", "Pick Offset", "Place Offset", "Clearance Offset", "Speed (Step/Interval)", "Reset ke Default" };
+constexpr uint8_t CAL_COUNT = 7;
+const char* CAL_LABELS[CAL_COUNT] = { "Pose (Home/Pass/dll)", "Pick Offset", "Place Offset", "Clearance Offset", "Post-Place Offset", "Speed (Step/Interval)", "Reset ke Default" };
 uint8_t calCursor = 0;
 
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
@@ -437,7 +449,8 @@ void handleOffsetKey(char key) {
   else if (key == 'B') { editingOffset[selJoint] -= JOG_STEPS[jogStepIdx]; previewOffsetOnServo(); }
   else if (key == 'C') { jogStepIdx = (jogStepIdx + 1) % 4; }
   else if (key == '#') {
-    const char* nvsKey = (editingOffset == PICK_OFFSET) ? "pick" : (editingOffset == PLACE_OFFSET) ? "place" : "clear";
+    const char* nvsKey = (editingOffset == PICK_OFFSET) ? "pick" : (editingOffset == PLACE_OFFSET) ? "place"
+                        : (editingOffset == CLEARANCE_OFFSET) ? "clear" : "postplace";
     saveOffsetToNvs(nvsKey, editingOffset, ServoCfg::NUM_JOINTS * sizeof(int16_t));
     lcdPrint(0, 3, String(editingOffsetName) + " tersimpan!");
     Serial.printf("[CAL] %s offset disimpan ke NVS\n", editingOffsetName);
@@ -495,36 +508,97 @@ void handleCalListKey(char key) {
       case 1: editingOffset = PICK_OFFSET; editingOffsetName = "PICK"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
       case 2: editingOffset = PLACE_OFFSET; editingOffsetName = "PLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
       case 3: editingOffset = CLEARANCE_OFFSET; editingOffsetName = "CLEARANCE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
-      case 4: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenu(); break;
-      case 5: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
+      case 4: editingOffset = POST_PLACE_OFFSET; editingOffsetName = "POSTPLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
+      case 5: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenu(); break;
+      case 6: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
 }
 
 // --- LEVEL 1b: TEST I/O ---
-struct IOTestItem { const char* label; uint8_t ch; bool isOutput; bool isSpecial; bool autoControlled; };
-constexpr uint8_t IO_TEST_COUNT = 9;
-IOTestItem IO_TEST_ITEMS[IO_TEST_COUNT] = {
-  {"I2C Scan",        0, false, true,  false},
-  {"System Info",     0, false, true,  false},
-  {"ESTOP (in)",      CH::ESTOP,     false, false, false},
-  {"LED_RUN (auto)",  CH::LED_RUN,   true,  false, true},
-  {"LED_OPERATION(auto)",CH::LED_OPERATION, true, false, true},
-  {"LED_MANUAL (auto)",CH::LED_MANUAL, true, false, true},
-  {"LED_FAULT (out)", CH::LED_FAULT, true,  false, false},
-  {"BUZZER (out)",    CH::BUZZER,    true,  false, false},
-  {"PCA_OE (out)",    CH::PCA_OE,    true,  false, false},
+struct IOTestItem { const char* label; uint8_t ch; bool autoControlled; };
+void drawTestIoCategory();
+
+// --- Kategori: Test Output ---
+constexpr uint8_t OUTPUT_TEST_COUNT = 4;
+IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
+  {"OPR",    CH::LED_OPERATION, true},
+  {"RUN",    CH::LED_RUN,       true},
+  {"MANUAL", CH::LED_MANUAL,    true},
+  {"FAULT",  CH::LED_FAULT,     false},
 };
-uint8_t ioTestCursor = 0;
-const char* IO_TEST_LABELS_ONLY[IO_TEST_COUNT];
-void buildIoTestLabels() { for (uint8_t i = 0; i < IO_TEST_COUNT; i++) IO_TEST_LABELS_ONLY[i] = IO_TEST_ITEMS[i].label; }
-void drawTestIoList() {
-  buildIoTestLabels();
-  // DIPERBAIKI: title tampilkan currentState -- lihat penjelasan di SORTER
-  String title = "TEST I/O [" + String(stateText(currentState)) + "]";
-  drawListMenu(title.c_str(), IO_TEST_LABELS_ONLY, IO_TEST_COUNT, ioTestCursor);
+uint8_t outputTestCursor = 0;
+bool testOutputLastVal = false, testOutputFirstDraw = true;
+void drawTestOutputList() {
+  static const char* labels[OUTPUT_TEST_COUNT];
+  for (uint8_t i = 0; i < OUTPUT_TEST_COUNT; i++) labels[i] = OUTPUT_TEST_ITEMS[i].label;
+  drawListMenu("TEST OUTPUT", labels, OUTPUT_TEST_COUNT, outputTestCursor);
+}
+void drawTestOutputItem() {
+  IOTestItem &item = OUTPUT_TEST_ITEMS[outputTestCursor];
+  bool val = io.read(item.ch);
+  if (testOutputFirstDraw) {
+    lcd.clear();
+    lcdPrint(0, 0, "TEST OUT: " + String(item.label));
+    lcdPrint(0, 2, "C=toggle" + String(item.autoControlled ? " (auto)" : ""));
+    lcdPrint(0, 3, "D=kembali");
+    testOutputFirstDraw = false;
+    testOutputLastVal = !val;
+  }
+  if (val != testOutputLastVal) { testOutputLastVal = val; lcdPrint(0, 1, "Nilai = " + String(val ? "HIGH" : "LOW") + "   "); }
+}
+void handleTestOutputListKey(char key) {
+  if (key == 'A') { outputTestCursor = (outputTestCursor == 0) ? OUTPUT_TEST_COUNT - 1 : outputTestCursor - 1; drawTestOutputList(); }
+  else if (key == 'B') { outputTestCursor = (outputTestCursor + 1) % OUTPUT_TEST_COUNT; drawTestOutputList(); }
+  else if (key == 'C') { menuState = MenuState::TEST_OUTPUT_ITEM; testOutputFirstDraw = true; drawTestOutputItem(); }
+  else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
+}
+void handleTestOutputItemKey(char key) {
+  IOTestItem &item = OUTPUT_TEST_ITEMS[outputTestCursor];
+  if (key == 'D') { menuState = MenuState::TEST_OUTPUT_LIST; drawTestOutputList(); return; }
+  static uint32_t lastToggleMs = 0;
+  constexpr uint32_t TOGGLE_MIN_INTERVAL_MS = 300;
+  if (key == 'C' && (item.autoControlled || currentState == NodeState::IDLE)) {
+    if (millis() - lastToggleMs < TOGGLE_MIN_INTERVAL_MS) return;
+    lastToggleMs = millis();
+    bool cur = io.read(item.ch);
+    io.write(item.ch, !cur);
+    Serial.printf("[TEST-OUT] CH%u (%s) di-toggle -> %s\n", item.ch, item.label, !cur ? "HIGH" : "LOW");
+  } else if (key == 'C') {
+    Serial.println("[TEST-OUT] Toggle ditolak -- state harus IDLE dulu");
+  }
+  drawTestOutputItem();
 }
 
+// --- Kategori: Test Input -- semua input tampil sekaligus (live) ---
+constexpr uint8_t INPUT_TEST_COUNT = 2;
+IOTestItem INPUT_TEST_ITEMS[INPUT_TEST_COUNT] = {
+  {"IN1", CH::ESTOP,  false},
+  {"IN2", CH::PCA_OE, false},
+};
+uint8_t inputTestScrollTop = 0;
+bool testInputLiveLastVal[INPUT_TEST_COUNT];
+uint8_t testInputLastScrollTop = 255;
+void drawTestInputList() {
+  bool scrollChanged = (inputTestScrollTop != testInputLastScrollTop);
+  if (scrollChanged) { lcd.clear(); testInputLastScrollTop = inputTestScrollTop; }
+  for (uint8_t row = 0; row < 4; row++) {
+    uint8_t idx = inputTestScrollTop + row;
+    if (idx >= INPUT_TEST_COUNT) continue;
+    bool val = io.read(INPUT_TEST_ITEMS[idx].ch);
+    if (scrollChanged || val != testInputLiveLastVal[idx]) {
+      testInputLiveLastVal[idx] = val;
+      lcdPrint(0, row, String(INPUT_TEST_ITEMS[idx].label) + " = " + String(val ? 1 : 0) + "         ");
+    }
+  }
+}
+void handleTestInputListKey(char key) {
+  if (key == 'A') { if (inputTestScrollTop > 0) { inputTestScrollTop--; drawTestInputList(); } }
+  else if (key == 'B') { if (inputTestScrollTop < (INPUT_TEST_COUNT > 4 ? INPUT_TEST_COUNT - 4 : 0)) { inputTestScrollTop++; drawTestInputList(); } }
+  else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
+}
+
+// --- Kategori: I2C Scan ---
 void runI2CScanFromMenu() {
   lcd.clear(); lcdPrint(0, 0, "I2C SCAN...");
   Serial.println("[TEST-IO] I2C Scan dari menu:");
@@ -542,75 +616,184 @@ void runI2CScanFromMenu() {
   lcdPrint(0, 3, "D=kembali");
   Serial.printf("[TEST-IO] Total %u device\n", count);
 }
-// BARU: LCD cuma 20 kolom -- FW_VERSION penuh (format "v.XX.XX.DDMMYYYY.HH.MM", 23 karakter)
-// TIDAK MUAT. Tampilkan cuma MAJOR.MINOR.tanggal di LCD, versi lengkap TETAP utuh di Serial STATUS.
+void handleTestIoI2CScanKey(char key) {
+  if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); return; }
+}
+
+// --- Kategori: Test RS485 ---
 String lcdVersionShort() {
   String v = FW_VERSION;
-  if (v.length() >= 16) return v.substring(2, 16);   // "01.00.25082026" -- buang "v." depan & ".HH.MM" belakang
-  return v;   // fallback kalau format FW_VERSION beda dari dugaan
+  if (v.length() >= 16) return v.substring(2, 16);
+  return v;
 }
-
-void drawSystemInfoFromMenu() {
+void drawTestRs485() {
   lcd.clear();
-  lcdPrint(0, 0, "SYSTEM INFO");
-  lcdPrint(0, 1, "FW:" + lcdVersionShort());
-  lcdPrint(0, 2, "Up:" + String(millis() / 1000) + "s I2Cerr:" + String(i2cErrorCount));
+  lcdPrint(0, 0, "TEST RS485");
+  lcdPrint(0, 1, "Slave:" + String(Rs485Cfg::SLAVE_ID) + " Baud:" + String(Rs485Cfg::BAUD));
+  if (modbusEverUsed) lcdPrint(0, 2, "RX terakhir:" + String((millis() - lastRs485Rx) / 1000) + "s lalu");
+  else lcdPrint(0, 2, "Belum ada data masuk");
   lcdPrint(0, 3, "D=kembali");
-  Serial.printf("[SYSINFO] FW=%s build=%s uptime=%lus freeHeap=%u slaveID=%d MCP=%s LCD=%s KP=%s i2cErrCount=%u lastFault=%u\n",
-                FW_VERSION, FW_BUILD, (unsigned long)(millis() / 1000), ESP.getFreeHeap(),
-                Rs485Cfg::SLAVE_ID, io.isHealthy() ? "OK" : "GAGAL",
-                lcdPresent ? "ADA" : "TIDAK", keypadPresent ? "ADA" : "TIDAK",
-                i2cErrorCount, lastFaultCode);
+  Serial.printf("[TEST-RS485] slaveID=%d baud=%lu pernahTerimaData=%d sejakRxMs=%lu FW=%s\n",
+                Rs485Cfg::SLAVE_ID, (unsigned long)Rs485Cfg::BAUD, modbusEverUsed,
+                modbusEverUsed ? (unsigned long)(millis() - lastRs485Rx) : 0UL, FW_VERSION);
 }
-bool testIoLastVal = false;
-bool testIoFirstDraw = true;
+void handleTestRs485Key(char key) {
+  if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); return; }
+  drawTestRs485();
+}
 
-void drawTestIoItem() {
-  IOTestItem &item = IO_TEST_ITEMS[ioTestCursor];
-  if (item.isSpecial) { if (ioTestCursor == 0) runI2CScanFromMenu(); else drawSystemInfoFromMenu(); return; }
-  bool val = io.read(item.ch);
-  if (testIoFirstDraw) {
-    // DIPERBAIKI (sinkron dgn SORTER): lcd.clear() cuma SEKALI saat pertama masuk -- bukan tiap
-    // refresh, itu penyebab layar "kedip" yang ditemukan sebelumnya
-    lcd.clear();
-    lcdPrint(0, 0, "TEST: " + String(item.label));
-    if (item.isOutput) lcdPrint(0, 2, "C=toggle" + String(item.autoControlled ? " (auto)" : ""));
-    else lcdPrint(0, 2, "(input, baca saja)");
-    lcdPrint(0, 3, "D=kembali");
-    testIoFirstDraw = false;
-    testIoLastVal = !val;
+// --- Kategori: Test Modul -- sub-menu pilihan JENIS modul, SAMA di semua 4 node (board universal).
+// PICKER sudah punya driver PCA9685 RESMI (objek pwm) -- Test Modul Servo REUSE ini langsung,
+// TIDAK bikin driver raw terpisah (beda dgn SORTER/STOCKER yang tidak punya driver resmi).
+bool testModFirstDraw = true;
+String testModLine1 = "";
+constexpr uint8_t MODULE_TYPE_COUNT = 4;
+const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Relay", "Servo" };
+uint8_t moduleTypeCursor = 0;
+void drawModuleTypeSelect() { drawListMenu("TEST MODUL", MODULE_TYPE_LABELS, MODULE_TYPE_COUNT, moduleTypeCursor); }
+void handleModuleTypeKey(char key);
+
+// --- Modul: Stepper (STEP_1/2/3 + DIR_1/2/3_MCP + EN_123) -- PICKER tidak punya infrastruktur
+// motion, pulsa manual sederhana. Blocking SESAAT (~80ms/tekan) -- pengecualian wajar, murni
+// test 1x-tekan, bukan continuous production loop.
+uint8_t testModAxis = 0;
+void testStepperPulse(uint8_t axisIdx, bool forward) {
+  const uint8_t stepPins[3] = { GP::STEP_1, GP::STEP_2, GP::STEP_3 };
+  const uint8_t dirPins[3]  = { CH::DIR_1_MCP, CH::DIR_2_MCP, CH::DIR_3_MCP };
+  io.write(CH::EN_123, LOW);
+  io.write(dirPins[axisIdx], forward ? HIGH : LOW);
+  delayMicroseconds(50);
+  for (uint16_t i = 0; i < 100; i++) {
+    digitalWrite(stepPins[axisIdx], HIGH);
+    delayMicroseconds(4);
+    digitalWrite(stepPins[axisIdx], LOW);
+    delayMicroseconds(800);
   }
-  // DIPERBAIKI: baris nilai HANYA ditulis ulang kalau BERUBAH -- mencegah kedip
-  if (val != testIoLastVal) {
-    testIoLastVal = val;
-    lcdPrint(0, 1, "Nilai = " + String(val ? "HIGH" : "LOW") + "   ");
+  io.write(CH::EN_123, HIGH);
+}
+void drawTestModStepper() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: STEPPER");
+    lcdPrint(0, 1, "(cek fisik manual)");
+    lcdPrint(0, 3, "C=ax A/B=puls D=kmb");
+    testModFirstDraw = false;
   }
+  const char* axisName[3] = {"1", "2", "3"};
+  lcdPrint(0, 2, "Axis:" + String(axisName[testModAxis]) + " STEP/DIR/EN");
 }
-void handleTestIoListKey(char key) {
-  if (key == 'A') { ioTestCursor = (ioTestCursor == 0) ? IO_TEST_COUNT - 1 : ioTestCursor - 1; drawTestIoList(); }
-  else if (key == 'B') { ioTestCursor = (ioTestCursor + 1) % IO_TEST_COUNT; drawTestIoList(); }
-  else if (key == 'C') { menuState = MenuState::TEST_IO_ITEM; testIoFirstDraw = true; drawTestIoItem(); }
-  else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
+void handleTestModStepperKey(char key) {
+  if (key == 'C') { testModAxis = (testModAxis + 1) % 3; }
+  else if (key == 'A') { testStepperPulse(testModAxis, true); }
+  else if (key == 'B') { testStepperPulse(testModAxis, false); }
+  else if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
+  drawTestModStepper();
 }
-void handleTestIoItemKey(char key) {
-  IOTestItem &item = IO_TEST_ITEMS[ioTestCursor];
-  if (key == 'D') { menuState = MenuState::TEST_IO_LIST; drawTestIoList(); return; }
-  if (item.isSpecial) { drawTestIoItem(); return; }
-  // DIPERBAIKI: semua output BISA ditoggle (termasuk auto-controlled -- kontrolnya di-pause
-  // sementara, lihat loop()). BARU: rate-limit 300ms -- beban induktif (motor servo/PCA_OE)
-  // yg di-toggle terlalu cepat berturut-turut berisiko ganggu integritas I2C (temuan di SORTER).
+
+// --- Modul: Motor DC (AIN1/AIN2/BIN1/BIN2/STBY) -- PICKER tidak pakai channel ini di produksi,
+// aman ditest kapan saja.
+uint8_t testModMotorAState = 0, testModMotorBState = 0;
+void testModSetMotor(bool channelA, uint8_t dirState) {
+  uint8_t ain1 = channelA ? CH::AIN1 : CH::BIN1, ain2 = channelA ? CH::AIN2 : CH::BIN2;
+  if (channelA) testModMotorAState = dirState; else testModMotorBState = dirState;
+  if (dirState == 0) { io.write(ain1, LOW); io.write(ain2, LOW); }
+  else { io.write(ain1, dirState == 1); io.write(ain2, dirState != 1); }
+  io.write(CH::STBY, (testModMotorAState != 0 || testModMotorBState != 0));
+}
+void drawTestModMotorDC() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: MOTOR DC");
+    lcdPrint(0, 3, "A=chA B=chB D=kmb");
+    testModFirstDraw = false; testModLine1 = "\x01";
+  }
+  String line1 = "ChA:" + String(testModMotorAState) + " ChB:" + String(testModMotorBState);
+  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
+  lcdPrint(0, 2, "A/B=maju,lg=stop");
+}
+void handleTestModMotorDCKey(char key) {
+  if (key == 'A') { testModSetMotor(true, testModMotorAState == 0 ? 1 : 0); }
+  else if (key == 'B') { testModSetMotor(false, testModMotorBState == 0 ? 1 : 0); }
+  else if (key == 'D') {
+    testModSetMotor(true, 0); testModSetMotor(false, 0);
+    menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return;
+  }
+  drawTestModMotorDC();
+}
+
+// --- Modul: Relay (RLY1/RLY2) ---
+uint8_t testModRelaySel = 0;
+void drawTestModRelay() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: RELAY");
+    lcdPrint(0, 3, "C=pilih A=tgl D=kmb");
+    testModFirstDraw = false; testModLine1 = "\x01";
+  }
+  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
+  bool val = io.read(ch);
+  String line1 = "RLY" + String(testModRelaySel + 1) + " = " + String(val ? "HIGH" : "LOW");
+  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
+}
+void handleTestModRelayKey(char key) {
   static uint32_t lastToggleMs = 0;
-  constexpr uint32_t TOGGLE_MIN_INTERVAL_MS = 300;
-  if (key == 'C' && item.isOutput && (item.autoControlled || currentState == NodeState::IDLE)) {
-    if (millis() - lastToggleMs < TOGGLE_MIN_INTERVAL_MS) return;
+  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
+  if (key == 'C') { testModRelaySel = (testModRelaySel + 1) % 2; }
+  else if (key == 'A') {
+    if (millis() - lastToggleMs < 300) return;
     lastToggleMs = millis();
-    bool cur = io.read(item.ch);
-    io.write(item.ch, !cur);
-    Serial.printf("[TEST-IO] CH%u (%s) di-toggle -> %s\n", item.ch, item.label, !cur ? "HIGH" : "LOW");
-  } else if (key == 'C' && item.isOutput) {
-    Serial.println("[TEST-IO] Toggle ditolak -- state harus IDLE dulu");
+    io.write(ch, !io.read(ch));
+  } else if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
+  drawTestModRelay();
+}
+
+// --- Modul: Servo -- REUSE driver PCA9685 RESMI (objek pwm) yang sudah aktif produksi ---
+uint8_t testModServoCh = 0;
+void drawTestModServo() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: SERVO");
+    lcdPrint(0, 3, "C=ch A/B=gerak D=kmb");
+    testModFirstDraw = false; testModLine1 = "\x01";
   }
-  drawTestIoItem();
+  String line1 = "Joint:" + String(testModServoCh) + " us:" + String(currentUs[testModServoCh]);
+  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
+}
+void handleTestModServoKey(char key) {
+  if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
+  else if (key == 'C') { testModServoCh = (testModServoCh + 1) % ServoCfg::NUM_JOINTS; }
+  else if (key == 'A') { currentUs[testModServoCh] = constrain((int)currentUs[testModServoCh] + 100, (int)ServoCfg::MIN_US, (int)ServoCfg::MAX_US); usToDuty(testModServoCh, currentUs[testModServoCh]); }
+  else if (key == 'B') { currentUs[testModServoCh] = constrain((int)currentUs[testModServoCh] - 100, (int)ServoCfg::MIN_US, (int)ServoCfg::MAX_US); usToDuty(testModServoCh, currentUs[testModServoCh]); }
+  drawTestModServo();
+}
+
+void handleModuleTypeKey(char key) {
+  if (key == 'A') { moduleTypeCursor = (moduleTypeCursor == 0) ? MODULE_TYPE_COUNT - 1 : moduleTypeCursor - 1; drawModuleTypeSelect(); }
+  else if (key == 'B') { moduleTypeCursor = (moduleTypeCursor + 1) % MODULE_TYPE_COUNT; drawModuleTypeSelect(); }
+  else if (key == 'C') {
+    testModFirstDraw = true;
+    switch (moduleTypeCursor) {
+      case 0: menuState = MenuState::TEST_MOD_STEPPER; drawTestModStepper(); break;
+      case 1: menuState = MenuState::TEST_MOD_MOTORDC; drawTestModMotorDC(); break;
+      case 2: menuState = MenuState::TEST_MOD_RELAY; drawTestModRelay(); break;
+      case 3: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
+    }
+  } else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
+}
+
+// --- Selector kategori (LEVEL 1b utama) ---
+constexpr uint8_t TEST_IO_CAT_COUNT = 5;
+const char* TEST_IO_CAT_LABELS[TEST_IO_CAT_COUNT] = { "I2C Scan", "Test Output", "Test Input", "Test RS485", "Test Modul" };
+uint8_t testIoCatCursor = 0;
+void drawTestIoCategory() { drawListMenu("TEST I/O", TEST_IO_CAT_LABELS, TEST_IO_CAT_COUNT, testIoCatCursor); }
+void handleTestIoCategoryKey(char key) {
+  if (key == 'A') { testIoCatCursor = (testIoCatCursor == 0) ? TEST_IO_CAT_COUNT - 1 : testIoCatCursor - 1; drawTestIoCategory(); }
+  else if (key == 'B') { testIoCatCursor = (testIoCatCursor + 1) % TEST_IO_CAT_COUNT; drawTestIoCategory(); }
+  else if (key == 'C') {
+    switch (testIoCatCursor) {
+      case 0: menuState = MenuState::TEST_IO_I2CSCAN; runI2CScanFromMenu(); break;
+      case 1: menuState = MenuState::TEST_OUTPUT_LIST; outputTestCursor = 0; drawTestOutputList(); break;
+      case 2: menuState = MenuState::TEST_INPUT_LIST; inputTestScrollTop = 0; testInputLastScrollTop = 255; drawTestInputList(); break;
+      case 3: menuState = MenuState::TEST_RS485; drawTestRs485(); break;
+      case 4: menuState = MenuState::TEST_MODULE_SELECT; moduleTypeCursor = 0; drawModuleTypeSelect(); break;
+    }
+  } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
 }
 
 // --- LEVEL 1c: TEST COMMAND ---
@@ -653,7 +836,7 @@ void handleTopMenuKey(char key) {
   else if (key == 'C') {
     switch (topCursor) {
       case 0: menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); break;
-      case 1: menuState = MenuState::TEST_IO_LIST; ioTestCursor = 0; drawTestIoList(); break;
+      case 1: menuState = MenuState::TEST_IO_CATEGORY; testIoCatCursor = 0; drawTestIoCategory(); break;
       case 2: menuState = MenuState::TEST_CMD_LIST; cmdTestCursor = 0; drawTestCmdList(); break;
     }
   } else if (key == 'D') { menuState = MenuState::NONE; lcd.clear(); Serial.println("[CAL] Keluar mode kalibrasi"); }
@@ -715,7 +898,7 @@ void handleSerialCommand() {
 }
 
 void handleSafety() {
-  if (io.read(CH::ESTOP) == HIGH) {
+  if (io.read(CH::ESTOP) == LOW) {   // DIUBAH dari HIGH ke LOW
     io.write(CH::PCA_OE, HIGH);
     currentState = NodeState::ESTOPPED; moving = false;
     qHead = qTail = 0; ackPending = false;
@@ -835,8 +1018,17 @@ void loop() {
       else if (menuState == MenuState::WAIT_SAVE_SLOT) handleSaveSlotKey(key);
       else if (menuState == MenuState::JOG_OFFSET) handleOffsetKey(key);
       else if (menuState == MenuState::JOG_SPEED) handleSpeedKey(key);
-      else if (menuState == MenuState::TEST_IO_LIST) handleTestIoListKey(key);
-      else if (menuState == MenuState::TEST_IO_ITEM) handleTestIoItemKey(key);
+      else if (menuState == MenuState::TEST_IO_CATEGORY) handleTestIoCategoryKey(key);
+      else if (menuState == MenuState::TEST_IO_I2CSCAN) handleTestIoI2CScanKey(key);
+      else if (menuState == MenuState::TEST_OUTPUT_LIST) handleTestOutputListKey(key);
+      else if (menuState == MenuState::TEST_OUTPUT_ITEM) handleTestOutputItemKey(key);
+      else if (menuState == MenuState::TEST_INPUT_LIST) handleTestInputListKey(key);
+      else if (menuState == MenuState::TEST_RS485) handleTestRs485Key(key);
+      else if (menuState == MenuState::TEST_MODULE_SELECT) handleModuleTypeKey(key);
+      else if (menuState == MenuState::TEST_MOD_STEPPER) handleTestModStepperKey(key);
+      else if (menuState == MenuState::TEST_MOD_MOTORDC) handleTestModMotorDCKey(key);
+      else if (menuState == MenuState::TEST_MOD_RELAY) handleTestModRelayKey(key);
+      else if (menuState == MenuState::TEST_MOD_SERVO) handleTestModServoKey(key);
       else if (menuState == MenuState::TEST_CMD_LIST) handleTestCmdListKey(key);
       else if (menuState == MenuState::CONFIRM_RESET) handleConfirmResetKey(key);
     }
@@ -863,19 +1055,34 @@ void loop() {
   }
 
   checkLcdKeypadHotplug();
-  bool pauseAutoIndicators = (menuState == MenuState::TEST_IO_ITEM && IO_TEST_ITEMS[ioTestCursor].autoControlled);
+  bool pauseAutoIndicators = (menuState == MenuState::TEST_OUTPUT_ITEM && OUTPUT_TEST_ITEMS[outputTestCursor].autoControlled);
   if (!pauseAutoIndicators) updateUniversalIndicators();
 
-  // BARU: refresh live Test I/O untuk item INPUT/auto-controlled -- lihat perubahan real-time
-  if (menuState == MenuState::TEST_IO_ITEM && lcdPresent) {
-    IOTestItem &curItem = IO_TEST_ITEMS[ioTestCursor];
-    if (!curItem.isSpecial && (!curItem.isOutput || curItem.autoControlled)) {
-      static uint32_t lastTestIoRefresh = 0;
-      if (millis() - lastTestIoRefresh > 200) {
-        lastTestIoRefresh = millis();
-        drawTestIoItem();
-      }
-    }
+  // DIPERBAIKI: refresh live utk kategori Test Output (auto-controlled saja), Test Input,
+  // Test RS485, dan Test Modul
+  if (menuState == MenuState::TEST_OUTPUT_ITEM && lcdPresent && OUTPUT_TEST_ITEMS[outputTestCursor].autoControlled) {
+    static uint32_t lastTestOutRefresh = 0;
+    if (millis() - lastTestOutRefresh > 100) { lastTestOutRefresh = millis(); drawTestOutputItem(); }
+  }
+  if (menuState == MenuState::TEST_INPUT_LIST && lcdPresent) {
+    static uint32_t lastTestInRefresh = 0;
+    if (millis() - lastTestInRefresh > 100) { lastTestInRefresh = millis(); drawTestInputList(); }
+  }
+  if (menuState == MenuState::TEST_RS485 && lcdPresent) {
+    static uint32_t lastTestRs485Refresh = 0;
+    if (millis() - lastTestRs485Refresh > 500) { lastTestRs485Refresh = millis(); drawTestRs485(); }
+  }
+  if (menuState == MenuState::TEST_MOD_MOTORDC && lcdPresent) {
+    static uint32_t lastTestModRefresh = 0;
+    if (millis() - lastTestModRefresh > 150) { lastTestModRefresh = millis(); drawTestModMotorDC(); }
+  }
+  if (menuState == MenuState::TEST_MOD_RELAY && lcdPresent) {
+    static uint32_t lastTestModRefresh2 = 0;
+    if (millis() - lastTestModRefresh2 > 150) { lastTestModRefresh2 = millis(); drawTestModRelay(); }
+  }
+  if (menuState == MenuState::TEST_MOD_SERVO && lcdPresent) {
+    static uint32_t lastTestModRefresh3 = 0;
+    if (millis() - lastTestModRefresh3 > 150) { lastTestModRefresh3 = millis(); drawTestModServo(); }
   }
   // DIUBAH: logic fisik (safety, trajektori servo, antrian) SEKARANG SELALU JALAN, termasuk
   // saat menu kalibrasi aktif -- konsisten dgn pola SORTER. Hanya command EKSTERNAL yang dijeda.

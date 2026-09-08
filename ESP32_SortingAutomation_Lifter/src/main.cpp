@@ -78,7 +78,8 @@ uint8_t microstepMode = 2;
 // --- Menu state (dideklarasikan awal, dipakai onCmdWrite) ---
 enum class MenuState { NONE, TOP_SELECT, CAL_LIST, MOVE_AXIS, WAIT_SAVE_SLOT, JOG_SPEED, TEST_RACK_SELECT,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
-                        TEST_INPUT_LIST, TEST_RS485, TEST_CMD_LIST, CONFIRM_RESET };
+                        TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
+                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET };
 MenuState menuState = MenuState::NONE;
 
 void loadRackFromNvs() {
@@ -455,7 +456,7 @@ void handleCycle() {
 }
 
 void handleSafety() {
-  if (io.read(CH::ESTOP) == HIGH) {
+  if (io.read(CH::ESTOP) == LOW) {   // DIUBAH dari HIGH ke LOW
     // SENGAJA unconditional (BUKAN lewat setStepperEnabled()/cache) -- ini jalur
     // keselamatan, tidak boleh berisiko ke-skip walau cache software kebetulan
     // tidak sinkron dengan hardware. Fail-safe: selalu tulis ulang paksa.
@@ -902,8 +903,161 @@ void handleTestRs485Key(char key) {
 }
 
 // --- Selector kategori (LEVEL 1b utama) ---
-constexpr uint8_t TEST_IO_CAT_COUNT = 4;
-const char* TEST_IO_CAT_LABELS[TEST_IO_CAT_COUNT] = { "I2C Scan", "Test Output", "Test Input", "Test RS485" };
+// --- BARU: Test Modul -- sub-menu pilihan JENIS modul, SAMA di semua 4 node (board universal --
+// channel/pin sudah didefinisikan sama persis terlepas modul itu benar2 terpasang fisik atau tidak
+// di board node ini). Stepper pakai infrastruktur startJog() yang sudah ada (non-blocking).
+// Motor DC/Relay/Servo murni untuk keperluan test manual -- STOCKER secara role asli tidak
+// pakai channel2 itu, tapi channel-nya TETAP ada di config.h karena board universal.
+void startJog(uint8_t axis, int32_t delta);   // forward declaration -- didefinisikan di bawah
+
+// --- PCA9685 minimal raw driver (Wire langsung, TANPA library) -- utk Test Modul Servo.
+// STOCKER tidak punya driver PCA9685 resmi (beda dgn PICKER yang sudah pakai Adafruit_PWMServoDriver
+// utk produksi) -- ini versi RINGAN khusus test, aman dipakai kapan saja karena cuma aktif kalau
+// operator masuk menu Test Modul Servo secara sengaja.
+constexpr uint8_t PCA9685_ADDR = 0x40;
+bool pca9685Detected() { Wire.beginTransmission(PCA9685_ADDR); return (Wire.endTransmission() == 0); }
+void pca9685Init() {
+  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x10); Wire.endTransmission();   // sleep dulu utk ubah prescale
+  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0xFE); Wire.write((uint8_t)121); Wire.endTransmission();     // prescale ~50Hz
+  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x20); Wire.endTransmission();   // wake + auto-increment
+  delay(5);
+}
+void pca9685SetServoUs(uint8_t channel, uint16_t us) {
+  uint32_t ticks = (uint32_t)us * 4096UL / 20000UL;   // konversi pulsa mikrodetik -> tick (periode 20ms @ 50Hz)
+  uint8_t reg = 0x06 + 4 * channel;
+  Wire.beginTransmission(PCA9685_ADDR);
+  Wire.write(reg); Wire.write((uint8_t)0); Wire.write((uint8_t)0);
+  Wire.write((uint8_t)(ticks & 0xFF)); Wire.write((uint8_t)(ticks >> 8));
+  Wire.endTransmission();
+}
+
+// --- Sub-menu pilihan jenis modul ---
+constexpr uint8_t MODULE_TYPE_COUNT = 4;
+const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Relay", "Servo" };
+uint8_t moduleTypeCursor = 0;
+void drawModuleTypeSelect() { drawListMenu("TEST MODUL", MODULE_TYPE_LABELS, MODULE_TYPE_COUNT, moduleTypeCursor); }
+void handleModuleTypeKey(char key);   // forward declaration -- dipakai di handleTestIoCategoryKey() sebelum definisi
+
+// --- Modul: Stepper (STEP_1/2/3 + DIR_1/2/3_MCP + EN_123) -- STOCKER pakai startJog() non-blocking ---
+uint8_t testModAxis = 0;
+bool testModFirstDraw = true;
+String testModLine1 = "", testModLine2 = "";
+void drawTestModStepper() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: STEPPER");
+    lcdPrint(0, 3, "C=ax A/B=jog D=kmb");
+    testModFirstDraw = false; testModLine1 = "\x01"; testModLine2 = "\x01";
+  }
+  String line1 = "X:" + String(homed[0] ? "Y" : "N") + " Y:" + String(homed[1] ? "Y" : "N")
+               + " Z:" + String(homed[2] ? "Y" : "N") + " EN:" + String(steppersEnabled ? "ON" : "OFF");
+  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
+  const char* axisName[3] = {"X", "Y", "Z"};
+  String line2 = "Axis:" + String(axisName[testModAxis]) + " Pos:" + String(curPos[testModAxis]);
+  if (line2 != testModLine2) { testModLine2 = line2; lcdPrint(0, 2, line2 + "   "); }
+}
+void handleTestModStepperKey(char key) {
+  constexpr int32_t TEST_JOG_DELTA = 200;
+  if (key == 'C') { testModAxis = (testModAxis + 1) % 3; }
+  else if (key == 'A') { startJog(testModAxis, TEST_JOG_DELTA); }
+  else if (key == 'B') { startJog(testModAxis, -TEST_JOG_DELTA); }
+  else if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
+  drawTestModStepper();
+}
+
+// --- Modul: Motor DC (AIN1/AIN2/BIN1/BIN2/STBY) -- ON/OFF sederhana, non-blocking ---
+uint8_t testModMotorAState = 0, testModMotorBState = 0;   // 0=stop,1=maju,2=mundur
+void testModSetMotor(bool channelA, uint8_t dirState) {
+  uint8_t ain1 = channelA ? CH::AIN1 : CH::BIN1, ain2 = channelA ? CH::AIN2 : CH::BIN2;
+  if (channelA) testModMotorAState = dirState; else testModMotorBState = dirState;
+  if (dirState == 0) { io.write(ain1, LOW); io.write(ain2, LOW); }
+  else { io.write(ain1, dirState == 1); io.write(ain2, dirState != 1); }
+  io.write(CH::STBY, (testModMotorAState != 0 || testModMotorBState != 0));
+}
+void drawTestModMotorDC() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: MOTOR DC");
+    lcdPrint(0, 3, "A=chA B=chB D=kmb");
+    testModFirstDraw = false; testModLine1 = "\x01";
+  }
+  String line1 = "ChA:" + String(testModMotorAState) + " ChB:" + String(testModMotorBState);
+  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
+  lcdPrint(0, 2, "A/B=maju,lg=stop");
+}
+void handleTestModMotorDCKey(char key) {
+  if (key == 'A') { testModSetMotor(true, testModMotorAState == 0 ? 1 : 0); }
+  else if (key == 'B') { testModSetMotor(false, testModMotorBState == 0 ? 1 : 0); }
+  else if (key == 'D') {
+    testModSetMotor(true, 0); testModSetMotor(false, 0);   // stop semua sebelum keluar -- safety
+    menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return;
+  }
+  drawTestModMotorDC();
+}
+
+// --- Modul: Relay (RLY1/RLY2) -- toggle, rate-limit 300ms (beban induktif) ---
+uint8_t testModRelaySel = 0;   // 0=RLY1, 1=RLY2
+void drawTestModRelay() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: RELAY");
+    lcdPrint(0, 3, "C=pilih A=tgl D=kmb");
+    testModFirstDraw = false; testModLine1 = "\x01";
+  }
+  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
+  bool val = io.read(ch);
+  String line1 = "RLY" + String(testModRelaySel + 1) + " = " + String(val ? "HIGH" : "LOW");
+  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
+}
+void handleTestModRelayKey(char key) {
+  static uint32_t lastToggleMs = 0;
+  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
+  if (key == 'C') { testModRelaySel = (testModRelaySel + 1) % 2; }
+  else if (key == 'A') {
+    if (millis() - lastToggleMs < 300) return;   // rate-limit -- beban induktif, sama alasan Test Output
+    lastToggleMs = millis();
+    io.write(ch, !io.read(ch));
+  } else if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
+  drawTestModRelay();
+}
+
+// --- Modul: Servo (PCA9685) -- cek deteksi I2C dulu, baru izinkan gerak ---
+uint8_t testModServoCh = 0;
+bool testModServoDetected = false;
+void drawTestModServo() {
+  if (testModFirstDraw) {
+    lcd.clear(); lcdPrint(0, 0, "MODUL: SERVO");
+    testModServoDetected = pca9685Detected();
+    if (testModServoDetected) pca9685Init();
+    testModFirstDraw = false; testModLine1 = "\x01";
+  }
+  String line1 = testModServoDetected ? ("PCA9685 OK, CH:" + String(testModServoCh)) : "PCA9685 TIDAK ADA";
+  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
+  lcdPrint(0, 3, testModServoDetected ? "C=ch A/B=gerak D=kmb" : "D=kembali");
+}
+void handleTestModServoKey(char key) {
+  if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
+  if (testModServoDetected) {
+    if (key == 'C') { testModServoCh = (testModServoCh + 1) % 16; }
+    else if (key == 'A') { pca9685SetServoUs(testModServoCh, 1700); }   // nudge kanan dari center
+    else if (key == 'B') { pca9685SetServoUs(testModServoCh, 1300); }   // nudge kiri dari center
+  }
+  drawTestModServo();
+}
+
+void handleModuleTypeKey(char key) {
+  if (key == 'A') { moduleTypeCursor = (moduleTypeCursor == 0) ? MODULE_TYPE_COUNT - 1 : moduleTypeCursor - 1; drawModuleTypeSelect(); }
+  else if (key == 'B') { moduleTypeCursor = (moduleTypeCursor + 1) % MODULE_TYPE_COUNT; drawModuleTypeSelect(); }
+  else if (key == 'C') {
+    testModFirstDraw = true;
+    switch (moduleTypeCursor) {
+      case 0: menuState = MenuState::TEST_MOD_STEPPER; drawTestModStepper(); break;
+      case 1: menuState = MenuState::TEST_MOD_MOTORDC; drawTestModMotorDC(); break;
+      case 2: menuState = MenuState::TEST_MOD_RELAY; drawTestModRelay(); break;
+      case 3: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
+    }
+  } else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
+}
+
+constexpr uint8_t TEST_IO_CAT_COUNT = 5;
+const char* TEST_IO_CAT_LABELS[TEST_IO_CAT_COUNT] = { "I2C Scan", "Test Output", "Test Input", "Test RS485", "Test Modul" };
 uint8_t testIoCatCursor = 0;
 void drawTestIoCategory() { drawListMenu("TEST I/O", TEST_IO_CAT_LABELS, TEST_IO_CAT_COUNT, testIoCatCursor); }
 void handleTestIoCategoryKey(char key) {
@@ -915,6 +1069,7 @@ void handleTestIoCategoryKey(char key) {
       case 1: menuState = MenuState::TEST_OUTPUT_LIST; outputTestCursor = 0; drawTestOutputList(); break;
       case 2: menuState = MenuState::TEST_INPUT_LIST; inputTestScrollTop = 0; testInputLastScrollTop = 255; drawTestInputList(); break;
       case 3: menuState = MenuState::TEST_RS485; drawTestRs485(); break;
+      case 4: menuState = MenuState::TEST_MODULE_SELECT; moduleTypeCursor = 0; drawModuleTypeSelect(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuStocker(); }
 }
@@ -1152,6 +1307,11 @@ void loop() {
       else if (menuState == MenuState::TEST_OUTPUT_ITEM) handleTestOutputItemKey(key);
       else if (menuState == MenuState::TEST_INPUT_LIST) handleTestInputListKey(key);
       else if (menuState == MenuState::TEST_RS485) handleTestRs485Key(key);
+      else if (menuState == MenuState::TEST_MODULE_SELECT) handleModuleTypeKey(key);
+      else if (menuState == MenuState::TEST_MOD_STEPPER) handleTestModStepperKey(key);
+      else if (menuState == MenuState::TEST_MOD_MOTORDC) handleTestModMotorDCKey(key);
+      else if (menuState == MenuState::TEST_MOD_RELAY) handleTestModRelayKey(key);
+      else if (menuState == MenuState::TEST_MOD_SERVO) handleTestModServoKey(key);
       else if (menuState == MenuState::TEST_CMD_LIST) handleTestCmdListKey(key);
       else if (menuState == MenuState::CONFIRM_RESET) handleConfirmResetKey(key);
     }
@@ -1236,6 +1396,18 @@ void loop() {
   if (menuState == MenuState::TEST_RS485 && lcdPresent) {
     static uint32_t lastTestRs485Refresh = 0;
     if (millis() - lastTestRs485Refresh > 500) { lastTestRs485Refresh = millis(); drawTestRs485(); }
+  }
+  if (menuState == MenuState::TEST_MOD_STEPPER && lcdPresent) {
+    static uint32_t lastTestModRefresh = 0;
+    if (millis() - lastTestModRefresh > 150) { lastTestModRefresh = millis(); drawTestModStepper(); }
+  }
+  if (menuState == MenuState::TEST_MOD_MOTORDC && lcdPresent) {
+    static uint32_t lastTestModRefresh2 = 0;
+    if (millis() - lastTestModRefresh2 > 150) { lastTestModRefresh2 = millis(); drawTestModMotorDC(); }
+  }
+  if (menuState == MenuState::TEST_MOD_RELAY && lcdPresent) {
+    static uint32_t lastTestModRefresh3 = 0;
+    if (millis() - lastTestModRefresh3 > 150) { lastTestModRefresh3 = millis(); drawTestModRelay(); }
   }
 
   if (menuState != MenuState::NONE) return;

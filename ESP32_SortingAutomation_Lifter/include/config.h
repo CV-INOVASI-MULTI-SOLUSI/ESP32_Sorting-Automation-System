@@ -46,8 +46,8 @@ namespace CH {
   constexpr uint8_t PROX_2    = 19;   // spare
   constexpr uint8_t BUTTON_2  = 20;   // SORTER -- test pass
   constexpr uint8_t BUTTON_3  = 21;   // SORTER -- test reject
-  constexpr uint8_t LIM_1     = 22;   // STOCKER=LIM_X, Dispenser=LIM_STOCK_EMPTY
-  constexpr uint8_t LIM_2     = 23;   // STOCKER=LIM_Y, Dispenser=LIM_BOX_ARRIVED
+  constexpr uint8_t LIM_1     = 23;   // STOCKER=LIM_X, Dispenser=LIM_STOCK_EMPTY
+  constexpr uint8_t LIM_2     = 22;   // STOCKER=LIM_Y, Dispenser=LIM_BOX_ARRIVED
   constexpr uint8_t LIM_3     = 24;   // STOCKER=LIM_Z, Dispenser=LIM_PUSH_HOME
   constexpr uint8_t LIM_4     = 25;   // STOCKER=RACK_LIM[0], Dispenser=LIM_PUSH_EXTENDED
   constexpr uint8_t LIM_5     = 26;   // STOCKER=RACK_LIM[1]
