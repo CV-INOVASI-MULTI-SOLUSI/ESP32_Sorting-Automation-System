@@ -20,6 +20,7 @@ namespace I2CAddr {
   constexpr uint8_t KEYPAD = 0x20;
   constexpr uint8_t MCP1   = 0x22;
   constexpr uint8_t MCP2   = 0x23;
+  constexpr uint8_t PCA9685 = 0x40;   // BARU -- Test Modul Servo, konsisten dgn SORTER/PICKER
 }
 
 // --- Channel MCP23017 -- UNIVERSAL, SAMA PERSIS DI SEMUA 4 NODE ---
@@ -84,9 +85,9 @@ namespace GP {
 // Berlaku OTOMATIS ke SEMUA gerakan (homing, jog, RUN_FULL_CYCLE) karena diterapkan di
 // SATU titik (setAxisDirection()), bukan perlu diubah di banyak tempat.
 namespace AxisInvert {
-  constexpr bool X = true;   // ubah ke true kalau axis X (STEP_1) berputar kebalik
-  constexpr bool Y = true;   // ubah ke true kalau axis Y (STEP_2) berputar kebalik
-  constexpr bool Z = true;   // ubah ke true kalau axis Z (STEP_3) berputar kebalik
+  constexpr bool X = false;   // ubah ke true kalau axis X (STEP_1) berputar kebalik
+  constexpr bool Y = false;   // ubah ke true kalau axis Y (STEP_2) berputar kebalik
+  constexpr bool Z = false;   // ubah ke true kalau axis Z (STEP_3) berputar kebalik
 }
 
 namespace LcdCfg {

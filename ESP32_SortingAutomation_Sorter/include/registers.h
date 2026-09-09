@@ -50,6 +50,7 @@ enum class Cmd : uint16_t {
   NONE = 0, START = 1, STOP = 2, RESET_FAULT = 3, SET_HOPPER_INTERVAL = 4,
   SET_CONVEYOR_SPEED = 5, SET_CONVEYOR_DIR = 6, RESET_COUNTERS = 7,
   SET_MOTOR_A = 8,   // BARU -- arg: 0=stop,1=maju,2=mundur (channel A chip TB6612FNG yg sama dgn conveyor)
+  TEST_HOPPER_CYCLE = 97,      // test-only -- 1x siklus maju-mundur hopper pakai nilai KALIBRASI
   TEST_TRIGGER_PALANG = 98,   // O12 -- simulasi 1 hasil reject tanpa HuskyLens, utk kalibrasi TOF
   TEST_FAULT = 99             // test-only, HAPUS sebelum produksi riil
 };

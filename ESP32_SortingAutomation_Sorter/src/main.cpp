@@ -13,6 +13,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <ModbusRTU.h>
 #include <Preferences.h>
+#include <Adafruit_PWMServoDriver.h>
 #include "config.h"
 #include "registers.h"
 #include "keypad4x4.h"
@@ -23,6 +24,9 @@ LiquidCrystal_I2C lcd(I2CAddr::LCD, LcdCfg::COLS, LcdCfg::ROWS);
 Keypad4x4 keypad(I2CAddr::KEYPAD);
 IOBank io;
 ModbusRTU mb;
+// DIUBAH: servo hopper sekarang pakai library RESMI Adafruit_PWMServoDriver -- SAMA PERSIS
+// pola dengan PICKER (yang terbukti bekerja), menggantikan driver Wire mentah sebelumnya.
+Adafruit_PWMServoDriver pwm(I2CAddr::PCA9685);
 Preferences prefs;
 
 constexpr char Keypad4x4::KEYMAP[4][4];
@@ -58,11 +62,11 @@ struct SorterConfig {
   float    distMm           = 150.0f;        // O2: ukur jarak fisik scan->palang
   float    mmPerSecAtMaxPwm = 300.0f;        // O2: ukur kecepatan conveyor aktual
   uint8_t  motorASpeed      = 180;           // BARU -- PWM kecepatan motor A (0-255), independen dari conveyor
-  // BARU: Hopper servo + rack-pinion -- titik awal/dorong dalam microdetik pulsa (spt PICKER),
-  // interval dalam ms (total waktu 1 siklus dorong+kembali, BUKAN cuma waktu tunggu)
-  uint16_t hopperStartUs    = 1000;
-  uint16_t hopperPushUs     = 2000;
-  uint16_t hopperIntervalMs = 1000;
+  // DIUBAH KEMBALI ke POSITIONAL -- rack-pinion Anda pendek (dalam 1 putaran servo), jadi
+  // servo positional (spt MG996R) lebih sederhana & presisi drpd continuous-rotation.
+  uint16_t hopperStartUs    = 1000;   // posisi diam/tertarik
+  uint16_t hopperPushUs     = 2000;   // posisi dorong penuh
+  uint16_t hopperIntervalMs = 1000;   // total waktu 1 siklus penuh (dorong+kembali)
   // BARU: buzzer notifikasi -- durasi ON/OFF (ms) saat trigger event (palang aktif/reject)
   uint16_t buzzerOnMs  = 500;
   uint16_t buzzerOffMs = 500;
@@ -98,30 +102,56 @@ uint8_t qHead = 0, qTail = 0;
 
 constexpr int PWM_FREQ = 20000, PWM_RES = 8, LEDC_CH_CONV1 = 0, LEDC_CH_MOTORA = 1;
 
-// BARU: driver PCA9685 raw (Wire langsung, tanpa library) -- dipakai UNTUK PRODUKSI hopper
-// servo, KARENA board universal sudah jadi & tidak ada pin native yang benar-benar bebas
-// dipakai ulang (semua pin sudah terikat desain PCB tetap). Servo hopper WAJIB lewat I2C.
-constexpr uint8_t PCA9685_ADDR = 0x40;
+// DIUBAH TOTAL: servo hopper sekarang pakai library RESMI Adafruit_PWMServoDriver (objek
+// pwm global) -- SAMA PERSIS pola dengan PICKER yang terbukti bekerja, menggantikan driver
+// Wire mentah sebelumnya yang mungkin punya bug tersembunyi.
 constexpr uint8_t HOPPER_PCA_CHANNEL = 0;   // channel PCA9685 yang dipakai utk servo hopper
-bool pca9685Detected() { Wire.beginTransmission(PCA9685_ADDR); return (Wire.endTransmission() == 0); }
-void pca9685Init() {
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x10); Wire.endTransmission();
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0xFE); Wire.write((uint8_t)121); Wire.endTransmission();
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x20); Wire.endTransmission();
-  delay(5);
-}
-void pca9685SetServoUs(uint8_t channel, uint16_t us) {
-  uint32_t ticks = (uint32_t)us * 4096UL / 20000UL;
-  uint8_t reg = 0x06 + 4 * channel;
-  Wire.beginTransmission(PCA9685_ADDR);
-  Wire.write(reg); Wire.write((uint8_t)0); Wire.write((uint8_t)0);
-  Wire.write((uint8_t)(ticks & 0xFF)); Wire.write((uint8_t)(ticks >> 8));
-  Wire.endTransmission();
-}
+constexpr uint16_t HOPPER_MIN_US = 400, HOPPER_MAX_US = 2500;   // DIVERIFIKASI FISIK -- di bawah 400 servo tidak bergerak (meski masih bisa diputar manual)
 
-// DIUBAH: hopper servo sekarang lewat PCA9685 (I2C), BUKAN lagi LEDC/native GPIO
-void hopperSetUs(uint16_t us) {
-  pca9685SetServoUs(HOPPER_PCA_CHANNEL, us);
+// DIUBAH: fungsi generik -- dipakai BERSAMA oleh hopper produksi (channel tetap) dan Test
+// Modul Servo (channel bisa diganti-ganti operator). SAMA PERSIS pola usToDuty() PICKER.
+void pcaSetServoUs(uint8_t channel, uint16_t us) {
+  us = constrain(us, HOPPER_MIN_US, HOPPER_MAX_US);
+  uint16_t duty = (uint32_t)us * 4096 / 20000;
+  pwm.setPWM(channel, 0, duty);
+}
+void hopperSetUs(uint16_t us) { pcaSetServoUs(HOPPER_PCA_CHANNEL, us); }
+
+// Variabel gerak BERSAMA (dipakai FSM produksi & Test Sequence) -- dipindah ke atas supaya
+// bisa dipakai Test Sequence yang didefinisikan lebih dulu dalam file.
+uint32_t hopperMoveStartMs = 0;   // kapan gerakan SAAT INI mulai
+uint16_t hopperMoveFromUs = 0;    // posisi SAAT gerakan mulai (titik awal interpolasi)
+
+// --- BARU: Test Sequence Hopper -- 1x siklus maju-mundur PAKAI NILAI KALIBRASI (Titik Awal/Dorong/
+// Interval), dipicu dari LCD Test Command ATAU langsung dari Orange Pi (opcode). REUSE trajectory
+// helper YANG SAMA dengan produksi (updateHopperTrajectory, didefinisikan di bawah).
+bool updateHopperTrajectory(uint16_t targetUs);   // forward declaration -- definisi lengkap di handleHopper()
+enum class TestHopperCycleStage { NONE, MOVING_TO_PUSH, MOVING_TO_START };
+TestHopperCycleStage testHopperCycleStage = TestHopperCycleStage::NONE;
+void startTestHopperCycle() {
+  if (currentState != NodeState::IDLE) { Serial.println("[TEST] Hopper cycle ditolak -- node sedang tidak IDLE"); return; }
+  testHopperCycleStage = TestHopperCycleStage::MOVING_TO_PUSH;
+  hopperMoveFromUs = cfg.hopperStartUs;
+  hopperMoveStartMs = millis();
+  Serial.println("[TEST] Hopper cycle dimulai (pakai nilai kalibrasi, termasuk Interval)");
+}
+void updateTestHopperCycle() {
+  switch (testHopperCycleStage) {
+    case TestHopperCycleStage::MOVING_TO_PUSH:
+      if (updateHopperTrajectory(cfg.hopperPushUs)) {
+        testHopperCycleStage = TestHopperCycleStage::MOVING_TO_START;
+        hopperMoveFromUs = cfg.hopperPushUs;
+        hopperMoveStartMs = millis();
+      }
+      break;
+    case TestHopperCycleStage::MOVING_TO_START:
+      if (updateHopperTrajectory(cfg.hopperStartUs)) {
+        testHopperCycleStage = TestHopperCycleStage::NONE;
+        Serial.println("[TEST] Hopper cycle SELESAI");
+      }
+      break;
+    default: break;
+  }
 }
 
 void motorWrite(uint8_t ain1, uint8_t ain2, bool forward) {
@@ -176,46 +206,56 @@ uint16_t onClassifyWrite(TRegister* reg, uint16_t val) {
 
 // --- BARU: Hopper servo + rack-pinion -- FSM 2-tahap (Push -> Return), dirancang supaya
 // TOTAL 1 siklus penuh = persis cfg.hopperIntervalMs yang di-set user (bukan waktu tunggu SAJA).
-enum class HopperState { AT_START, PUSHING, RETURNING };
+// DIREDESIGN TOTAL: servo hopper CONTINUOUS ROTATION -- konsep lama (posisi Awal/Dorong)
+// TIDAK BERLAKU untuk servo jenis ini. Sekarang: kirim pulsa arah+kecepatan SELAMA durasi
+// tertentu, LALU WAJIB kirim pulsa netral eksplisit (STOP) sebelum ganti arah -- servo
+// continuous-rotation TIDAK PERNAH "diam sendiri" di suatu posisi seperti servo biasa,
+// dia AKAN TERUS BERPUTAR sampai benar-benar diperintah netral.
+// DIKEMBALIKAN ke POSITIONAL: rack-pinion pendek, servo positional (spt MG996R) lebih
+// sederhana & presisi drpd continuous-rotation -- servo diam sendiri di posisi yang
+// diperintah, tidak perlu STOP eksplisit / risiko putar tak terkendali.
+// DIREDESIGN: Interval sekarang = WAKTU TEMPUH satu arah (Titik Awal->Titik Dorong), BUKAN
+// lagi total 1 siklus. Servo bergerak BERTAHAP (ramped, non-blocking) selama durasi itu --
+// bukan lompat instan seperti sebelumnya. Arah kembali (Dorong->Awal) pakai durasi SAMA.
+enum class HopperState { AT_START, MOVING_TO_PUSH, AT_PUSH, MOVING_TO_START };
 HopperState hopperState = HopperState::AT_START;
-uint32_t hopperStateEnteredAt = 0;
-constexpr uint32_t HOPPER_DWELL_MS = 200;   // waktu servo geser+settle per tahap gerak (fisik, bukan sensor)
-bool hopperIntervalTestMode = false;   // di-set true/false dari handleCalListKey()/handleParamKey() -- lihat di bawah
+bool hopperIntervalTestMode = false;   // di-set true/false dari handleCalListKey()/handleParamKey()
+
+// Interpolasi linear non-blocking: dari hopperMoveFromUs menuju targetUs, selama cfg.hopperIntervalMs.
+// Return true kalau SUDAH SAMPAI (durasi habis).
+bool updateHopperTrajectory(uint16_t targetUs) {
+  uint32_t elapsed = millis() - hopperMoveStartMs;
+  if (elapsed >= cfg.hopperIntervalMs) { hopperSetUs(targetUs); return true; }
+  float fraction = (float)elapsed / (float)cfg.hopperIntervalMs;
+  int32_t interpolated = (int32_t)hopperMoveFromUs + (int32_t)(((int32_t)targetUs - (int32_t)hopperMoveFromUs) * fraction);
+  hopperSetUs((uint16_t)constrain(interpolated, (int32_t)HOPPER_MIN_US, (int32_t)HOPPER_MAX_US));
+  return false;
+}
+
 void handleHopper() {
   // BARU: kalau operator SEDANG di layar kalibrasi "Hopper Interval(ms)", paksa FSM tetap
-  // bersiklus LIVE walau currentState bukan RUNNING_OR_MOVING -- supaya waktu antar-dorong
-  // bisa diamati/diverifikasi presisi langsung sambil nilai disesuaikan, tanpa perlu START
-  // produksi penuh dulu. Berhenti otomatis begitu operator keluar layar ini.
+  // bersiklus LIVE walau currentState bukan RUNNING_OR_MOVING -- supaya waktu tempuh bisa
+  // diamati/diverifikasi presisi langsung sambil nilai disesuaikan, tanpa perlu START produksi.
   if (currentState != NodeState::RUNNING_OR_MOVING && !hopperIntervalTestMode) {
     if (hopperState != HopperState::AT_START) { hopperSetUs(cfg.hopperStartUs); hopperState = HopperState::AT_START; }
-    hopperStateEnteredAt = millis();
     return;
   }
-  uint32_t elapsed = millis() - hopperStateEnteredAt;
   switch (hopperState) {
-    case HopperState::AT_START: {
-      // sisa waktu tunggu = interval TOTAL dikurangi waktu gerak (push+return) -- supaya
-      // total 1 siklus penuh persis sama dgn interval yg di-set, bukan interval+waktu gerak
-      uint32_t waitMs = (cfg.hopperIntervalMs > 2 * HOPPER_DWELL_MS) ? (cfg.hopperIntervalMs - 2 * HOPPER_DWELL_MS) : 0;
-      if (elapsed >= waitMs) {
-        hopperSetUs(cfg.hopperPushUs);
-        hopperState = HopperState::PUSHING;
-        hopperStateEnteredAt = millis();
-      }
+    case HopperState::AT_START:
+      hopperMoveFromUs = cfg.hopperStartUs;
+      hopperMoveStartMs = millis();
+      hopperState = HopperState::MOVING_TO_PUSH;
       break;
-    }
-    case HopperState::PUSHING:
-      if (elapsed >= HOPPER_DWELL_MS) {
-        hopperSetUs(cfg.hopperStartUs);
-        hopperState = HopperState::RETURNING;
-        hopperStateEnteredAt = millis();
-      }
+    case HopperState::MOVING_TO_PUSH:
+      if (updateHopperTrajectory(cfg.hopperPushUs)) hopperState = HopperState::AT_PUSH;
       break;
-    case HopperState::RETURNING:
-      if (elapsed >= HOPPER_DWELL_MS) {
-        hopperState = HopperState::AT_START;
-        hopperStateEnteredAt = millis();   // mulai hitung interval BARU dari sini -- siklus berikutnya
-      }
+    case HopperState::AT_PUSH:
+      hopperMoveFromUs = cfg.hopperPushUs;
+      hopperMoveStartMs = millis();
+      hopperState = HopperState::MOVING_TO_START;
+      break;
+    case HopperState::MOVING_TO_START:
+      if (updateHopperTrajectory(cfg.hopperStartUs)) hopperState = HopperState::AT_START;
       break;
   }
 }
@@ -345,6 +385,7 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       mb.Hreg(Reg::PASS_COUNT, 0); mb.Hreg(Reg::REJECT_COUNT, 0);
       break;
     case Cmd::SET_MOTOR_A: setMotorA((uint8_t)constrain(arg, 0, 2)); break;
+    case Cmd::TEST_HOPPER_CYCLE: startTestHopperCycle(); break;
     case Cmd::TEST_TRIGGER_PALANG:
       enqueueClassification(true, millis());
       Serial.println("[SORTER] TEST_TRIGGER_PALANG -- simulasi reject dikirim");
@@ -518,17 +559,17 @@ void handleParamKey(char key) {
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       if (motorAState != 0) ledcWrite(LEDC_CH_MOTORA, cfg.motorASpeed);   // update live kalau sedang jalan
       break;
-    // BARU: Hopper titik awal/dorong -- PREVIEW LIVE (servo langsung gerak saat dijog), sama
-    // pola dgn kalibrasi offset PICKER, supaya operator lihat langsung hasilnya di rack-pinion.
+    // DIKEMBALIKAN ke POSITIONAL: preview live langsung untuk Titik Awal/Dorong (servo diam
+    // sendiri di posisi yang diperintah, aman ditahan tanpa risiko putar tak terkendali).
     case 7:
-      if (key == 'A') cfg.hopperStartUs = (uint16_t)constrain((int)cfg.hopperStartUs + step, 500, 2500);
-      else if (key == 'B') cfg.hopperStartUs = (uint16_t)constrain((int)cfg.hopperStartUs - step, 500, 2500);
+      if (key == 'A') cfg.hopperStartUs = (uint16_t)constrain((int)cfg.hopperStartUs + step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
+      else if (key == 'B') cfg.hopperStartUs = (uint16_t)constrain((int)cfg.hopperStartUs - step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       hopperSetUs(cfg.hopperStartUs);   // preview live
       break;
     case 8:
-      if (key == 'A') cfg.hopperPushUs = (uint16_t)constrain((int)cfg.hopperPushUs + step, 500, 2500);
-      else if (key == 'B') cfg.hopperPushUs = (uint16_t)constrain((int)cfg.hopperPushUs - step, 500, 2500);
+      if (key == 'A') cfg.hopperPushUs = (uint16_t)constrain((int)cfg.hopperPushUs + step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
+      else if (key == 'B') cfg.hopperPushUs = (uint16_t)constrain((int)cfg.hopperPushUs - step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       hopperSetUs(cfg.hopperPushUs);   // preview live
       break;
@@ -815,14 +856,15 @@ void handleTestModRelayKey(char key) {
   drawTestModRelay();
 }
 
-// --- Modul: Servo (PCA9685) -- cek deteksi I2C dulu, baru izinkan gerak ---
+// --- Modul: Servo (PCA9685) -- cek deteksi I2C dulu, baru izinkan gerak. Pakai objek pwm
+// GLOBAL yang sama dengan hopper produksi (SATU driver, bukan 2 cara berbeda lagi) ---
 uint8_t testModServoCh = 0;
 bool testModServoDetected = false;
 void drawTestModServo() {
   if (testModFirstDraw) {
     lcd.clear(); lcdPrint(0, 0, "MODUL: SERVO");
-    testModServoDetected = pca9685Detected();
-    if (testModServoDetected) pca9685Init();
+    Wire.beginTransmission(I2CAddr::PCA9685);
+    testModServoDetected = (Wire.endTransmission() == 0);
     testModFirstDraw = false; testModLine1 = "\x01";
   }
   String line1 = testModServoDetected ? ("PCA9685 OK, CH:" + String(testModServoCh)) : "PCA9685 TIDAK ADA";
@@ -833,8 +875,8 @@ void handleTestModServoKey(char key) {
   if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
   if (testModServoDetected) {
     if (key == 'C') { testModServoCh = (testModServoCh + 1) % 16; }
-    else if (key == 'A') { pca9685SetServoUs(testModServoCh, 1700); }
-    else if (key == 'B') { pca9685SetServoUs(testModServoCh, 1300); }
+    else if (key == 'A') { pcaSetServoUs(testModServoCh, 1700); }
+    else if (key == 'B') { pcaSetServoUs(testModServoCh, 1300); }
   }
   drawTestModServo();
 }
@@ -874,7 +916,7 @@ void handleTestIoCategoryKey(char key) {
 
 // --- LEVEL 1c: TEST COMMAND (simulasi command SEOLAH dari node lain via Modbus) ---
 struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
-constexpr uint8_t CMD_TEST_COUNT = 10;
+constexpr uint8_t CMD_TEST_COUNT = 11;
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"START",             Cmd::START,               0},
   {"STOP",               Cmd::STOP,                0},
@@ -884,6 +926,7 @@ CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"RESET_COUNTERS",     Cmd::RESET_COUNTERS,      0},
   {"MOTOR_A Maju",       Cmd::SET_MOTOR_A,         1},
   {"MOTOR_A Stop",       Cmd::SET_MOTOR_A,         0},
+  {"Test Hopper M/M",    Cmd::TEST_HOPPER_CYCLE,   0},
   {"TEST_TRIGGER_PALANG",Cmd::TEST_TRIGGER_PALANG, 0},
   {"TEST_FAULT",         Cmd::TEST_FAULT,          0},
 };
@@ -1150,6 +1193,22 @@ void setup() {
   // TBD HOPPER: io.pinMode(CH::LIMIT_HOPPER, INPUT_PULLUP); -- aktifkan lagi nanti
   Serial.printf("[BOOT] MCP23017: %s, semua pinMode selesai (hopper belum di-setup, TBD)\n", ioOk ? "OK" : "GAGAL");
 
+  // DIPERBAIKI (regresi ditemukan): pwm.begin() TIDAK BOLEH ditunda sampai setelah
+  // loadConfigFromNvs() -- itu BUG BARU yang tidak sengaja saya perkenalkan saat
+  // memperbaiki bug lain sebelumnya. PICKER (yang terbukti bekerja) memanggil pwm.begin()
+  // SEGERA setelah io.pinMode() selesai, BUKAN ditunda sampai setelah akses NVS/flash.
+  // pwm.begin() (inisialisasi CHIP) dipisah dari hopperSetUs() (PENERAPAN kalibrasi) --
+  // yang PERTAMA harus SEDINI mungkin, yang KEDUA baru boleh setelah cfg dimuat dari NVS.
+  pwm.begin(); pwm.setPWMFreq(50);
+  // DITAMBAHKAN (akar masalah ditemukan!): pin Output-Enable PCA9685 (aktif-LOW) TIDAK PERNAH
+  // ditarik LOW sebelumnya -- komunikasi I2C berhasil sempurna, PWM dihitung benar secara
+  // internal, TAPI output pin secara FISIK tidak pernah aktif tanpa OE=LOW. Inilah penyebab
+  // sebenarnya servo diam meski software terlihat benar, dan kenapa power-cycle sungguhan
+  // (yang mereset MCP23017 channel OE ke default) selalu mematikan servo lagi.
+  io.pinMode(CH::OE_PCA, OUTPUT);
+  io.write(CH::OE_PCA, LOW);
+  Serial.println("[BOOT] PCA9685 diinisialisasi (Adafruit_PWMServoDriver)");
+
   ledcSetup(LEDC_CH_CONV1, PWM_FREQ, PWM_RES);
   ledcAttachPin(GP::CONV1_PWM, LEDC_CH_CONV1);
   ledcSetup(LEDC_CH_MOTORA, PWM_FREQ, PWM_RES);       // BARU
@@ -1162,12 +1221,8 @@ void setup() {
   loadConfigFromNvs();   // BARU -- cfg sekarang persist antar reboot, sebelumnya selalu reset ke default
   Serial.println("[BOOT] SorterConfig dimuat dari NVS (kalau pernah disimpan)");
 
-  // DIPERBAIKI (bug urutan): pca9685Init() + hopperSetUs() HARUS setelah loadConfigFromNvs() --
-  // sebelumnya hopperSetUs() dipanggil pakai nilai DEFAULT compile-time (cfg.hopperStartUs belum
-  // dimuat dari NVS), bukan nilai kalibrasi tersimpan yang sebenarnya.
-  pca9685Init();
   hopperSetUs(cfg.hopperStartUs);   // posisi awal servo saat boot, PAKAI nilai kalibrasi tersimpan
-  Serial.println("[BOOT] PCA9685 hopper servo diinisialisasi");
+  Serial.println("[BOOT] Hopper diposisikan ke titik awal");
 
   Serial2.begin(Rs485Cfg::BAUD, SERIAL_8N1, Rs485Cfg::RX_PIN, Rs485Cfg::TX_PIN);
   mb.begin(&Serial2);
@@ -1282,6 +1337,7 @@ void loop() {
   handleSafety();
   if (currentState != NodeState::ESTOPPED && currentState != NodeState::FAULT) {
     handleHopper();   // BARU -- servo hopper aktif otomatis selama RUNNING_OR_MOVING
+    updateTestHopperCycle();   // BARU -- proses test sequence non-blocking (independen dari FSM hopper produksi)
     updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking, TIDAK di-skip walau menu aktif
     handleConveyor();
     handlePalangQueue();

@@ -12,7 +12,7 @@
 namespace Pin {
   constexpr uint8_t I2C_SDA = 21;
   constexpr uint8_t I2C_SCL = 22;
-  constexpr uint32_t I2C_FREQ_HZ = 100000;
+  constexpr uint32_t I2C_FREQ_HZ = 400000;
 }
 
 namespace I2CAddr {
@@ -20,6 +20,7 @@ namespace I2CAddr {
   constexpr uint8_t KEYPAD = 0x20;
   constexpr uint8_t MCP1   = 0x22;
   constexpr uint8_t MCP2   = 0x23;
+  constexpr uint8_t PCA9685 = 0x40;   // BARU -- Test Modul Servo, konsisten dgn SORTER/PICKER/STOCKER
 }
 
 namespace LcdCfg {

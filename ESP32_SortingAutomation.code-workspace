@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "ESP32_SortingAutomation_Dispenser"
+		},
+		{
+			"name": "ESP32_SortingAutomation_Lifter",
+			"path": "ESP32_SortingAutomation_Lifter"
+		},
+		{
+			"name": "ESP32_SortingAutomation_Picker",
+			"path": "ESP32_SortingAutomation_Picker"
+		},
+		{
+			"name": "ESP32_SortingAutomation_Sorter",
+			"path": "ESP32_SortingAutomation_Sorter"
+		}
+	],
+	"settings": {}
+}

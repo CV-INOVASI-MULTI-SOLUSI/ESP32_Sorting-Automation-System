@@ -24,7 +24,12 @@ namespace Reg {
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik FEEDER (refillState yg sudah ada) ---
 enum class ActivityCode : uint16_t {
-  DIAM = 0, CONVEYOR_JALAN = 1, MENDORONG_BOX = 2, MENARIK_KEMBALI = 3, SELESAI = 4,
+  DIAM = 0, CONVEYOR_JALAN = 1,
+  // DIUBAH: MENDORONG_BOX/MENARIK_KEMBALI diganti 6 tahap servo1/servo2 (redesign mekanisme
+  // dispenser dari DC-motor-push jadi 2-servo gerbang stack)
+  SERVO1_BUKA = 2, SERVO1_TAHAN = 3, SERVO1_TUTUP = 4,
+  SERVO2_BUKA = 5, SERVO2_TAHAN = 6, SERVO2_TUTUP = 7,
+  SELESAI = 8,
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
 };
 
@@ -43,5 +48,7 @@ enum class Cmd : uint16_t {
   NONE = 0,
   REQUEST_REFILL = 1,       // mulai FSM conveyor2+push
   RESET_FAULT = 2,
-  SET_CONVEYOR_SPEED = 3
+  SET_CONVEYOR_SPEED = 3,
+  TEST_SERVO1_CYCLE = 97,   // test-only -- 1x siklus maju-mundur pakai nilai KALIBRASI servo1
+  TEST_SERVO2_CYCLE = 98    // test-only -- 1x siklus maju-mundur pakai nilai KALIBRASI servo2
 };

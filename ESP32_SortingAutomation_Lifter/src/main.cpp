@@ -8,10 +8,14 @@
 #include <LiquidCrystal_I2C.h>
 #include <ModbusRTU.h>
 #include <Preferences.h>
+#include <Adafruit_PWMServoDriver.h>
 #include "config.h"
 #include "registers.h"
 #include "keypad4x4.h"
 #include "io_expander.h"
+
+// BARU: objek pwm global, dipakai Test Modul Servo -- SAMA PERSIS pola dgn SORTER/PICKER
+Adafruit_PWMServoDriver pwm(I2CAddr::PCA9685);
 
 LiquidCrystal_I2C lcd(I2CAddr::LCD, LcdCfg::COLS, LcdCfg::ROWS);
 Keypad4x4 keypad(I2CAddr::KEYPAD);
@@ -977,25 +981,12 @@ void handleTestRs485Key(char key) {
 // pakai channel2 itu, tapi channel-nya TETAP ada di config.h karena board universal.
 void startJog(uint8_t axis, int32_t delta);   // forward declaration -- didefinisikan di bawah
 
-// --- PCA9685 minimal raw driver (Wire langsung, TANPA library) -- utk Test Modul Servo.
-// STOCKER tidak punya driver PCA9685 resmi (beda dgn PICKER yang sudah pakai Adafruit_PWMServoDriver
-// utk produksi) -- ini versi RINGAN khusus test, aman dipakai kapan saja karena cuma aktif kalau
-// operator masuk menu Test Modul Servo secara sengaja.
-constexpr uint8_t PCA9685_ADDR = 0x40;
-bool pca9685Detected() { Wire.beginTransmission(PCA9685_ADDR); return (Wire.endTransmission() == 0); }
-void pca9685Init() {
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x10); Wire.endTransmission();   // sleep dulu utk ubah prescale
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0xFE); Wire.write((uint8_t)121); Wire.endTransmission();     // prescale ~50Hz
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x20); Wire.endTransmission();   // wake + auto-increment
-  delay(5);
-}
-void pca9685SetServoUs(uint8_t channel, uint16_t us) {
-  uint32_t ticks = (uint32_t)us * 4096UL / 20000UL;   // konversi pulsa mikrodetik -> tick (periode 20ms @ 50Hz)
-  uint8_t reg = 0x06 + 4 * channel;
-  Wire.beginTransmission(PCA9685_ADDR);
-  Wire.write(reg); Wire.write((uint8_t)0); Wire.write((uint8_t)0);
-  Wire.write((uint8_t)(ticks & 0xFF)); Wire.write((uint8_t)(ticks >> 8));
-  Wire.endTransmission();
+// --- Servo (Test Modul) -- DIUBAH ke library resmi Adafruit_PWMServoDriver, SAMA PERSIS
+// pola dengan SORTER/PICKER (menggantikan driver Wire mentah yang berpotensi bug tersembunyi).
+void pcaSetServoUs(uint8_t channel, uint16_t us) {
+  us = constrain(us, (uint16_t)500, (uint16_t)2500);
+  uint16_t duty = (uint32_t)us * 4096 / 20000;
+  pwm.setPWM(channel, 0, duty);
 }
 
 // --- Sub-menu pilihan jenis modul ---
@@ -1091,8 +1082,8 @@ bool testModServoDetected = false;
 void drawTestModServo() {
   if (testModFirstDraw) {
     lcd.clear(); lcdPrint(0, 0, "MODUL: SERVO");
-    testModServoDetected = pca9685Detected();
-    if (testModServoDetected) pca9685Init();
+    Wire.beginTransmission(I2CAddr::PCA9685);
+    testModServoDetected = (Wire.endTransmission() == 0);
     testModFirstDraw = false; testModLine1 = "\x01";
   }
   String line1 = testModServoDetected ? ("PCA9685 OK, CH:" + String(testModServoCh)) : "PCA9685 TIDAK ADA";
@@ -1103,8 +1094,8 @@ void handleTestModServoKey(char key) {
   if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
   if (testModServoDetected) {
     if (key == 'C') { testModServoCh = (testModServoCh + 1) % 16; }
-    else if (key == 'A') { pca9685SetServoUs(testModServoCh, 1700); }   // nudge kanan dari center
-    else if (key == 'B') { pca9685SetServoUs(testModServoCh, 1300); }   // nudge kiri dari center
+    else if (key == 'A') { pcaSetServoUs(testModServoCh, 1700); }   // nudge kanan dari center
+    else if (key == 'B') { pcaSetServoUs(testModServoCh, 1300); }   // nudge kiri dari center
   }
   drawTestModServo();
 }
@@ -1301,10 +1292,17 @@ void setup() {
   Serial.println("\n[BOOT] STOCKER mulai (Y-axis = pusher)");
 
   Wire.begin(Pin::I2C_SDA, Pin::I2C_SCL, Pin::I2C_FREQ_HZ);
+  pwm.begin(); pwm.setPWMFreq(50);   // BARU -- utk Test Modul Servo (library resmi, sinkron SORTER/PICKER)
   scanI2CAndDetectOptional();
 
   bool ioOk = io.begin(I2CAddr::MCP1, I2CAddr::MCP2);
   if (!ioOk) { faultCode = (uint16_t)FaultCode::IO_EXPANDER_MISSING; currentState = NodeState::FAULT; }
+
+  // DITAMBAHKAN (akar masalah ditemukan!): pin Output-Enable PCA9685 (aktif-LOW) TIDAK PERNAH
+  // ditarik LOW sebelumnya -- ini penyebab sebenarnya servo diam meski I2C berhasil sempurna.
+  // WAJIB setelah io.begin() -- io.pinMode()/io.write() butuh IOBank sudah siap dulu.
+  io.pinMode(CH::OE_PCA, OUTPUT);
+  io.write(CH::OE_PCA, LOW);
 
   if (lcdPresent) { lcd.init(); lcd.backlight(); lcdPrint(0, 0, "STOCKER"); Serial.println("[BOOT] LCD OK"); }
   else Serial.println("[BOOT] LCD dilewati -- kalibrasi via Serial (HELP)");
