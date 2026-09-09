@@ -65,6 +65,25 @@ uint16_t trajStepUs = 20;          // kecepatan JELAJAH (setelah "pemanasan") --
 uint16_t trajStepIntervalMs = 20;  // jeda antar update -- BISA DIATUR
 uint32_t lastTrajStepMs = 0;
 
+// BARU: buzzer notifikasi -- 1 siklus ON-OFF non-blocking per trigger event
+uint16_t buzzerOnMs = 500, buzzerOffMs = 500;
+bool buzzerBeeping = false, buzzerCurrentlyOn = false;
+uint32_t buzzerStateChangedAt = 0;
+void triggerBuzzerBeep() {
+  buzzerBeeping = true; buzzerCurrentlyOn = true;
+  io.write(CH::BUZZER, HIGH);
+  buzzerStateChangedAt = millis();
+}
+void updateBuzzerBeep() {
+  if (!buzzerBeeping) return;
+  uint32_t elapsed = millis() - buzzerStateChangedAt;
+  if (buzzerCurrentlyOn && elapsed >= buzzerOnMs) {
+    io.write(CH::BUZZER, LOW); buzzerCurrentlyOn = false; buzzerStateChangedAt = millis();
+  } else if (!buzzerCurrentlyOn && elapsed >= buzzerOffMs) {
+    buzzerBeeping = false;
+  }
+}
+
 // BARU: ramp akselerasi/deselerasi per-joint -- sama pola dgn STOCKER. Mulai pelan
 // (rampMinStepUs), naik ke trajStepUs selama rampSteps langkah pertama, pelan lagi
 // selama rampSteps langkah terakhir mendekati target. Mengurangi sentakan mekanis +
@@ -171,13 +190,16 @@ void processQueue() {
   switch (item.cmd) {
     case QCmd::GOTO_POSE: startMoveAbs(POSES[item.poseIdx].us, 800); break;
     case QCmd::PICK:  startMoveDelta(PICK_OFFSET, 400); break;
-    case QCmd::PLACE: startMoveDelta(PLACE_OFFSET, 400); break;
+    case QCmd::PLACE: startMoveDelta(PLACE_OFFSET, 400); triggerBuzzerBeep(); break;   // BARU -- notifikasi: package diletakkan
     case QCmd::CLEARANCE: startMoveDelta(CLEARANCE_OFFSET, 400); break;
     case QCmd::POST_PLACE: startMoveDelta(POST_PLACE_OFFSET, 400); break;
   }
 }
 void checkSequenceComplete() {
-  if (ackPending && qHead == qTail && !moving) { ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq); }
+  if (ackPending && qHead == qTail && !moving) {
+    ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq);
+    triggerBuzzerBeep();   // BARU -- notifikasi: siklus selesai, sudah kembali Home
+  }
 }
 
 void loadPosesFromNvs() {
@@ -191,6 +213,8 @@ void loadPosesFromNvs() {
   if (prefs.isKey("trajIntv")) trajStepIntervalMs = prefs.getUShort("trajIntv", trajStepIntervalMs);
   if (prefs.isKey("rampMin")) rampMinStepUs = prefs.getUShort("rampMin", rampMinStepUs);   // BARU
   if (prefs.isKey("rampSteps")) rampSteps = prefs.getUShort("rampSteps", rampSteps);       // BARU
+  if (prefs.isKey("buzzOn")) buzzerOnMs = prefs.getUShort("buzzOn", buzzerOnMs);           // BARU
+  if (prefs.isKey("buzzOff")) buzzerOffMs = prefs.getUShort("buzzOff", buzzerOffMs);       // BARU
   prefs.end();
 }
 void savePosesToNvs() { prefs.begin("picker_cal", false); prefs.putBytes("poses", POSES, sizeof(POSES)); prefs.end(); }
@@ -207,6 +231,12 @@ void saveRampToNvs() {   // BARU
   prefs.begin("picker_cal", false);
   prefs.putUShort("rampMin", rampMinStepUs);
   prefs.putUShort("rampSteps", rampSteps);
+  prefs.end();
+}
+void saveBuzzerToNvs() {   // BARU
+  prefs.begin("picker_cal", false);
+  prefs.putUShort("buzzOn", buzzerOnMs);
+  prefs.putUShort("buzzOff", buzzerOffMs);
   prefs.end();
 }
 // BARU: reset total -- hapus SEMUA kalibrasi NVS ("picker_cal" namespace) & kembalikan RAM ke default
@@ -229,6 +259,7 @@ void resetAllToDefault() {
   memcpy(POST_PLACE_OFFSET, defPostPlace, sizeof(POST_PLACE_OFFSET));
   trajStepUs = 20; trajStepIntervalMs = 20;
   rampMinStepUs = 4; rampSteps = 15;   // BARU
+  buzzerOnMs = 500; buzzerOffMs = 500;   // BARU
   Serial.println("[RESET] Semua kalibrasi PICKER dikembalikan ke default & NVS dihapus");
 }
 
@@ -322,6 +353,7 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       if (blockIfFaulted("RUN_SEQUENCE")) return;
       enqueue(QCmd::GOTO_POSE, 0);
       enqueue(QCmd::CLEARANCE);
+      triggerBuzzerBeep();   // BARU -- notifikasi: arm mulai menuju objek untuk diambil
       enqueue(QCmd::GOTO_POSE, arg == 1 ? 1 : 2);
       enqueue(QCmd::PICK);
       enqueue(QCmd::GOTO_POSE, 3);
@@ -487,14 +519,16 @@ void drawSpeedMenu() {
     case 2: line1 = "2:Interval=" + String(trajStepIntervalMs) + "ms"; break;
     case 3: line1 = "3:RampMin=" + String(rampMinStepUs) + "us"; break;
     case 4: line1 = "4:RampSteps=" + String(rampSteps); break;
+    case 5: line1 = "5:BuzzOn=" + String(buzzerOnMs) + "ms"; break;
+    case 6: line1 = "6:BuzzOff=" + String(buzzerOffMs) + "ms"; break;
   }
   lcdPrint(0, 1, line1);
-  lcdPrint(0, 2, "1-4=pilih A+B-C:step");
+  lcdPrint(0, 2, "1-6=pilih A+B-C:step");
   lcdPrint(0, 3, "#=SIMPAN D=kembali");
 }
 void handleSpeedKey(char key) {
   int16_t step = JOG_STEPS[jogStepIdx];
-  if (key >= '1' && key <= '4') { selSpeedParam = key - '0'; }
+  if (key >= '1' && key <= '6') { selSpeedParam = key - '0'; }
   else if (key == 'A' || key == 'B') {
     int delta = (key == 'A') ? step : -step;
     switch (selSpeedParam) {
@@ -502,12 +536,14 @@ void handleSpeedKey(char key) {
       case 2: trajStepIntervalMs = (uint16_t)constrain((int)trajStepIntervalMs + delta, 5, 200); break;
       case 3: rampMinStepUs = (uint16_t)constrain((int)rampMinStepUs + delta, 1, 500); break;
       case 4: rampSteps = (uint16_t)constrain((int)rampSteps + delta, 0, 200); break;
+      case 5: buzzerOnMs = (uint16_t)constrain((int)buzzerOnMs + delta * 10, 50, 5000); break;
+      case 6: buzzerOffMs = (uint16_t)constrain((int)buzzerOffMs + delta * 10, 50, 5000); break;
     }
   } else if (key == 'C') { jogStepIdx = (jogStepIdx + 1) % 4; }
   else if (key == '#') {
-    saveSpeedToNvs(); saveRampToNvs();
+    saveSpeedToNvs(); saveRampToNvs(); saveBuzzerToNvs();
     lcdPrint(0, 3, "TERSIMPAN ke NVS!");
-    Serial.println("[CAL] Step/Interval/Ramp disimpan");
+    Serial.println("[CAL] Step/Interval/Ramp/Buzzer disimpan");
     return;
   }
   else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); return; }
@@ -1106,6 +1142,7 @@ void loop() {
     updateTrajectory();
     processQueue();
     checkSequenceComplete();
+    updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking
   }
 
   if (menuState != MenuState::NONE) return;   // command eksternal dijeda saat menu aktif (§12.6)

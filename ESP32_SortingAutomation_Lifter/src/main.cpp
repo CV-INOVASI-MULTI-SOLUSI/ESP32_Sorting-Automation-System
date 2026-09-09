@@ -55,6 +55,25 @@ int32_t curPos[3] = {0, 0, 0}, tgtPos[3] = {0, 0, 0};
 bool homed[3] = {false, false, false};
 uint32_t lastStepMicros[3] = {0, 0, 0};
 
+// BARU: buzzer notifikasi -- 1 siklus ON-OFF non-blocking per trigger event
+uint16_t buzzerOnMs = 500, buzzerOffMs = 500;
+bool buzzerBeeping = false, buzzerCurrentlyOn = false;
+uint32_t buzzerStateChangedAt = 0;
+void triggerBuzzerBeep() {
+  buzzerBeeping = true; buzzerCurrentlyOn = true;
+  io.write(CH::BUZZER, HIGH);
+  buzzerStateChangedAt = millis();
+}
+void updateBuzzerBeep() {
+  if (!buzzerBeeping) return;
+  uint32_t elapsed = millis() - buzzerStateChangedAt;
+  if (buzzerCurrentlyOn && elapsed >= buzzerOnMs) {
+    io.write(CH::BUZZER, LOW); buzzerCurrentlyOn = false; buzzerStateChangedAt = millis();
+  } else if (!buzzerCurrentlyOn && elapsed >= buzzerOffMs) {
+    buzzerBeeping = false;
+  }
+}
+
 struct RackPos { int32_t x, z; };
 RackPos RACK[6];
 // BARU: Load Position -- titik tunggal tempat lift "standby" menunggu robot arm
@@ -96,6 +115,8 @@ void loadRackFromNvs() {
   if (prefs.isKey("rampMin")) rampMinIntervalUs = prefs.getUShort("rampMin", rampMinIntervalUs);
   if (prefs.isKey("rampSteps")) rampSteps = prefs.getUShort("rampSteps", rampSteps);
   if (prefs.isKey("mstep")) microstepMode = prefs.getUChar("mstep", microstepMode);
+  if (prefs.isKey("buzzOn")) buzzerOnMs = prefs.getUShort("buzzOn", buzzerOnMs);       // BARU
+  if (prefs.isKey("buzzOff")) buzzerOffMs = prefs.getUShort("buzzOff", buzzerOffMs);   // BARU
   prefs.end();
 }
 void saveRackToNvs() { prefs.begin("stocker_cal", false); prefs.putBytes("rack", RACK, sizeof(RACK)); prefs.end(); }
@@ -105,6 +126,7 @@ void saveStepIntervalToNvs() { prefs.begin("stocker_cal", false); prefs.putUShor
 void saveHomingIntervalToNvs() { prefs.begin("stocker_cal", false); prefs.putUShort("homeIntv", homingStepIntervalUs); prefs.end(); }
 void saveRampToNvs() { prefs.begin("stocker_cal", false); prefs.putUShort("rampMin", rampMinIntervalUs); prefs.putUShort("rampSteps", rampSteps); prefs.end(); }
 void saveMicrostepToNvs() { prefs.begin("stocker_cal", false); prefs.putUChar("mstep", microstepMode); prefs.end(); }
+void saveBuzzerToNvsStocker() { prefs.begin("stocker_cal", false); prefs.putUShort("buzzOn", buzzerOnMs); prefs.putUShort("buzzOff", buzzerOffMs); prefs.end(); }   // BARU
 // BARU: reset total -- hapus SEMUA kalibrasi NVS & kembalikan RAM ke default
 void resetAllToDefault() {
   prefs.begin("stocker_cal", false);
@@ -115,6 +137,7 @@ void resetAllToDefault() {
   pushExtendSteps = 1000;
   stepIntervalUs = 600; homingStepIntervalUs = 150;
   rampMinIntervalUs = 1200; rampSteps = 300; microstepMode = 2;
+  buzzerOnMs = 500; buzzerOffMs = 500;   // BARU
   Serial.println("[RESET] Semua kalibrasi STOCKER dikembalikan ke default & NVS dihapus");
 }
 
@@ -438,11 +461,17 @@ void handleCycle() {
   switch (cycleStage) {
     case CycleStage::NONE: break;
     case CycleStage::MOVING_XZ:
-      if (state == LiftState::IDLE) { tgtPos[1] = pushExtendSteps; state = LiftState::MOVING; cycleStage = CycleStage::PUSHING_Y; }
+      if (state == LiftState::IDLE) {
+        tgtPos[1] = pushExtendSteps; state = LiftState::MOVING; cycleStage = CycleStage::PUSHING_Y;
+        triggerBuzzerBeep();   // BARU -- notifikasi: sudah masuk rack yang benar
+      }
       else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; }
       break;
     case CycleStage::PUSHING_Y:
-      if (state == LiftState::IDLE) { startYRetract(); cycleStage = CycleStage::RETRACT_Y; }
+      if (state == LiftState::IDLE) {
+        startYRetract(); cycleStage = CycleStage::RETRACT_Y;
+        triggerBuzzerBeep();   // BARU -- notifikasi: selesai dorong package
+      }
       else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; }
       break;
     case CycleStage::RETRACT_Y:
@@ -457,7 +486,11 @@ void handleCycle() {
       }
       break;
     case CycleStage::RETURNING_XZ:
-      if (state == LiftState::IDLE) { cycleStage = CycleStage::NONE; if (ackPending) { ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq); } }
+      if (state == LiftState::IDLE) {
+        cycleStage = CycleStage::NONE;
+        if (ackPending) { ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq); }
+        triggerBuzzerBeep();   // BARU -- notifikasi: sudah kembali ke Load Position
+      }
       else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; }
       break;
     case CycleStage::PUSHING_Y_STANDALONE:
@@ -558,6 +591,7 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       currentState = NodeState::RUNNING_OR_MOVING;
       cycleStage = CycleStage::MOVING_XZ;
+      triggerBuzzerBeep();   // BARU -- notifikasi: package sudah di lift, cycle mulai
       ackPending = true; pendingAckSeq = seq; return;
     case Cmd::MOVE_TO_RACK:
       if (blockIfFaulted("MOVE_TO_RACK", seq)) return;
@@ -704,9 +738,11 @@ void drawSpeedMenuStocker() {
     case 3: line1 = "3:RampMin=" + String(rampMinIntervalUs) + "us"; break;
     case 4: line1 = "4:RampSteps=" + String(rampSteps); break;
     case 5: line1 = "5:Microstep=1/" + String(microstepMode) + " (jumper MS1/MS2 TMC2209)"; break;
+    case 6: line1 = "6:BuzzOn=" + String(buzzerOnMs) + "ms"; break;
+    case 7: line1 = "7:BuzzOff=" + String(buzzerOffMs) + "ms"; break;
   }
   lcdPrint(0, 1, line1);
-  lcdPrint(0, 2, "1-5=pilih A+B-C:step");
+  lcdPrint(0, 2, "1-7=pilih A+B-C:step");
   lcdPrint(0, 3, "#=SIMPAN D=kembali");
 }
 void handleSpeedKeyStocker(char key) {
@@ -715,7 +751,7 @@ void handleSpeedKeyStocker(char key) {
   // cuma 4 kombinasi lewat MS1/MS2 (bukan 5 lewat MS1/MS2/MS3), TIDAK ADA full-step (1/1).
   // Tabel resmi TMC2209 (MS2,MS1): 00=1/8, 01=1/2, 10=1/4, 11=1/16
   constexpr uint8_t MSTEP_VALUES[4] = {2, 4, 8, 16};   // urut kasar->halus, logis utk tombol A(naik)/B(turun)
-  if (key >= '1' && key <= '5') { selSpeedParam = key - '0'; }
+  if (key >= '1' && key <= '7') { selSpeedParam = key - '0'; }
   else if (key == 'A' || key == 'B') {
     if (selSpeedParam == 5) {
       int8_t idx = 0;
@@ -729,14 +765,16 @@ void handleSpeedKeyStocker(char key) {
         case 2: homingStepIntervalUs = (uint16_t)constrain((int)homingStepIntervalUs + delta, 20, 5000); break;
         case 3: rampMinIntervalUs = (uint16_t)constrain((int)rampMinIntervalUs + delta, 20, 5000); break;
         case 4: rampSteps = (uint16_t)constrain((int)rampSteps + delta, 0, 5000); break;
+        case 6: buzzerOnMs = (uint16_t)constrain((int)buzzerOnMs + delta * 10, 50, 5000); break;
+        case 7: buzzerOffMs = (uint16_t)constrain((int)buzzerOffMs + delta * 10, 50, 5000); break;
       }
     }
   }
   else if (key == 'C') { jogStepIdx = (jogStepIdx + 1) % 7; }
   else if (key == '#') {
-    saveStepIntervalToNvs(); saveHomingIntervalToNvs(); saveRampToNvs(); saveMicrostepToNvs();
+    saveStepIntervalToNvs(); saveHomingIntervalToNvs(); saveRampToNvs(); saveMicrostepToNvs(); saveBuzzerToNvsStocker();
     lcdPrint(0, 3, "TERSIMPAN ke NVS!");
-    Serial.println("[CAL] Kecepatan step + microstep disimpan ke NVS");
+    Serial.println("[CAL] Kecepatan step + microstep + buzzer disimpan ke NVS");
     return;
   }
   else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); return; }
@@ -1395,6 +1433,7 @@ void loop() {
     }
     updateYRetract();
     handleCycle();
+    updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking
     if (ackPending && cycleStage == CycleStage::NONE && state == LiftState::IDLE && !yRetracting) {
       ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq);
     }

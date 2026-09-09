@@ -45,7 +45,27 @@ bool modbusEverUsed = false;
 struct FeederConfig {
   uint8_t  conveyorSpeed = 160;
   uint16_t pushTimeoutMs = 800;
+  uint16_t buzzerOnMs  = 500;   // BARU -- notifikasi audio saat refill selesai
+  uint16_t buzzerOffMs = 500;
 } cfg;
+
+// BARU: buzzer notifikasi -- 1 siklus ON-OFF non-blocking per trigger event
+bool buzzerBeeping = false, buzzerCurrentlyOn = false;
+uint32_t buzzerStateChangedAt = 0;
+void triggerBuzzerBeep() {
+  buzzerBeeping = true; buzzerCurrentlyOn = true;
+  io.write(CH::BUZZER, HIGH);
+  buzzerStateChangedAt = millis();
+}
+void updateBuzzerBeep() {
+  if (!buzzerBeeping) return;
+  uint32_t elapsed = millis() - buzzerStateChangedAt;
+  if (buzzerCurrentlyOn && elapsed >= cfg.buzzerOnMs) {
+    io.write(CH::BUZZER, LOW); buzzerCurrentlyOn = false; buzzerStateChangedAt = millis();
+  } else if (!buzzerCurrentlyOn && elapsed >= cfg.buzzerOffMs) {
+    buzzerBeeping = false;
+  }
+}
 
 enum class RefillState { IDLE, CONVEYOR_RUN, PUSHING, RETRACT, DONE, FAULT, ESTOPPED };
 RefillState refillState = RefillState::IDLE;
@@ -127,7 +147,7 @@ void handleRefillFSM() {
       break;
     case RefillState::RETRACT:
       if (!motorWriteDoneForState) { motorWrite(CH::DISP_AIN1, CH::DISP_AIN2, false); motorWriteDoneForState = true; }
-      if (io.read(CH::LIM_PUSH_HOME) == LOW) { io.write(CH::DISP_AIN1, LOW); io.write(CH::DISP_AIN2, LOW); enterRefillState(RefillState::DONE); }
+      if (io.read(CH::LIM_PUSH_HOME) == LOW) { io.write(CH::DISP_AIN1, LOW); io.write(CH::DISP_AIN2, LOW); enterRefillState(RefillState::DONE); triggerBuzzerBeep(); }
       else if (elapsed > cfg.pushTimeoutMs) { faultCode = (uint16_t)FaultCode::PUSH_STUCK; enterRefillState(RefillState::FAULT); }
       break;
     case RefillState::DONE:
@@ -286,8 +306,8 @@ void drawTopMenuFeeder() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-constexpr uint8_t CAL_COUNT = 3;
-const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Push Timeout (ms)", "Reset ke Default" };
+constexpr uint8_t CAL_COUNT = 5;
+const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Push Timeout (ms)", "Buzzer On (ms)", "Buzzer Off (ms)", "Reset ke Default" };
 uint8_t calCursor = 0;
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
 
@@ -304,10 +324,17 @@ void handleConfirmResetKey(char key) {
 }
 
 void drawParamMenuFeeder() {
-  lcdPrint(0, 0, selParam == 1 ? "CONVEYOR SPEED" : "PUSH TIMEOUT (ms)");
+  switch (selParam) {
+    case 1: lcdPrint(0, 0, "CONVEYOR SPEED"); break;
+    case 2: lcdPrint(0, 0, "PUSH TIMEOUT (ms)"); break;
+    case 3: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
+    case 4: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
+  }
   String line1;
   if (selParam == 1) line1 = "Nilai:" + String(cfg.conveyorSpeed) + "   Step:" + String(JOG_STEPS[jogStepIdx]);
   else if (selParam == 2) line1 = "Nilai:" + String(cfg.pushTimeoutMs) + "   Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 3) line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 4) line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
   lcdPrint(0, 1, line1);
   lcdPrint(0, 2, "A+ B- C:step");
   lcdPrint(0, 3, "#=SIMPAN D=kembali");
@@ -320,6 +347,12 @@ void handleParamKeyFeeder(char key) {
   } else if (selParam == 2) {
     if (key == 'A') cfg.pushTimeoutMs = (uint16_t)constrain((int)cfg.pushTimeoutMs + step, 100, 5000);
     else if (key == 'B') cfg.pushTimeoutMs = (uint16_t)constrain((int)cfg.pushTimeoutMs - step, 100, 5000);
+  } else if (selParam == 3) {
+    if (key == 'A') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs + step * 10, 50, 5000);
+    else if (key == 'B') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs - step * 10, 50, 5000);
+  } else if (selParam == 4) {
+    if (key == 'A') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs + step * 10, 50, 5000);
+    else if (key == 'B') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs - step * 10, 50, 5000);
   }
   if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
   else if (key == '#') { saveConfigToNvs(); lcdPrint(0, 3, "TERSIMPAN ke NVS!"); Serial.println("[CAL] FeederConfig disimpan ke NVS"); return; }
@@ -331,7 +364,7 @@ void handleCalListKey(char key) {
   if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 2) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
+    if (calCursor == 4) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
     else { selParam = calCursor + 1; menuState = MenuState::JOG_PARAM; lcd.clear(); drawParamMenuFeeder(); }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuFeeder(); }
 }
@@ -872,6 +905,7 @@ void loop() {
   }
   handleSafety();
   if (currentState != NodeState::ESTOPPED) handleRefillFSM();
+  updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking
 
   if (menuState != MenuState::NONE) return;
 

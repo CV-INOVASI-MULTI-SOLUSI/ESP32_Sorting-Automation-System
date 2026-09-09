@@ -63,10 +63,31 @@ struct SorterConfig {
   uint16_t hopperStartUs    = 1000;
   uint16_t hopperPushUs     = 2000;
   uint16_t hopperIntervalMs = 1000;
+  // BARU: buzzer notifikasi -- durasi ON/OFF (ms) saat trigger event (palang aktif/reject)
+  uint16_t buzzerOnMs  = 500;
+  uint16_t buzzerOffMs = 500;
 } cfg;
 
 uint32_t passCount = 0, rejectCount = 0;
 bool palangPending = false, palangActive = false;
+
+// BARU: buzzer notifikasi -- 1 siklus ON-OFF non-blocking per trigger event (bukan alarm terus-menerus)
+bool buzzerBeeping = false, buzzerCurrentlyOn = false;
+uint32_t buzzerStateChangedAt = 0;
+void triggerBuzzerBeep() {
+  buzzerBeeping = true; buzzerCurrentlyOn = true;
+  io.write(CH::BUZZER, HIGH);
+  buzzerStateChangedAt = millis();
+}
+void updateBuzzerBeep() {
+  if (!buzzerBeeping) return;
+  uint32_t elapsed = millis() - buzzerStateChangedAt;
+  if (buzzerCurrentlyOn && elapsed >= cfg.buzzerOnMs) {
+    io.write(CH::BUZZER, LOW); buzzerCurrentlyOn = false; buzzerStateChangedAt = millis();
+  } else if (!buzzerCurrentlyOn && elapsed >= cfg.buzzerOffMs) {
+    buzzerBeeping = false;   // 1 siklus ON-OFF selesai
+  }
+}
 uint32_t palangTriggerAt = 0, palangOffAt = 0;
 bool lastProxState = HIGH;
 uint32_t lastProxEdge = 0;
@@ -76,11 +97,31 @@ PendingClass pendingQ[4];
 uint8_t qHead = 0, qTail = 0;
 
 constexpr int PWM_FREQ = 20000, PWM_RES = 8, LEDC_CH_CONV1 = 0, LEDC_CH_MOTORA = 1;
-// BARU: Hopper servo -- freq/resolusi BEDA dari motor DC (servo butuh 50Hz presisi, bukan 20kHz)
-constexpr int HOPPER_PWM_FREQ = 50, HOPPER_PWM_RES = 12, LEDC_CH_HOPPER = 2;
+
+// BARU: driver PCA9685 raw (Wire langsung, tanpa library) -- dipakai UNTUK PRODUKSI hopper
+// servo, KARENA board universal sudah jadi & tidak ada pin native yang benar-benar bebas
+// dipakai ulang (semua pin sudah terikat desain PCB tetap). Servo hopper WAJIB lewat I2C.
+constexpr uint8_t PCA9685_ADDR = 0x40;
+constexpr uint8_t HOPPER_PCA_CHANNEL = 0;   // channel PCA9685 yang dipakai utk servo hopper
+bool pca9685Detected() { Wire.beginTransmission(PCA9685_ADDR); return (Wire.endTransmission() == 0); }
+void pca9685Init() {
+  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x10); Wire.endTransmission();
+  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0xFE); Wire.write((uint8_t)121); Wire.endTransmission();
+  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x20); Wire.endTransmission();
+  delay(5);
+}
+void pca9685SetServoUs(uint8_t channel, uint16_t us) {
+  uint32_t ticks = (uint32_t)us * 4096UL / 20000UL;
+  uint8_t reg = 0x06 + 4 * channel;
+  Wire.beginTransmission(PCA9685_ADDR);
+  Wire.write(reg); Wire.write((uint8_t)0); Wire.write((uint8_t)0);
+  Wire.write((uint8_t)(ticks & 0xFF)); Wire.write((uint8_t)(ticks >> 8));
+  Wire.endTransmission();
+}
+
+// DIUBAH: hopper servo sekarang lewat PCA9685 (I2C), BUKAN lagi LEDC/native GPIO
 void hopperSetUs(uint16_t us) {
-  uint32_t duty = (uint32_t)us * 4096UL / 20000UL;   // 4096 = 2^12 (resolusi 12-bit), 20000us = periode @ 50Hz
-  ledcWrite(LEDC_CH_HOPPER, duty);
+  pca9685SetServoUs(HOPPER_PCA_CHANNEL, us);
 }
 
 void motorWrite(uint8_t ain1, uint8_t ain2, bool forward) {
@@ -226,6 +267,7 @@ void handlePalangQueue() {
   }
   if (palangPending && !palangActive && now >= palangTriggerAt) {
     io.write(CH::PALANG_RELAY, HIGH);   // solenoid push-pull 1 kumparan, HIGH=dorong
+    triggerBuzzerBeep();   // BARU -- notifikasi audio saat objek REJECT ditolak
     palangActive = true; palangOffAt = now + cfg.palangPulseMs;
     rejectCount++;
     mb.Hreg(Reg::REJECT_COUNT, (uint16_t)rejectCount);
@@ -359,9 +401,10 @@ void drawTopMenuSorter() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI (list param, masing2 masuk ke JOG_PARAM) ---
-constexpr uint8_t CAL_COUNT = 10;
+constexpr uint8_t CAL_COUNT = 12;
 const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Conveyor Dir", "Palang Pulse", "Dist (TOF mm)", "Mm/s Max",
-                                        "Motor A Speed", "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Interval(ms)", "Reset ke Default" };
+                                        "Motor A Speed", "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Interval(ms)",
+                                        "Buzzer On (ms)", "Buzzer Off (ms)", "Reset ke Default" };
 uint8_t calCursor = 0;
 uint8_t selParam = 0;
 
@@ -396,7 +439,7 @@ void handleCalListKey(char key) {
   if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 9) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
+    if (calCursor == 11) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
       menuState = MenuState::CONFIRM_RESET;
       drawConfirmReset();
     } else {
@@ -420,6 +463,8 @@ void drawParamMenu() {
     case 7: lcdPrint(0, 0, "HOPPER TITIK AWAL"); break;
     case 8: lcdPrint(0, 0, "HOPPER TITIK DORONG"); break;
     case 9: lcdPrint(0, 0, "HOPPER INTERVAL(ms)"); break;
+    case 10: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
+    case 11: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
   }
   String line1;
   switch (selParam) {
@@ -432,6 +477,8 @@ void drawParamMenu() {
     case 7: line1 = "us:" + String(cfg.hopperStartUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 8: line1 = "us:" + String(cfg.hopperPushUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 9: line1 = "ms:" + String(cfg.hopperIntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 10: line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 11: line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
   }
   lcdPrint(0, 1, line1);
   lcdPrint(0, 2, selParam == 2 ? "A=Forward B=Reverse" : "A+ B- C:step");
@@ -488,6 +535,16 @@ void handleParamKey(char key) {
     case 9:
       if (key == 'A') cfg.hopperIntervalMs = (uint16_t)constrain((int)cfg.hopperIntervalMs + step * 10, 300, 10000);
       else if (key == 'B') cfg.hopperIntervalMs = (uint16_t)constrain((int)cfg.hopperIntervalMs - step * 10, 300, 10000);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
+    case 10:
+      if (key == 'A') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs + step * 10, 50, 5000);
+      else if (key == 'B') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs - step * 10, 50, 5000);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
+    case 11:
+      if (key == 'A') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs + step * 10, 50, 5000);
+      else if (key == 'B') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs - step * 10, 50, 5000);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
   }
@@ -654,23 +711,7 @@ bool testModFirstDraw = true;
 String testModLine1 = "", testModLine2 = "";
 
 // --- PCA9685 minimal raw driver (Wire langsung, TANPA library) -- utk Test Modul Servo.
-// SORTER tidak punya driver PCA9685 resmi (beda dgn PICKER) -- versi RINGAN khusus test.
-constexpr uint8_t PCA9685_ADDR = 0x40;
-bool pca9685Detected() { Wire.beginTransmission(PCA9685_ADDR); return (Wire.endTransmission() == 0); }
-void pca9685Init() {
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x10); Wire.endTransmission();
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0xFE); Wire.write((uint8_t)121); Wire.endTransmission();
-  Wire.beginTransmission(PCA9685_ADDR); Wire.write((uint8_t)0x00); Wire.write((uint8_t)0x20); Wire.endTransmission();
-  delay(5);
-}
-void pca9685SetServoUs(uint8_t channel, uint16_t us) {
-  uint32_t ticks = (uint32_t)us * 4096UL / 20000UL;
-  uint8_t reg = 0x06 + 4 * channel;
-  Wire.beginTransmission(PCA9685_ADDR);
-  Wire.write(reg); Wire.write((uint8_t)0); Wire.write((uint8_t)0);
-  Wire.write((uint8_t)(ticks & 0xFF)); Wire.write((uint8_t)(ticks >> 8));
-  Wire.endTransmission();
-}
+// --- PCA9685 (driver sudah didefinisikan di atas, dipakai bersama produksi hopper & test modul) ---
 
 constexpr uint8_t MODULE_TYPE_COUNT = 4;
 const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Relay", "Servo" };
@@ -1109,13 +1150,18 @@ void setup() {
   ledcAttachPin(GP::MOTOR_A_PWM, LEDC_CH_MOTORA);     // BARU
   // BARU: Hopper servo -- pakai GP::STEP_1 (GPIO23), pin ini MENGANGGUR di board SORTER
   // (tidak ada stepper terpasang fisik untuk role SORTER)
-  ledcSetup(LEDC_CH_HOPPER, HOPPER_PWM_FREQ, HOPPER_PWM_RES);
-  ledcAttachPin(GP::STEP_1, LEDC_CH_HOPPER);
-  hopperSetUs(cfg.hopperStartUs);   // posisi awal servo saat boot -- aman, di titik awal bukan dorong
+  // DIHAPUS: ledcSetup/ledcAttachPin utk hopper -- servo sekarang lewat PCA9685 (I2C), bukan LEDC
   Serial.println("[BOOT] LEDC PWM conveyor1 + motor A OK");
 
   loadConfigFromNvs();   // BARU -- cfg sekarang persist antar reboot, sebelumnya selalu reset ke default
   Serial.println("[BOOT] SorterConfig dimuat dari NVS (kalau pernah disimpan)");
+
+  // DIPERBAIKI (bug urutan): pca9685Init() + hopperSetUs() HARUS setelah loadConfigFromNvs() --
+  // sebelumnya hopperSetUs() dipanggil pakai nilai DEFAULT compile-time (cfg.hopperStartUs belum
+  // dimuat dari NVS), bukan nilai kalibrasi tersimpan yang sebenarnya.
+  pca9685Init();
+  hopperSetUs(cfg.hopperStartUs);   // posisi awal servo saat boot, PAKAI nilai kalibrasi tersimpan
+  Serial.println("[BOOT] PCA9685 hopper servo diinisialisasi");
 
   Serial2.begin(Rs485Cfg::BAUD, SERIAL_8N1, Rs485Cfg::RX_PIN, Rs485Cfg::TX_PIN);
   mb.begin(&Serial2);
@@ -1230,6 +1276,7 @@ void loop() {
   handleSafety();
   if (currentState != NodeState::ESTOPPED && currentState != NodeState::FAULT) {
     handleHopper();   // BARU -- servo hopper aktif otomatis selama RUNNING_OR_MOVING
+    updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking, TIDAK di-skip walau menu aktif
     handleConveyor();
     handlePalangQueue();
     handleSensors();
