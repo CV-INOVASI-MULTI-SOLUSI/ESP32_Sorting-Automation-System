@@ -1141,6 +1141,12 @@ void setup() {
   io.pinMode(CH::PROX_PASS, INPUT_PULLUP);
   io.pinMode(CH::BTN_TEST_PASS, INPUT_PULLUP);     // BARU
   io.pinMode(CH::BTN_TEST_REJECT, INPUT_PULLUP);   // BARU
+  // DIPERBAIKI (bug ditemukan): channel Test Modul berikut TIDAK PERNAH di-pinMode OUTPUT --
+  // io.write() ke pin yang masih default INPUT MCP23017 TIDAK ADA efek fisik sama sekali.
+  // Ini penyebab "Test Modul cuma RLY2 doang yang jalan" -- selebihnya diam bukan krn hardware.
+  io.pinMode(CH::DIR_1_MCP, OUTPUT); io.pinMode(CH::DIR_2_MCP, OUTPUT); io.pinMode(CH::DIR_3_MCP, OUTPUT);
+  io.pinMode(CH::EN_123, OUTPUT);
+  io.pinMode(CH::RLY2, OUTPUT);
   // TBD HOPPER: io.pinMode(CH::LIMIT_HOPPER, INPUT_PULLUP); -- aktifkan lagi nanti
   Serial.printf("[BOOT] MCP23017: %s, semua pinMode selesai (hopper belum di-setup, TBD)\n", ioOk ? "OK" : "GAGAL");
 

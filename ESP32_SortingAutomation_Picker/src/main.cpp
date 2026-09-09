@@ -1027,6 +1027,14 @@ void setup() {
   io.pinMode(CH::LED_RUN, OUTPUT); io.pinMode(CH::LED_FAULT, OUTPUT); io.pinMode(CH::BUZZER, OUTPUT);
   io.pinMode(CH::LED_OPERATION, OUTPUT); io.pinMode(CH::LED_MANUAL, OUTPUT);   // BARU
   io.pinMode(CH::PCA_OE, OUTPUT); io.write(CH::PCA_OE, HIGH);
+  // DIPERBAIKI (bug ditemukan): PICKER tidak punya channel produksi asli Stepper/Motor DC/Relay,
+  // jadi channel ini TIDAK PERNAH di-pinMode OUTPUT -- Test Modul (semua kecuali Servo) diam total.
+  io.pinMode(CH::DIR_1_MCP, OUTPUT); io.pinMode(CH::DIR_2_MCP, OUTPUT); io.pinMode(CH::DIR_3_MCP, OUTPUT);
+  io.pinMode(CH::EN_123, OUTPUT);
+  io.pinMode(CH::AIN1, OUTPUT); io.pinMode(CH::AIN2, OUTPUT);
+  io.pinMode(CH::BIN1, OUTPUT); io.pinMode(CH::BIN2, OUTPUT);
+  io.pinMode(CH::STBY, OUTPUT);
+  io.pinMode(CH::RLY1, OUTPUT); io.pinMode(CH::RLY2, OUTPUT);
   Serial.printf("[BOOT] MCP23017: %s\n", ioOk ? "OK" : "GAGAL");
 
   pwm.begin(); pwm.setPWMFreq(ServoCfg::FREQ_HZ);

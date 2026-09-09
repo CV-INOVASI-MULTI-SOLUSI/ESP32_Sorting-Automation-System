@@ -796,6 +796,11 @@ void setup() {
   io.pinMode(CH::LED_OPERATION, OUTPUT); io.pinMode(CH::LED_MANUAL, OUTPUT);   // BARU
   io.pinMode(CH::DISP_AIN1, OUTPUT); io.pinMode(CH::DISP_AIN2, OUTPUT); io.pinMode(CH::DISP_STBY, OUTPUT);
   io.pinMode(CH::CONV2_BIN1, OUTPUT); io.pinMode(CH::CONV2_BIN2, OUTPUT);
+  // DIPERBAIKI (bug ditemukan): FEEDER tidak punya channel produksi asli Stepper/Relay,
+  // jadi channel ini TIDAK PERNAH di-pinMode OUTPUT -- Test Modul Stepper/Relay diam total.
+  io.pinMode(CH::DIR_1_MCP, OUTPUT); io.pinMode(CH::DIR_2_MCP, OUTPUT); io.pinMode(CH::DIR_3_MCP, OUTPUT);
+  io.pinMode(CH::EN_123, OUTPUT);
+  io.pinMode(CH::RLY1, OUTPUT); io.pinMode(CH::RLY2, OUTPUT);
   io.pinMode(CH::LIM_STOCK_EMPTY, INPUT_PULLUP);
   io.pinMode(CH::LIM_BOX_ARRIVED, INPUT_PULLUP);
   io.pinMode(CH::LIM_PUSH_HOME, INPUT_PULLUP);

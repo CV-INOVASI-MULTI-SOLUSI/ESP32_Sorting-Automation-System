@@ -1319,6 +1319,12 @@ void setup() {
   io.pinMode(CH::DIR_1_MCP, OUTPUT); io.pinMode(CH::DIR_2_MCP, OUTPUT); io.pinMode(CH::DIR_3_MCP, OUTPUT);
   Serial.println("[BOOT] DIR via MCP23017");
   io.pinMode(CH::EN_STEPPERS, OUTPUT); io.write(CH::EN_STEPPERS, HIGH);   // unconditional -- init boot, jangan lewat cache
+  // DIPERBAIKI (bug ditemukan): STOCKER tidak punya channel produksi asli Motor DC/Relay,
+  // jadi channel ini TIDAK PERNAH di-pinMode OUTPUT -- Test Modul Motor DC/Relay diam total.
+  io.pinMode(CH::AIN1, OUTPUT); io.pinMode(CH::AIN2, OUTPUT);
+  io.pinMode(CH::BIN1, OUTPUT); io.pinMode(CH::BIN2, OUTPUT);
+  io.pinMode(CH::STBY, OUTPUT);
+  io.pinMode(CH::RLY1, OUTPUT); io.pinMode(CH::RLY2, OUTPUT);
   steppersEnabled = false;   // sinkronkan cache
   io.pinMode(CH::LIM_X, INPUT_PULLUP); io.pinMode(CH::LIM_Y, INPUT_PULLUP); io.pinMode(CH::LIM_Z, INPUT_PULLUP);
   for (uint8_t i = 0; i < 6; i++) io.pinMode(CH::RACK_LIM[i], INPUT_PULLUP);
