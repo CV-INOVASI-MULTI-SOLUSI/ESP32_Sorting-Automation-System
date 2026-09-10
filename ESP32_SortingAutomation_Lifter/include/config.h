@@ -31,8 +31,11 @@ namespace CH {
   // MCP1 (0x22) CH6-15 -- dipakai beda-beda tergantung node
   constexpr uint8_t OE_PCA     = 6;    // PICKER -- PCA9685 output-enable
   constexpr uint8_t EN_123     = 7;    // STOCKER -- EN gabungan 3x TMC2209 (1 sinyal, fan-out hardware)
-  constexpr uint8_t AIN1       = 8;    // SORTER motor-A / Dispenser dispenser-push
-  constexpr uint8_t AIN2       = 9;
+  // DIKOREKSI: AIN1/AIN2 TERTUKAR dari wiring fisik nyata -- user konfirmasi AIN2 ada di
+  // GPB0(ch8), AIN1 di GPB1(ch9). Nilai di bawah SUDAH disesuaikan supaya CH::AIN1 software
+  // = pin AIN1 fisik TB6612 yang sebenarnya. Harus SAMA di keempat config.h (board universal).
+  constexpr uint8_t AIN1       = 9;    // SORTER motor-A / Dispenser dispenser-push
+  constexpr uint8_t AIN2       = 8;
   constexpr uint8_t BIN1       = 10;   // SORTER conveyor / Dispenser conveyor2
   constexpr uint8_t BIN2       = 11;
   constexpr uint8_t STBY       = 12;   // dipakai bersama AIN+BIN (1 chip TB6612FNG)
@@ -43,8 +46,10 @@ namespace CH {
   // MCP2 (0x23) CH16-31 -- dipakai beda-beda tergantung node
   constexpr uint8_t RLY1      = 16;   // SORTER -- palang solenoid
   constexpr uint8_t RLY2      = 17;   // spare
-  constexpr uint8_t PROX_1    = 18;   // SORTER -- proximity sorting
-  constexpr uint8_t PROX_2    = 19;   // spare
+  // DIKOREKSI: PROX_1/PROX_2 TERTUKAR dari wiring fisik nyata -- user konfirmasi PROX_1 ada
+  // di GPA3(ch19), PROX_2 di GPA2(ch18). Harus SAMA di keempat config.h (board universal).
+  constexpr uint8_t PROX_1    = 19;   // SORTER -- proximity sorting
+  constexpr uint8_t PROX_2    = 18;   // spare
   constexpr uint8_t BUTTON_2  = 20;   // SORTER -- test pass
   constexpr uint8_t BUTTON_3  = 21;   // SORTER -- test reject
   constexpr uint8_t LIM_1     = 23;   // STOCKER=LIM_X, Dispenser=LIM_STOCK_EMPTY

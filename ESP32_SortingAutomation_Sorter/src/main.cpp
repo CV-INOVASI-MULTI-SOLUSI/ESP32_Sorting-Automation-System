@@ -45,6 +45,31 @@ void lcdPrint(uint8_t col, uint8_t row, String text) {
   lcd.print(text);
 }
 
+// BARU: animasi LOADING singkat saat boot -- kasih feedback visual operator + waktu settle
+// I2C/PCA9685/MCP23017 sebelum masuk operasi normal. No-op total kalau LCD tidak terdeteksi
+// (dipanggil SETELAH lcd.init() supaya benar-benar tampil).
+constexpr uint8_t BOOT_STEPS_TOTAL = 6;
+constexpr uint16_t BOOT_STEP_DELAY_MS = 150;
+uint8_t bootStep = 0;
+void lcdBootProgress(const char* stepLabel) {
+  bootStep++;
+  // DIPERBAIKI: delay() WAJIB tetap jalan meski LCD tidak terdeteksi -- tujuannya kasih waktu
+  // settle inisialisasi hardware (I2C/PCA9685/MCP23017), animasi LCD cuma bonus visual di atasnya.
+  // Sebelumnya delay ikut di-skip bareng LCD (return duluan), jadi tanpa LCD = TIDAK ada jeda sama
+  // sekali -- gak sesuai maksud "beri waktu inisialisasi" yang harusnya berlaku terlepas dari LCD.
+  if (lcdPresent) {
+    uint8_t filled = (uint8_t)min((uint32_t)10, (uint32_t)bootStep * 10 / BOOT_STEPS_TOTAL);
+    String bar = "[";
+    for (uint8_t i = 0; i < 10; i++) bar += (i < filled) ? '#' : '-';
+    bar += "]";
+    lcdPrint(0, 0, "SORTER BOOTING");
+    lcdPrint(0, 1, bar);
+    lcdPrint(0, 2, "LOADING " + String(bootStep) + "/" + String(BOOT_STEPS_TOTAL));
+    lcdPrint(0, 3, stepLabel);
+  }
+  delay(BOOT_STEP_DELAY_MS);
+}
+
 NodeState currentState = NodeState::INIT;
 uint16_t faultCode = 0;
 // BARU: Lapis 3 diagnostik -- bantu identifikasi masalah intermiten (mis. EMI relay) dari jarak jauh
@@ -58,10 +83,13 @@ bool modbusEverUsed = false;   // BARU: watchdog COMM_TIMEOUT cuma aktif kalau m
 struct SorterConfig {
   uint8_t  conveyorSpeed    = 180;
   bool     conveyorDir      = true;
-  uint16_t palangPulseMs    = 300;
+  uint16_t palangPushMs     = 300;           // DIUBAH nama dari palangPulseMs -- palang sekarang
+                                              // linear actuator (motor DC), bukan solenoid relay lagi.
+                                              // Ini durasi drive motor MAJU (push), bukan lagi durasi relay ON.
   float    distMm           = 150.0f;        // O2: ukur jarak fisik scan->palang
   float    mmPerSecAtMaxPwm = 300.0f;        // O2: ukur kecepatan conveyor aktual
-  uint8_t  motorASpeed      = 180;           // BARU -- PWM kecepatan motor A (0-255), independen dari conveyor
+  uint8_t  palangSpeed      = 180;           // DIUBAH nama dari motorASpeed -- channel Motor A yang
+                                              // tadinya spare SEKARANG dipakai buat actuator palang ini.
   // DIUBAH KEMBALI ke POSITIONAL -- rack-pinion Anda pendek (dalam 1 putaran servo), jadi
   // servo positional (spt MG996R) lebih sederhana & presisi drpd continuous-rotation.
   uint16_t hopperStartUs    = 1000;   // posisi diam/tertarik
@@ -70,6 +98,18 @@ struct SorterConfig {
   // BARU: buzzer notifikasi -- durasi ON/OFF (ms) saat trigger event (palang aktif/reject)
   uint16_t buzzerOnMs  = 500;
   uint16_t buzzerOffMs = 500;
+  // BARU: palang linear actuator -- field DITARUH DI AKHIR struct supaya kalibrasi lama
+  // tersimpan di NVS (blob lebih pendek, belum punya field ini) tetap kebaca aman, field baru
+  // otomatis pakai nilai default ini kalau blob NVS lama belum punya byte-nya.
+  bool     palangDir        = true;   // arah PUSH (true=forward via motorWrite). RETRACT = kebalikannya otomatis.
+  uint16_t palangRetractMs  = 300;    // durasi drive motor MUNDUR (retract balik ke posisi awal)
+  // DIUBAH TOTAL: hopper dari "target durasi tetap" (hopperIntervalMs, SEKARANG TIDAK DIPAKAI LAGI
+  // tapi field dibiarkan supaya offset NVS di belakangnya tidak geser) jadi "kecepatan step tetap"
+  // -- sama pola dgn trajStepUs/trajStepIntervalMs PICKER. Durasi jadi HASIL (jarak/kecepatan),
+  // bukan target yang dipaksakan -- ini juga menghilangkan bug "mundur sebelum sampai" kalau
+  // Interval di-set lebih kecil dari kecepatan fisik servo yang sebenarnya sanggup.
+  uint16_t hopperStepUs         = 20;   // besar lompatan tiap tick (us)
+  uint16_t hopperStepIntervalMs = 20;   // jeda antar tick (ms)
 } cfg;
 
 uint32_t passCount = 0, rejectCount = 0;
@@ -92,7 +132,7 @@ void updateBuzzerBeep() {
     buzzerBeeping = false;   // 1 siklus ON-OFF selesai
   }
 }
-uint32_t palangTriggerAt = 0, palangOffAt = 0;
+uint32_t palangTriggerAt = 0;
 bool lastProxState = HIGH;
 uint32_t lastProxEdge = 0;
 
@@ -119,30 +159,27 @@ void hopperSetUs(uint16_t us) { pcaSetServoUs(HOPPER_PCA_CHANNEL, us); }
 
 // Variabel gerak BERSAMA (dipakai FSM produksi & Test Sequence) -- dipindah ke atas supaya
 // bisa dipakai Test Sequence yang didefinisikan lebih dulu dalam file.
-uint32_t hopperMoveStartMs = 0;   // kapan gerakan SAAT INI mulai
-uint16_t hopperMoveFromUs = 0;    // posisi SAAT gerakan mulai (titik awal interpolasi)
+// DIUBAH TOTAL: hopperCurrentUs = posisi FISIK SAAT INI yang di-track terus-menerus (SAMA pola
+// dgn currentUs[] PICKER) -- gantikan hopperMoveFromUs/hopperMoveStartMs (interpolasi duration-based
+// lama). Selesai-nya gerakan sekarang ditentukan POSISI (currentUs==target), bukan waktu abis.
+uint16_t hopperCurrentUs = 1000;   // diinisialisasi ulang di setup() pakai cfg.hopperStartUs
+uint32_t lastHopperStepMs = 0;     // kapan tick step TERAKHIR terjadi
 
 // --- BARU: Test Sequence Hopper -- 1x siklus maju-mundur PAKAI NILAI KALIBRASI (Titik Awal/Dorong/
-// Interval), dipicu dari LCD Test Command ATAU langsung dari Orange Pi (opcode). REUSE trajectory
-// helper YANG SAMA dengan produksi (updateHopperTrajectory, didefinisikan di bawah).
+// Step/StepInterval), dipicu dari LCD Test Command ATAU langsung dari Orange Pi (opcode). REUSE
+// trajectory helper YANG SAMA dengan produksi (updateHopperTrajectory, didefinisikan di bawah).
 bool updateHopperTrajectory(uint16_t targetUs);   // forward declaration -- definisi lengkap di handleHopper()
 enum class TestHopperCycleStage { NONE, MOVING_TO_PUSH, MOVING_TO_START };
 TestHopperCycleStage testHopperCycleStage = TestHopperCycleStage::NONE;
 void startTestHopperCycle() {
   if (currentState != NodeState::IDLE) { Serial.println("[TEST] Hopper cycle ditolak -- node sedang tidak IDLE"); return; }
   testHopperCycleStage = TestHopperCycleStage::MOVING_TO_PUSH;
-  hopperMoveFromUs = cfg.hopperStartUs;
-  hopperMoveStartMs = millis();
-  Serial.println("[TEST] Hopper cycle dimulai (pakai nilai kalibrasi, termasuk Interval)");
+  Serial.println("[TEST] Hopper cycle dimulai (pakai nilai kalibrasi Step/StepInterval)");
 }
 void updateTestHopperCycle() {
   switch (testHopperCycleStage) {
     case TestHopperCycleStage::MOVING_TO_PUSH:
-      if (updateHopperTrajectory(cfg.hopperPushUs)) {
-        testHopperCycleStage = TestHopperCycleStage::MOVING_TO_START;
-        hopperMoveFromUs = cfg.hopperPushUs;
-        hopperMoveStartMs = millis();
-      }
+      if (updateHopperTrajectory(cfg.hopperPushUs)) testHopperCycleStage = TestHopperCycleStage::MOVING_TO_START;
       break;
     case TestHopperCycleStage::MOVING_TO_START:
       if (updateHopperTrajectory(cfg.hopperStartUs)) {
@@ -221,37 +258,45 @@ enum class HopperState { AT_START, MOVING_TO_PUSH, AT_PUSH, MOVING_TO_START };
 HopperState hopperState = HopperState::AT_START;
 bool hopperIntervalTestMode = false;   // di-set true/false dari handleCalListKey()/handleParamKey()
 
-// Interpolasi linear non-blocking: dari hopperMoveFromUs menuju targetUs, selama cfg.hopperIntervalMs.
-// Return true kalau SUDAH SAMPAI (durasi habis).
+// DIUBAH TOTAL: dulu interpolasi linear duration-based (target durasi TETAP, step dihitung
+// mundur dari waktu tersisa -- bisa "mundur sebelum sampai" kalau Interval di-set lebih kecil
+// dari kecepatan fisik servo yang sebenarnya). SEKARANG step-rate based, SAMA pola dgn PICKER:
+// tiap tick (cfg.hopperStepIntervalMs) majukan posisi SEBESAR cfg.hopperStepUs menuju target.
+// Selesai ditentukan POSISI (hopperCurrentUs == targetUs), bukan waktu abis -- gak mungkin lagi
+// "declare selesai" sebelum benar-benar sampai. Durasi total jadi HASIL (jarak/kecepatan step).
 bool updateHopperTrajectory(uint16_t targetUs) {
-  uint32_t elapsed = millis() - hopperMoveStartMs;
-  if (elapsed >= cfg.hopperIntervalMs) { hopperSetUs(targetUs); return true; }
-  float fraction = (float)elapsed / (float)cfg.hopperIntervalMs;
-  int32_t interpolated = (int32_t)hopperMoveFromUs + (int32_t)(((int32_t)targetUs - (int32_t)hopperMoveFromUs) * fraction);
-  hopperSetUs((uint16_t)constrain(interpolated, (int32_t)HOPPER_MIN_US, (int32_t)HOPPER_MAX_US));
-  return false;
+  if (hopperCurrentUs == targetUs) return true;
+  // BARU: StepIntervalMs=0 = "opsional/tanpa jeda" -- step tiap loop tick, secepat mungkin
+  // (cuma dibatasi kecepatan loop asli). Operator tanggung sendiri resiko fisiknya (lihat
+  // komentar di handleParamKey case 11/12).
+  if (cfg.hopperStepIntervalMs > 0 && millis() - lastHopperStepMs < cfg.hopperStepIntervalMs) return false;
+  lastHopperStepMs = millis();
+  int32_t diff = (int32_t)targetUs - (int32_t)hopperCurrentUs;
+  int16_t step = (abs(diff) < (int32_t)cfg.hopperStepUs) ? (int16_t)diff
+                 : (diff > 0 ? (int16_t)cfg.hopperStepUs : -(int16_t)cfg.hopperStepUs);
+  hopperCurrentUs = (uint16_t)constrain((int32_t)hopperCurrentUs + step, (int32_t)HOPPER_MIN_US, (int32_t)HOPPER_MAX_US);
+  hopperSetUs(hopperCurrentUs);
+  return (hopperCurrentUs == targetUs);
 }
 
 void handleHopper() {
-  // BARU: kalau operator SEDANG di layar kalibrasi "Hopper Interval(ms)", paksa FSM tetap
-  // bersiklus LIVE walau currentState bukan RUNNING_OR_MOVING -- supaya waktu tempuh bisa
-  // diamati/diverifikasi presisi langsung sambil nilai disesuaikan, tanpa perlu START produksi.
+  // BARU: kalau operator SEDANG di layar kalibrasi Hopper Step/StepInterval, paksa FSM tetap
+  // bersiklus LIVE walau currentState bukan RUNNING_OR_MOVING -- supaya kecepatan bisa
+  // diamati/diverifikasi langsung sambil nilai disesuaikan, tanpa perlu START produksi.
   if (currentState != NodeState::RUNNING_OR_MOVING && !hopperIntervalTestMode) {
-    if (hopperState != HopperState::AT_START) { hopperSetUs(cfg.hopperStartUs); hopperState = HopperState::AT_START; }
+    if (hopperState != HopperState::AT_START) {
+      hopperCurrentUs = cfg.hopperStartUs; hopperSetUs(hopperCurrentUs); hopperState = HopperState::AT_START;
+    }
     return;
   }
   switch (hopperState) {
     case HopperState::AT_START:
-      hopperMoveFromUs = cfg.hopperStartUs;
-      hopperMoveStartMs = millis();
       hopperState = HopperState::MOVING_TO_PUSH;
       break;
     case HopperState::MOVING_TO_PUSH:
       if (updateHopperTrajectory(cfg.hopperPushUs)) hopperState = HopperState::AT_PUSH;
       break;
     case HopperState::AT_PUSH:
-      hopperMoveFromUs = cfg.hopperPushUs;
-      hopperMoveStartMs = millis();
       hopperState = HopperState::MOVING_TO_START;
       break;
     case HopperState::MOVING_TO_START:
@@ -288,35 +333,66 @@ void handleConveyor() {
   ledcWrite(LEDC_CH_CONV1, cfg.conveyorSpeed);
 }
 
-// BARU: motor A -- channel yang tadinya menganggur di chip TB6612FNG yang sama dgn conveyor.
-// Kontrol manual (Test Command/Serial), TIDAK terintegrasi otomatis ke FSM produksi manapun --
-// keputusan itu menunggu Anda tentukan mekanisme fisiknya untuk apa.
+// DIUBAH TOTAL: palang dulu solenoid relay (1 pulsa HIGH, pegas balik sendiri). SEKARANG linear
+// actuator (motor DC di channel Motor A) -- harus di-drive AKTIF 2 arah: PUSH (maju, cfg.palangPushMs)
+// lalu RETRACT (mundur, cfg.palangRetractMs), TIDAK ada pegas yang otomatis menariknya balik.
+// Dipindah KE ATAS setMotorA() karena dipakai sbg guard di situ (lihat bug ditemukan di bawah).
+enum class PalangState { IDLE, PUSHING, RETRACTING };
+PalangState palangState = PalangState::IDLE;
+uint32_t palangStateAt = 0;
+
+// BARU: motor A -- channel yang tadinya menganggur di chip TB6612FNG yang sama dgn conveyor,
+// SEKARANG dipakai jadi actuator palang (lihat handlePalangQueue) -- fungsi ini tetap dipakai
+// utk jog/test manual (Test Command/Serial MOTORA), independen dari siklus otomatis palang.
+// DIPERBAIKI (bug ditemukan): channel ini dipakai BARENG jog manual & siklus otomatis palang
+// TANPA saling kunci -- jog manual bisa nyelonong di tengah PUSHING/RETRACTING dan nge-override
+// arah motor sampai transisi state berikutnya (motorWrite() otomatis cuma ditulis SEKALI saat
+// masuk state, bukan tiap loop), bikin reject sungguhan bisa gagal separuh jalan. Sekarang jog
+// manual DITOLAK selama palang otomatis masih jalan -- produksi/safety menang drpd diagnostik.
 void setMotorA(uint8_t dirState) {
+  if (palangState != PalangState::IDLE) {
+    Serial.println("[MOTORA] Ditolak -- palang otomatis sedang jalan (PUSHING/RETRACTING), tunggu selesai");
+    return;
+  }
   motorAState = dirState;
   if (dirState == 0) { io.write(CH::CONV1_AIN1, LOW); io.write(CH::CONV1_AIN2, LOW); ledcWrite(LEDC_CH_MOTORA, 0); }
-  else { motorWrite(CH::CONV1_AIN1, CH::CONV1_AIN2, dirState == 1); ledcWrite(LEDC_CH_MOTORA, cfg.motorASpeed); }
+  else { motorWrite(CH::CONV1_AIN1, CH::CONV1_AIN2, dirState == 1); ledcWrite(LEDC_CH_MOTORA, cfg.palangSpeed); }
   updateConv1Stby();
 }
 
 void handlePalangQueue() {
   uint32_t now = millis();
-  if (qHead != qTail && !palangPending) {
+  if (qHead != qTail && !palangPending && palangState == PalangState::IDLE) {
     PendingClass &pc = pendingQ[qHead];
     if (pc.isReject) { palangTriggerAt = pc.scanTimeMs + calculateTOF(); palangPending = true; }
     qHead = (qHead + 1) % 4;
   }
-  if (palangPending && !palangActive && now >= palangTriggerAt) {
-    io.write(CH::PALANG_RELAY, HIGH);   // solenoid push-pull 1 kumparan, HIGH=dorong
-    triggerBuzzerBeep();   // BARU -- notifikasi audio saat objek REJECT ditolak
-    palangActive = true; palangOffAt = now + cfg.palangPulseMs;
+  if (palangPending && palangState == PalangState::IDLE && now >= palangTriggerAt) {
+    motorWrite(CH::CONV1_AIN1, CH::CONV1_AIN2, cfg.palangDir);   // arah PUSH sesuai kalibrasi
+    ledcWrite(LEDC_CH_MOTORA, cfg.palangSpeed);
+    motorAState = 1;   // BARU -- supaya updateConv1Stby() tau motor lagi jalan (STBY ikut ON)
+    triggerBuzzerBeep();   // notifikasi audio saat objek REJECT ditolak
+    palangActive = true;
+    palangState = PalangState::PUSHING;
+    palangStateAt = now;
     rejectCount++;
     mb.Hreg(Reg::REJECT_COUNT, (uint16_t)rejectCount);
-    Serial.printf("[SORTER] Palang TRIGGER! rejectCount=%lu\n", (unsigned long)rejectCount);
+    Serial.printf("[SORTER] Palang PUSH mulai! rejectCount=%lu\n", (unsigned long)rejectCount);
     palangPending = false;
   }
-  if (palangActive && now >= palangOffAt) {
-    io.write(CH::PALANG_RELAY, LOW);   // lepas, pegas balik sendiri
+  if (palangState == PalangState::PUSHING && now - palangStateAt >= cfg.palangPushMs) {
+    motorWrite(CH::CONV1_AIN1, CH::CONV1_AIN2, !cfg.palangDir);   // arah RETRACT -- kebalikan PUSH
+    palangState = PalangState::RETRACTING;
+    palangStateAt = now;
+    Serial.println("[SORTER] Palang RETRACT mulai");
+  }
+  if (palangState == PalangState::RETRACTING && now - palangStateAt >= cfg.palangRetractMs) {
+    ledcWrite(LEDC_CH_MOTORA, 0);
+    motorAState = 0;
+    updateConv1Stby();
+    palangState = PalangState::IDLE;
     palangActive = false;
+    Serial.println("[SORTER] Palang RETRACT selesai, siap siklus berikutnya");
   }
 }
 
@@ -332,8 +408,14 @@ void handleSensors() {
 void handleSafety() {
   if (io.read(CH::ESTOP) == LOW) {   // DIUBAH ke aktif-LOW sesuai instruksi terbaru
     currentState = NodeState::ESTOPPED;
-    io.write(CH::CONV1_STBY, LOW); io.write(CH::PALANG_RELAY, LOW);
-    ledcWrite(LEDC_CH_CONV1, 0); ledcWrite(LEDC_CH_MOTORA, 0); motorAState = 0;   // BARU -- motor A ikut mati
+    io.write(CH::CONV1_STBY, LOW);
+    ledcWrite(LEDC_CH_CONV1, 0);
+    // DIUBAH: palang sekarang motor DC (bukan relay) -- E-stop WAJIB potong daya motor langsung,
+    // BUKAN coba retract dulu (itu masih butuh motor jalan, kontradiktif sama tujuan E-stop).
+    // State palang dipaksa balik IDLE -- kalau lagi di tengah PUSH/RETRACT saat E-stop ditekan,
+    // siklus itu DIBATALKAN, bukan dilanjut otomatis setelah E-stop dilepas.
+    ledcWrite(LEDC_CH_MOTORA, 0); motorAState = 0;
+    palangState = PalangState::IDLE; palangActive = false; palangPending = false;
     return;
   }
   if (currentState == NodeState::ESTOPPED) currentState = NodeState::IDLE;   // diam, TIDAK auto-RUNNING (D11)
@@ -377,7 +459,11 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb, simpan SEBELUM di-nol-kan
       faultCode = 0; currentState = NodeState::IDLE;
       break;
-    case Cmd::SET_HOPPER_INTERVAL: cfg.hopperIntervalMs = (uint16_t)constrain(arg, 300, 10000); break;
+    // DIUBAH: hopperIntervalMs (target durasi tetap) sudah tidak dipakai lagi -- diganti
+    // hopperStepUs/hopperStepIntervalMs (kecepatan step tetap). Opcode Modbus ini di-arahkan ulang
+    // ke hopperStepIntervalMs (padanan paling dekat) -- hopperStepUs cuma bisa diatur via
+    // LCD/Serial utk sekarang (1 opcode cuma bawa 1 arg, gak cukup utk 2 parameter baru).
+    case Cmd::SET_HOPPER_INTERVAL: cfg.hopperStepIntervalMs = (uint16_t)constrain(arg, 0, 500); break;
     case Cmd::SET_CONVEYOR_SPEED:  cfg.conveyorSpeed = (uint8_t)constrain(arg, 0, 255); break;
     case Cmd::SET_CONVEYOR_DIR:    cfg.conveyorDir = (arg != 0); break;
     case Cmd::RESET_COUNTERS:
@@ -412,7 +498,7 @@ constexpr const char* FW_BUILD = __DATE__ " " __TIME__;
 
 enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_PARAM,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
-                        TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
+                        TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
                         TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET };
 MenuState menuState = MenuState::NONE;
 uint8_t jogStepIdx = 0;
@@ -442,9 +528,15 @@ void drawTopMenuSorter() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI (list param, masing2 masuk ke JOG_PARAM) ---
-constexpr uint8_t CAL_COUNT = 12;
-const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Conveyor Dir", "Palang Pulse", "Dist (TOF mm)", "Mm/s Max",
-                                        "Motor A Speed", "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Interval(ms)",
+// DIUBAH: palang sekarang linear actuator (motor DC), bukan relay -- "Palang Pulse" pecah jadi
+// Speed/Dir/Push/Retract (4 parameter, dulu cuma 1 ON-OFF). Speed pakai channel Motor A yang sama.
+// DIUBAH: "Hopper Interval(ms)" (target durasi tetap) diganti "Hopper Step(us)" + "Hopper Step
+// Interval(ms)" (kecepatan tetap, SAMA pola dgn "Speed (Step/Interval)" PICKER) -- durasi total
+// jadi hasil jarak/kecepatan, bukan dipaksa satu angka yang bisa gak realistis fisiknya.
+constexpr uint8_t CAL_COUNT = 15;
+const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Conveyor Dir", "Palang Speed", "Palang Dir",
+                                        "Palang Push (ms)", "Palang Retract (ms)", "Dist (TOF mm)", "Mm/s Max",
+                                        "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Step (us)", "Hopper Step Interval(ms)",
                                         "Buzzer On (ms)", "Buzzer Off (ms)", "Reset ke Default" };
 uint8_t calCursor = 0;
 uint8_t selParam = 0;
@@ -480,12 +572,14 @@ void handleCalListKey(char key) {
   if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 11) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
+    if (calCursor == 14) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
       menuState = MenuState::CONFIRM_RESET;
       drawConfirmReset();
     } else {
       selParam = calCursor + 1;
-      hopperIntervalTestMode = (selParam == 9);   // BARU -- aktifkan test-live cuma utk layar Hopper Interval
+      // BARU: aktifkan test-live di KEDUA layar Hopper Step(11)/Step Interval(12) -- operator
+      // perlu liat efeknya live pas ngatur salah satu dari dua parameter ini.
+      hopperIntervalTestMode = (selParam == 11 || selParam == 12);
       menuState = MenuState::JOG_PARAM;
       lcd.clear(); drawParamMenu();
     }
@@ -497,32 +591,38 @@ void drawParamMenu() {
   switch (selParam) {
     case 1: lcdPrint(0, 0, "CONVEYOR SPEED"); break;
     case 2: lcdPrint(0, 0, "CONVEYOR DIR"); break;
-    case 3: lcdPrint(0, 0, "PALANG PULSE (ms)"); break;
-    case 4: lcdPrint(0, 0, "DIST_MM"); break;
-    case 5: lcdPrint(0, 0, "MM_PER_SEC_MAX"); break;
-    case 6: lcdPrint(0, 0, "MOTOR A SPEED"); break;
-    case 7: lcdPrint(0, 0, "HOPPER TITIK AWAL"); break;
-    case 8: lcdPrint(0, 0, "HOPPER TITIK DORONG"); break;
-    case 9: lcdPrint(0, 0, "HOPPER INTERVAL(ms)"); break;
-    case 10: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
-    case 11: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
+    case 3: lcdPrint(0, 0, "PALANG SPEED"); break;
+    case 4: lcdPrint(0, 0, "PALANG DIR"); break;
+    case 5: lcdPrint(0, 0, "PALANG PUSH (ms)"); break;
+    case 6: lcdPrint(0, 0, "PALANG RETRACT(ms)"); break;
+    case 7: lcdPrint(0, 0, "DIST_MM"); break;
+    case 8: lcdPrint(0, 0, "MM_PER_SEC_MAX"); break;
+    case 9: lcdPrint(0, 0, "HOPPER TITIK AWAL"); break;
+    case 10: lcdPrint(0, 0, "HOPPER TITIK DORONG"); break;
+    case 11: lcdPrint(0, 0, "HOPPER STEP (us)"); break;
+    case 12: lcdPrint(0, 0, "HOPPER STEP INTV(ms)"); break;
+    case 13: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
+    case 14: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
   }
   String line1;
   switch (selParam) {
     case 1: line1 = "Nilai:" + String(cfg.conveyorSpeed) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 2: line1 = "Arah:" + String(cfg.conveyorDir ? "FORWARD" : "REVERSE"); break;
-    case 3: line1 = "Nilai:" + String(cfg.palangPulseMs) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 4: line1 = "Nilai:" + String(cfg.distMm, 1) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 5: line1 = "Nilai:" + String(cfg.mmPerSecAtMaxPwm, 1) + " Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 6: line1 = "Nilai:" + String(cfg.motorASpeed) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 7: line1 = "us:" + String(cfg.hopperStartUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 8: line1 = "us:" + String(cfg.hopperPushUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 9: line1 = "ms:" + String(cfg.hopperIntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 10: line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 11: line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 3: line1 = "Nilai:" + String(cfg.palangSpeed) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 4: line1 = "Arah PUSH:" + String(cfg.palangDir ? "FORWARD" : "REVERSE"); break;
+    case 5: line1 = "Nilai:" + String(cfg.palangPushMs) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 6: line1 = "Nilai:" + String(cfg.palangRetractMs) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 7: line1 = "Nilai:" + String(cfg.distMm, 1) + "   Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 8: line1 = "Nilai:" + String(cfg.mmPerSecAtMaxPwm, 1) + " Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 9: line1 = "us:" + String(cfg.hopperStartUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 10: line1 = "us:" + String(cfg.hopperPushUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 11: line1 = "us:" + String(cfg.hopperStepUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 12: line1 = "ms:" + String(cfg.hopperStepIntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 13: line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 14: line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
   }
   lcdPrint(0, 1, line1);
-  lcdPrint(0, 2, selParam == 2 ? "A=Forward B=Reverse" : "A+ B- C:step");
+  lcdPrint(0, 2, (selParam == 2 || selParam == 4) ? "A=Forward B=Reverse" : "A+ B- C:step");
   lcdPrint(0, 3, "#=SIMPAN D=kembali");
 }
 
@@ -539,51 +639,71 @@ void handleParamKey(char key) {
       else if (key == 'B') cfg.conveyorDir = false;
       break;
     case 3:
-      if (key == 'A') cfg.palangPulseMs = (uint16_t)constrain((int)cfg.palangPulseMs + step, 50, 2000);
-      else if (key == 'B') cfg.palangPulseMs = (uint16_t)constrain((int)cfg.palangPulseMs - step, 50, 2000);
+      if (key == 'A') cfg.palangSpeed = (uint8_t)constrain((int)cfg.palangSpeed + step, 0, 255);
+      else if (key == 'B') cfg.palangSpeed = (uint8_t)constrain((int)cfg.palangSpeed - step, 0, 255);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      if (motorAState != 0) ledcWrite(LEDC_CH_MOTORA, cfg.palangSpeed);   // update live kalau sedang jalan
       break;
     case 4:
+      if (key == 'A') cfg.palangDir = true;
+      else if (key == 'B') cfg.palangDir = false;
+      break;
+    case 5:
+      if (key == 'A') cfg.palangPushMs = (uint16_t)constrain((int)cfg.palangPushMs + step, 50, 3000);
+      else if (key == 'B') cfg.palangPushMs = (uint16_t)constrain((int)cfg.palangPushMs - step, 50, 3000);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
+    case 6:
+      if (key == 'A') cfg.palangRetractMs = (uint16_t)constrain((int)cfg.palangRetractMs + step, 50, 3000);
+      else if (key == 'B') cfg.palangRetractMs = (uint16_t)constrain((int)cfg.palangRetractMs - step, 50, 3000);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
+    case 7:
       if (key == 'A') cfg.distMm += step;
       else if (key == 'B') cfg.distMm = max(0.0f, cfg.distMm - step);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
-    case 5:
+    case 8:
       if (key == 'A') cfg.mmPerSecAtMaxPwm += step;
       else if (key == 'B') cfg.mmPerSecAtMaxPwm = max(5.0f, cfg.mmPerSecAtMaxPwm - step);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
-    case 6:
-      if (key == 'A') cfg.motorASpeed = (uint8_t)constrain((int)cfg.motorASpeed + step, 0, 255);
-      else if (key == 'B') cfg.motorASpeed = (uint8_t)constrain((int)cfg.motorASpeed - step, 0, 255);
-      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
-      if (motorAState != 0) ledcWrite(LEDC_CH_MOTORA, cfg.motorASpeed);   // update live kalau sedang jalan
-      break;
     // DIKEMBALIKAN ke POSITIONAL: preview live langsung untuk Titik Awal/Dorong (servo diam
     // sendiri di posisi yang diperintah, aman ditahan tanpa risiko putar tak terkendali).
-    case 7:
+    case 9:
       if (key == 'A') cfg.hopperStartUs = (uint16_t)constrain((int)cfg.hopperStartUs + step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
       else if (key == 'B') cfg.hopperStartUs = (uint16_t)constrain((int)cfg.hopperStartUs - step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
-      hopperSetUs(cfg.hopperStartUs);   // preview live
+      hopperCurrentUs = cfg.hopperStartUs; hopperSetUs(hopperCurrentUs);   // preview live, sinkron tracking
       break;
-    case 8:
+    case 10:
       if (key == 'A') cfg.hopperPushUs = (uint16_t)constrain((int)cfg.hopperPushUs + step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
       else if (key == 'B') cfg.hopperPushUs = (uint16_t)constrain((int)cfg.hopperPushUs - step, (int)HOPPER_MIN_US, (int)HOPPER_MAX_US);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
-      hopperSetUs(cfg.hopperPushUs);   // preview live
+      hopperCurrentUs = cfg.hopperPushUs; hopperSetUs(hopperCurrentUs);   // preview live, sinkron tracking
       break;
-    case 9:
-      if (key == 'A') cfg.hopperIntervalMs = (uint16_t)constrain((int)cfg.hopperIntervalMs + step * 10, 300, 10000);
-      else if (key == 'B') cfg.hopperIntervalMs = (uint16_t)constrain((int)cfg.hopperIntervalMs - step * 10, 300, 10000);
+    case 11:
+      // BARU: batas atas dinaikkan 500->2500 -- rentang servo cuma 2000us (500-2500), jadi
+      // stepUs=2500 udah cukup lompat langsung ujung ke ujung dalam 1 tick kalau operator mau.
+      if (key == 'A') cfg.hopperStepUs = (uint16_t)constrain((int)cfg.hopperStepUs + step, 1, 2500);
+      else if (key == 'B') cfg.hopperStepUs = (uint16_t)constrain((int)cfg.hopperStepUs - step, 1, 2500);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
-    case 10:
+    case 12:
+      // BARU: batas bawah 1->0 -- 0 = tanpa jeda (step tiap loop tick, secepat mungkin).
+      // AWAS: stepUs besar + interval 0 = gerakan "selesai" logika dalam 1 tick, servo fisik
+      // belum tentu ngejar secepat itu -- balik ke resiko yang sama kayak model duration-based
+      // lama kalau dipaksa lebih cepat dari kemampuan mekanis servo. Kalibrasi hati-hati.
+      if (key == 'A') cfg.hopperStepIntervalMs = (uint16_t)constrain((int)cfg.hopperStepIntervalMs + step, 0, 500);
+      else if (key == 'B') cfg.hopperStepIntervalMs = (uint16_t)constrain((int)cfg.hopperStepIntervalMs - step, 0, 500);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
+    case 13:
       if (key == 'A') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs + step * 10, 50, 5000);
       else if (key == 'B') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs - step * 10, 50, 5000);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
-    case 11:
+    case 14:
       if (key == 'A') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs + step * 10, 50, 5000);
       else if (key == 'B') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs - step * 10, 50, 5000);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
@@ -615,7 +735,9 @@ IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
   {"FAULT",  CH::LED_FAULT,     false},
   {"BUZZER", CH::BUZZER,        false},
   {"CONV1_STBY", CH::CONV1_STBY, false},
-  {"PALANG", CH::PALANG_RELAY,  false},
+  // DIUBAH: dulu "PALANG" (relay reject) -- sekarang palang pakai motor DC (Motor A), RLY1
+  // jadi channel spare, tetap bisa ditest manual raw di sini.
+  {"RLY1(spare)", CH::RLY1,  false},
 };
 uint8_t outputTestCursor = 0;
 bool testOutputLastVal = false, testOutputFirstDraw = true;
@@ -665,18 +787,40 @@ void handleTestOutputItemKey(char key) {
   drawTestOutputItem();
 }
 
-// --- Kategori: Test Input (semua input, IN1..IN5, baca saja) ---
-// --- Kategori: Test Input -- semua input tampil sekaligus (live, tanpa perlu masuk item) ---
-constexpr uint8_t INPUT_TEST_COUNT = 5;
-IOTestItem INPUT_TEST_ITEMS[INPUT_TEST_COUNT] = {
-  {"IN1", CH::ESTOP,           false},
-  {"IN2", CH::PROX_PASS,       false},
-  {"IN3", CH::BTN_TEST_PASS,   false},
-  {"IN4", CH::BTN_TEST_REJECT, false},
-  {"IN5", CH::CONV1_BIN1,      false},
+// --- Kategori: Test Input -- 3 sub-kategori (Button/Proximity/Limit Switch), SAMA PERSIS
+// channel-nya di semua 4 node (board PCB universal) -- test channel mentah CH::xxx, TERLEPAS
+// dari alias/peran yang dipakai node ini (mis. LIM_1..10 tetap diuji semua walau node ini
+// cuma pakai sebagian sebagai limit switch beneran).
+constexpr uint8_t BUTTON_TEST_COUNT = 3;
+IOTestItem BUTTON_TEST_ITEMS[BUTTON_TEST_COUNT] = {
+  {"ESTOP", CH::ESTOP,    false},
+  {"BTN2",  CH::BUTTON_2, false},
+  {"BTN3",  CH::BUTTON_3, false},
 };
+constexpr uint8_t PROX_TEST_COUNT = 2;
+IOTestItem PROX_TEST_ITEMS[PROX_TEST_COUNT] = {
+  {"PROX1", CH::PROX_1, false},
+  {"PROX2", CH::PROX_2, false},
+};
+constexpr uint8_t LIMIT_TEST_COUNT = 10;
+IOTestItem LIMIT_TEST_ITEMS[LIMIT_TEST_COUNT] = {
+  {"LIM1",  CH::LIM_1,  false}, {"LIM2",  CH::LIM_2,  false},
+  {"LIM3",  CH::LIM_3,  false}, {"LIM4",  CH::LIM_4,  false},
+  {"LIM5",  CH::LIM_5,  false}, {"LIM6",  CH::LIM_6,  false},
+  {"LIM7",  CH::LIM_7,  false}, {"LIM8",  CH::LIM_8,  false},
+  {"LIM9",  CH::LIM_9,  false}, {"LIM10", CH::LIM_10, false},
+};
+
+constexpr uint8_t INPUT_CAT_COUNT = 3;
+const char* INPUT_CAT_LABELS[INPUT_CAT_COUNT] = { "Button", "Proximity", "Limit Switch" };
+uint8_t inputCatCursor = 0;
+void drawInputCategorySelect() { drawListMenu("TEST INPUT", INPUT_CAT_LABELS, INPUT_CAT_COUNT, inputCatCursor); }
+
+IOTestItem* activeInputItems = BUTTON_TEST_ITEMS;
+uint8_t activeInputCount = BUTTON_TEST_COUNT;
 uint8_t inputTestScrollTop = 0;               // indeks item PALING ATAS yang sedang tampil (viewport 4 baris)
-bool testInputLiveLastVal[INPUT_TEST_COUNT];  // nilai TERAKHIR yang ditampilkan per item -- cegah kedip
+constexpr uint8_t INPUT_TEST_MAX = LIMIT_TEST_COUNT;   // terbesar dari 3 kategori -- ukuran array cache nilai
+bool testInputLiveLastVal[INPUT_TEST_MAX];    // nilai TERAKHIR yang ditampilkan per item -- cegah kedip
 uint8_t testInputLastScrollTop = 255;         // beda dari nilai valid manapun -- paksa redraw penuh pertama kali
 
 void drawTestInputList() {
@@ -684,19 +828,33 @@ void drawTestInputList() {
   if (scrollChanged) { lcd.clear(); testInputLastScrollTop = inputTestScrollTop; }
   for (uint8_t row = 0; row < 4; row++) {
     uint8_t idx = inputTestScrollTop + row;
-    if (idx >= INPUT_TEST_COUNT) continue;
-    bool val = io.read(INPUT_TEST_ITEMS[idx].ch);
+    if (idx >= activeInputCount) continue;
+    bool val = io.read(activeInputItems[idx].ch);
     if (scrollChanged || val != testInputLiveLastVal[idx]) {
       testInputLiveLastVal[idx] = val;
-      lcdPrint(0, row, String(INPUT_TEST_ITEMS[idx].label) + " = " + String(val ? 1 : 0) + "         ");
+      lcdPrint(0, row, String(activeInputItems[idx].label) + " = " + String(val ? 1 : 0) + "         ");
     }
   }
 }
 void handleTestInputListKey(char key) {
   if (key == 'A') { if (inputTestScrollTop > 0) { inputTestScrollTop--; drawTestInputList(); } }
-  else if (key == 'B') { if (inputTestScrollTop < (INPUT_TEST_COUNT > 4 ? INPUT_TEST_COUNT - 4 : 0)) { inputTestScrollTop++; drawTestInputList(); } }
-  else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
+  else if (key == 'B') { if (inputTestScrollTop < (activeInputCount > 4 ? activeInputCount - 4 : 0)) { inputTestScrollTop++; drawTestInputList(); } }
+  else if (key == 'D') { menuState = MenuState::TEST_INPUT_CATEGORY; drawInputCategorySelect(); }
   // 'C' sengaja tidak melakukan apa-apa -- input baca-saja, tidak ada item terpisah lagi
+}
+void handleInputCategoryKey(char key) {
+  if (key == 'A') { inputCatCursor = (inputCatCursor == 0) ? INPUT_CAT_COUNT - 1 : inputCatCursor - 1; drawInputCategorySelect(); }
+  else if (key == 'B') { inputCatCursor = (inputCatCursor + 1) % INPUT_CAT_COUNT; drawInputCategorySelect(); }
+  else if (key == 'C') {
+    switch (inputCatCursor) {
+      case 0: activeInputItems = BUTTON_TEST_ITEMS; activeInputCount = BUTTON_TEST_COUNT; break;
+      case 1: activeInputItems = PROX_TEST_ITEMS;   activeInputCount = PROX_TEST_COUNT;   break;
+      case 2: activeInputItems = LIMIT_TEST_ITEMS;  activeInputCount = LIMIT_TEST_COUNT;  break;
+    }
+    inputTestScrollTop = 0; testInputLastScrollTop = 255;
+    menuState = MenuState::TEST_INPUT_LIST; drawTestInputList();
+  }
+  else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
 }
 
 // --- Kategori: I2C Scan ---
@@ -805,25 +963,43 @@ void handleTestModStepperKey(char key) {
 // pastikan sendiri conveyor sedang STOP sebelum test modul motor DC.
 uint8_t testModMotorAState = 0, testModMotorBState = 0;
 void testModSetMotor(bool channelA, uint8_t dirState) {
+  // DIPERBAIKI (bug ditemukan): channel A (AIN1/AIN2/LEDC_CH_MOTORA) SAMA PERSIS dgn actuator
+  // palang otomatis -- test manual di sini bisa nabrak siklus reject sungguhan (setMotorA punya
+  // guard yang sama, lihat komentarnya). Channel B (conveyor) TIDAK di-guard di sini -- operator
+  // tetap perlu pastikan sendiri conveyor produksi sedang STOP sebelum test channel itu.
+  if (channelA && palangState != PalangState::IDLE) {
+    Serial.println("[TEST-MOTORDC] ChA ditolak -- palang otomatis sedang jalan, tunggu selesai");
+    return;
+  }
+  // DIPERBAIKI: sebelumnya cuma set arah (AIN/BIN) + STBY, TANPA pernah ledcWrite ke PWMA/PWMB
+  // -- TB6612FNG butuh sinyal PWM aktif di pin PWMA/PWMB spy motor benar-benar berputar, arah
+  // doang tidak cukup. Pakai LEDC channel & speed yang SAMA dgn produksi (LEDC_CH_MOTORA/CONV1,
+  // cfg.palangSpeed/conveyorSpeed) supaya hasil test representatif thd kecepatan aktual produksi.
   uint8_t ain1 = channelA ? CH::AIN1 : CH::BIN1, ain2 = channelA ? CH::AIN2 : CH::BIN2;
+  uint8_t pwmCh = channelA ? LEDC_CH_MOTORA : LEDC_CH_CONV1;
+  uint8_t speed = channelA ? cfg.palangSpeed : cfg.conveyorSpeed;
   if (channelA) testModMotorAState = dirState; else testModMotorBState = dirState;
-  if (dirState == 0) { io.write(ain1, LOW); io.write(ain2, LOW); }
-  else { io.write(ain1, dirState == 1); io.write(ain2, dirState != 1); }
+  if (dirState == 0) { io.write(ain1, LOW); io.write(ain2, LOW); ledcWrite(pwmCh, 0); }
+  else { io.write(ain1, dirState == 1); io.write(ain2, dirState != 1); ledcWrite(pwmCh, speed); }
   io.write(CH::STBY, (testModMotorAState != 0 || testModMotorBState != 0));
 }
+// DIPERBAIKI (bug ditemukan): sebelumnya A/B cuma toggle stop<->maju, dirState=2 (mundur)
+// TIDAK PERNAH bisa dicapai dari menu -- arah mundur gak bisa ditest/dikalibrasi sama sekali.
+// Sekarang A/B cycle stop->maju->mundur->stop tiap ditekan.
+const char* motorDirName(uint8_t s) { return s == 0 ? "STOP" : (s == 1 ? "FWD" : "REV"); }
 void drawTestModMotorDC() {
   if (testModFirstDraw) {
     lcd.clear(); lcdPrint(0, 0, "MODUL: MOTOR DC");
     lcdPrint(0, 3, "A=chA B=chB D=kmb");
     testModFirstDraw = false; testModLine1 = "\x01";
   }
-  String line1 = "ChA:" + String(testModMotorAState) + " ChB:" + String(testModMotorBState);
+  String line1 = "ChA:" + String(motorDirName(testModMotorAState)) + " ChB:" + String(motorDirName(testModMotorBState));
   if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
-  lcdPrint(0, 2, "A/B=maju,lg=stop");
+  lcdPrint(0, 2, "A/B=cycle arah");
 }
 void handleTestModMotorDCKey(char key) {
-  if (key == 'A') { testModSetMotor(true, testModMotorAState == 0 ? 1 : 0); }
-  else if (key == 'B') { testModSetMotor(false, testModMotorBState == 0 ? 1 : 0); }
+  if (key == 'A') { testModSetMotor(true, (testModMotorAState + 1) % 3); }
+  else if (key == 'B') { testModSetMotor(false, (testModMotorBState + 1) % 3); }
   else if (key == 'D') {
     testModSetMotor(true, 0); testModSetMotor(false, 0);
     menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return;
@@ -907,7 +1083,7 @@ void handleTestIoCategoryKey(char key) {
     switch (testIoCatCursor) {
       case 0: menuState = MenuState::TEST_IO_I2CSCAN; runI2CScanFromMenu(); break;
       case 1: menuState = MenuState::TEST_OUTPUT_LIST; outputTestCursor = 0; drawTestOutputList(); break;
-      case 2: menuState = MenuState::TEST_INPUT_LIST; inputTestScrollTop = 0; testInputLastScrollTop = 255; drawTestInputList(); break;
+      case 2: menuState = MenuState::TEST_INPUT_CATEGORY; inputCatCursor = 0; drawInputCategorySelect(); break;
       case 3: menuState = MenuState::TEST_RS485; drawTestRs485(); break;
       case 4: menuState = MenuState::TEST_MODULE_SELECT; moduleTypeCursor = 0; drawModuleTypeSelect(); break;
     }
@@ -1015,17 +1191,17 @@ void handleSerialCommand() {
   else if (cmd == "TESTREJECT")  { enqueueClassification(true, millis());  Serial.println("[SERIAL] Simulasi klasifikasi REJECT"); }
   else if (cmd == "MOTORA") { uint8_t d = line.substring(spaceIdx + 1).toInt(); setMotorA(constrain(d, 0, 2)); Serial.printf("[MOTORA] state=%u\n", d); }
   else if (cmd == "MOTORASPEED") {
-    cfg.motorASpeed = (uint8_t)constrain((int)line.substring(spaceIdx + 1).toInt(), 0, 255);
+    cfg.palangSpeed = (uint8_t)constrain((int)line.substring(spaceIdx + 1).toInt(), 0, 255);
     saveConfigToNvs();
-    if (motorAState != 0) ledcWrite(LEDC_CH_MOTORA, cfg.motorASpeed);   // update live kalau sedang jalan
-    Serial.printf("[MOTORASPEED] %u\n", cfg.motorASpeed);
+    if (motorAState != 0) ledcWrite(LEDC_CH_MOTORA, cfg.palangSpeed);   // update live kalau sedang jalan
+    Serial.printf("[MOTORASPEED] %u\n", cfg.palangSpeed);
   }
   else if (cmd == "STATUS") {
     Serial.printf("[STATUS] state=%s fault=%u pass=%lu reject=%lu ESTOP=%d speed=%u dir=%d dist=%.1f mmps=%.1f\n",
                   stateText(currentState), faultCode, (unsigned long)passCount, (unsigned long)rejectCount,
                   io.read(CH::ESTOP), cfg.conveyorSpeed, cfg.conveyorDir, cfg.distMm, cfg.mmPerSecAtMaxPwm);
-    Serial.printf("[STATUS] activity=%u i2cErrCount=%u lastFault=%u uptime=%lus motorA=%u\n",
-                  (uint16_t)activityCode(), i2cErrorCount, lastFaultCode, (unsigned long)(millis() / 1000), motorAState);
+    Serial.printf("[STATUS] activity=%u i2cErrCount=%u lastFault=%u uptime=%lus motorA=%u palangState=%d\n",
+                  (uint16_t)activityCode(), i2cErrorCount, lastFaultCode, (unsigned long)(millis() / 1000), motorAState, (int)palangState);
     Serial.printf("[STATUS] FW=%s build=%s freeHeap=%u\n", FW_VERSION, FW_BUILD, ESP.getFreeHeap());
   }
   else if (cmd == "HELP") {
@@ -1170,6 +1346,7 @@ void setup() {
   } else {
     Serial.println("[BOOT] Keypad dilewati (tidak terdeteksi)");
   }
+  lcdBootProgress("I2C + LCD/Keypad");
 
   bool ioOk = io.begin(I2CAddr::MCP1, I2CAddr::MCP2);
   if (!ioOk) { faultCode = (uint16_t)FaultCode::IO_EXPANDER_MISSING; currentState = NodeState::FAULT; }
@@ -1178,9 +1355,11 @@ void setup() {
   io.pinMode(CH::LED_RUN, OUTPUT); io.pinMode(CH::LED_FAULT, OUTPUT); io.pinMode(CH::BUZZER, OUTPUT);
   io.pinMode(CH::LED_OPERATION, OUTPUT); io.pinMode(CH::LED_MANUAL, OUTPUT);   // BARU
   io.pinMode(CH::CONV1_BIN1, OUTPUT); io.pinMode(CH::CONV1_BIN2, OUTPUT); io.pinMode(CH::CONV1_STBY, OUTPUT);
-  io.pinMode(CH::PALANG_RELAY, OUTPUT);
-  // BARU: 2 motor DC opsional -- pinMode disiapkan meski belum tentu fisiknya terpasang
-  io.pinMode(CH::CONV1_AIN1, OUTPUT); io.pinMode(CH::CONV1_AIN2, OUTPUT);   // BARU -- motor A (channel yg tadinya menganggur)
+  // DIUBAH: RLY1 (dulu PALANG_RELAY) sekarang channel spare -- palang produksi pakai Motor A
+  // (motor DC linear actuator). Tetap di-pinMode supaya bisa ditest manual raw (Test Output).
+  io.pinMode(CH::RLY1, OUTPUT);
+  // Motor A (AIN1/AIN2) -- SEKARANG dipakai produksi utk actuator palang, BUKAN lagi spare.
+  io.pinMode(CH::CONV1_AIN1, OUTPUT); io.pinMode(CH::CONV1_AIN2, OUTPUT);
   io.pinMode(CH::PROX_PASS, INPUT_PULLUP);
   io.pinMode(CH::BTN_TEST_PASS, INPUT_PULLUP);     // BARU
   io.pinMode(CH::BTN_TEST_REJECT, INPUT_PULLUP);   // BARU
@@ -1192,6 +1371,7 @@ void setup() {
   io.pinMode(CH::RLY2, OUTPUT);
   // TBD HOPPER: io.pinMode(CH::LIMIT_HOPPER, INPUT_PULLUP); -- aktifkan lagi nanti
   Serial.printf("[BOOT] MCP23017: %s, semua pinMode selesai (hopper belum di-setup, TBD)\n", ioOk ? "OK" : "GAGAL");
+  lcdBootProgress("I/O Expander MCP23017");
 
   // DIPERBAIKI (regresi ditemukan): pwm.begin() TIDAK BOLEH ditunda sampai setelah
   // loadConfigFromNvs() -- itu BUG BARU yang tidak sengaja saya perkenalkan saat
@@ -1208,21 +1388,31 @@ void setup() {
   io.pinMode(CH::OE_PCA, OUTPUT);
   io.write(CH::OE_PCA, LOW);
   Serial.println("[BOOT] PCA9685 diinisialisasi (Adafruit_PWMServoDriver)");
+  lcdBootProgress("Servo PCA9685");
 
   ledcSetup(LEDC_CH_CONV1, PWM_FREQ, PWM_RES);
   ledcAttachPin(GP::CONV1_PWM, LEDC_CH_CONV1);
   ledcSetup(LEDC_CH_MOTORA, PWM_FREQ, PWM_RES);       // BARU
   ledcAttachPin(GP::MOTOR_A_PWM, LEDC_CH_MOTORA);     // BARU
+  // DIPERBAIKI (bug ditemukan): pin native STEP_1/2/3 dipakai testStepperPulse() (Test Modul
+  // Stepper) via digitalWrite() langsung, TAPI TIDAK PERNAH di-pinMode(OUTPUT) -- default ESP32
+  // setelah boot adalah INPUT, jadi pulsa STEP tidak pernah keluar secara elektrik. SORTER tidak
+  // punya stepper produksi (DIR/EN lewat MCP sudah pinMode di tempat lain), jadi cuma pin ini
+  // yang kelewat -- sama pola bug dgn PWM Motor DC yang sudah diperbaiki.
+  pinMode(GP::STEP_1, OUTPUT); pinMode(GP::STEP_2, OUTPUT); pinMode(GP::STEP_3, OUTPUT);
   // BARU: Hopper servo -- pakai GP::STEP_1 (GPIO23), pin ini MENGANGGUR di board SORTER
   // (tidak ada stepper terpasang fisik untuk role SORTER)
   // DIHAPUS: ledcSetup/ledcAttachPin utk hopper -- servo sekarang lewat PCA9685 (I2C), bukan LEDC
   Serial.println("[BOOT] LEDC PWM conveyor1 + motor A OK");
+  lcdBootProgress("PWM Conveyor/Motor");
 
   loadConfigFromNvs();   // BARU -- cfg sekarang persist antar reboot, sebelumnya selalu reset ke default
   Serial.println("[BOOT] SorterConfig dimuat dari NVS (kalau pernah disimpan)");
 
-  hopperSetUs(cfg.hopperStartUs);   // posisi awal servo saat boot, PAKAI nilai kalibrasi tersimpan
+  hopperCurrentUs = cfg.hopperStartUs;   // BARU -- sinkronkan tracking posisi step-based dgn boot
+  hopperSetUs(hopperCurrentUs);   // posisi awal servo saat boot, PAKAI nilai kalibrasi tersimpan
   Serial.println("[BOOT] Hopper diposisikan ke titik awal");
+  lcdBootProgress("Kalibrasi NVS");
 
   Serial2.begin(Rs485Cfg::BAUD, SERIAL_8N1, Rs485Cfg::RX_PIN, Rs485Cfg::TX_PIN);
   mb.begin(&Serial2);
@@ -1245,6 +1435,7 @@ void setup() {
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   mb.onSetHreg(Reg::CLASSIFY_IS_REJECT, onClassifyWrite);
   Serial.println("[BOOT] Modbus + register lengkap OK");
+  lcdBootProgress("Modbus RS485");
 
   if (currentState != NodeState::FAULT) currentState = NodeState::IDLE;
   Serial.println("[BOOT] setup SELESAI");
@@ -1278,6 +1469,8 @@ void loop() {
         handleTestOutputListKey(key);
       } else if (menuState == MenuState::TEST_OUTPUT_ITEM) {
         handleTestOutputItemKey(key);
+      } else if (menuState == MenuState::TEST_INPUT_CATEGORY) {
+        handleInputCategoryKey(key);
       } else if (menuState == MenuState::TEST_INPUT_LIST) {
         handleTestInputListKey(key);
       } else if (menuState == MenuState::TEST_RS485) {

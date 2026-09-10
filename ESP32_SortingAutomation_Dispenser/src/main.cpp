@@ -38,6 +38,29 @@ void lcdPrint(uint8_t col, uint8_t row, String text) {
 #define FW_VERSION "v.01.00.25082026.21.17"
 constexpr const char* FW_BUILD = __DATE__ " " __TIME__;
 
+// BARU: animasi LOADING singkat saat boot -- kasih feedback visual operator + waktu settle
+// I2C/PCA9685/MCP23017 sebelum masuk operasi normal. No-op total kalau LCD tidak terdeteksi.
+constexpr uint8_t BOOT_STEPS_TOTAL = 5;
+constexpr uint16_t BOOT_STEP_DELAY_MS = 150;
+uint8_t bootStep = 0;
+void lcdBootProgress(const char* stepLabel) {
+  bootStep++;
+  // DIPERBAIKI: delay() WAJIB tetap jalan meski LCD tidak terdeteksi -- tujuannya kasih waktu
+  // settle inisialisasi hardware, animasi LCD cuma bonus visual di atasnya. Sebelumnya delay
+  // ikut di-skip bareng LCD, jadi tanpa LCD = TIDAK ada jeda sama sekali.
+  if (lcdPresent) {
+    uint8_t filled = (uint8_t)min((uint32_t)10, (uint32_t)bootStep * 10 / BOOT_STEPS_TOTAL);
+    String bar = "[";
+    for (uint8_t i = 0; i < 10; i++) bar += (i < filled) ? '#' : '-';
+    bar += "]";
+    lcdPrint(0, 0, "FEEDER BOOTING");
+    lcdPrint(0, 1, bar);
+    lcdPrint(0, 2, "LOADING " + String(bootStep) + "/" + String(BOOT_STEPS_TOTAL));
+    lcdPrint(0, 3, stepLabel);
+  }
+  delay(BOOT_STEP_DELAY_MS);
+}
+
 NodeState currentState = NodeState::INIT;
 uint16_t faultCode = 0;
 // BARU: Lapis 3 diagnostik -- sinkron pola SORTER/PICKER/STOCKER
@@ -48,15 +71,28 @@ bool modbusEverUsed = false;
 
 struct FeederConfig {
   uint8_t  conveyorSpeed = 160;
+  bool     conveyorDir = true;   // BARU -- true=forward, false=reverse (dulu hardcoded forward)
   uint16_t pushTimeoutMs = 800;   // DIUBAH makna: sekarang batas waktu MAKSIMUM tiap gerakan servo (pengaman, servo tak punya sensor "sampai")
   uint16_t buzzerOnMs  = 500;
   uint16_t buzzerOffMs = 500;
   // BARU: 2 servo gerbang stack dispenser -- Servo1=gerbang BAWAH, Servo2=gerbang ATAS.
-  // Titik Awal=tertutup/tertahan, Titik Akhir=terbuka/lepas. DIUBAH: Interval sekarang =
-  // waktu tempuh (Awal->Akhir), TERPISAH per servo -- SAMA konsep dengan hopper SORTER,
-  // BUKAN lagi step+interval speed yang shared. Waktu Tahan tetap terpisah dari Interval.
-  uint16_t servo1StartUs = 1000, servo1EndUs = 2000, servo1HoldMs = 500, servo1IntervalMs = 500;
-  uint16_t servo2StartUs = 1000, servo2EndUs = 2000, servo2HoldMs = 500, servo2IntervalMs = 500;
+  // Titik Awal=tertutup/tertahan, Titik Akhir=terbuka/lepas. Waktu Tahan terpisah dari gerak.
+  // DIUBAH TOTAL: *StepIntervalMs (dulu *IntervalMs = target durasi TETAP satu arah) sekarang
+  // = jeda antar-tick step (SAMA pola dgn hopper SORTER/PICKER) -- durasi jadi HASIL
+  // jarak/kecepatan, bukan target yang dipaksakan (menghilangkan bug "mundur sebelum sampai").
+  uint16_t servo1StartUs = 1000, servo1EndUs = 2000, servo1HoldMs = 500, servo1StepIntervalMs = 20;
+  uint16_t servo2StartUs = 1000, servo2EndUs = 2000, servo2HoldMs = 500, servo2StepIntervalMs = 20;
+  // DIUBAH: servoStartDelayMs SUDAH GAK DIPAKAI di siklus produksi normal (REQUEST_REFILL) --
+  // itu sekarang PROX_2-edge-triggered, sensor-confirmed. Field ini DIPAKAI LAGI, tapi KHUSUS
+  // utk Cmd::FORCE_MIDDLE_REFILL (startup/recovery): conveyor jalan duluan, servo1+2 baru
+  // dieksekusi setelah jeda ini.
+  uint16_t servoStartDelayMs = 0;
+  // BARU: besar lompatan tiap tick (us) -- pasangan servo*StepIntervalMs di atas.
+  uint16_t servo1StepUs = 20, servo2StepUs = 20;
+  // BARU: mekanisme 2-proximity -- batas waktu tunggu PACKAGE_MIDDLE_SENSOR konfirmasi LOW
+  // (package baru beneran nyampe tengah) SETELAH servo selesai jatuhin -- kalau kelewat,
+  // FAULT(MIDDLE_PACKAGE_MISSING) (macet/kehabisan stok tumpukan). DITARUH DI AKHIR struct.
+  uint16_t middleConfirmTimeoutMs = 5000;
 } cfg;
 
 // BARU: buzzer notifikasi -- 1 siklus ON-OFF non-blocking per trigger event
@@ -77,42 +113,47 @@ void updateBuzzerBeep() {
   }
 }
 
-enum class RefillState { IDLE, CONVEYOR_RUN, SERVO1_TO_END, SERVO1_HOLD, SERVO1_TO_START,
-                          SERVO2_TO_END, SERVO2_HOLD, SERVO2_TO_START, DONE, FAULT, ESTOPPED };
+// DIUBAH: servo (gerbang stack) TIDAK LAGI bagian dari RefillState -- sekarang jalan PARALEL,
+// state independen sendiri (lihat ServoRefillStage di bawah), bukan sub-tahapan berurutan
+// setelah conveyor berhenti. RefillState sekarang murni soal conveyor2 doang.
+enum class RefillState { IDLE, CONVEYOR_RUN, DONE, FAULT, ESTOPPED };
 RefillState refillState = RefillState::IDLE;
 uint32_t stateEnteredAt = 0;
 bool refillRequested = false;
 
-// DIREDESIGN: trajectory servo DURATION-BASED (bukan step-speed lagi) -- SAMA konsep dgn
-// hopper SORTER. Servo1=channel PCA9685 0, Servo2=channel 1. Tiap servo punya tracking
-// gerak (moveFromUs/moveStartMs) TERPISAH karena interval-nya juga terpisah.
+// DIUBAH TOTAL: trajectory servo STEP-RATE based (dulu duration-based -- bisa "mundur sebelum
+// sampai" kalau Interval di-set lebih kecil dari kecepatan fisik servo yang sebenarnya sanggup).
+// SAMA konsep dgn hopper SORTER/PICKER: tiap tick majukan posisi SEBESAR stepUs menuju target.
+// Selesai ditentukan POSISI (currentUs==target), bukan waktu abis. Servo1=channel PCA9685 0,
+// Servo2=channel 1.
 void pcaSetServoUs(uint8_t channel, uint16_t us);   // forward declaration -- didefinisikan di bawah (Test Modul)
 constexpr uint8_t SERVO1_CH = 0, SERVO2_CH = 1;
 uint16_t servo1CurrentUs = 1000, servo2CurrentUs = 1000;
-uint32_t servo1MoveStartMs = 0, servo2MoveStartMs = 0;
-uint16_t servo1MoveFromUs = 1000, servo2MoveFromUs = 1000;
+uint32_t servo1LastStepMs = 0, servo2LastStepMs = 0;
 
-// Panggil SEKALI saat MULAI gerakan baru -- catat titik awal & waktu mulai utk interpolasi
-void startServoMove(uint8_t which, uint16_t fromUs) {
-  if (which == 1) { servo1MoveFromUs = fromUs; servo1MoveStartMs = millis(); }
-  else { servo2MoveFromUs = fromUs; servo2MoveStartMs = millis(); }
+// Reset timer tick -- dipanggil saat MULAI gerakan baru, spy tick pertama gerakan baru nunggu
+// 1 stepInterval penuh dulu (bukan langsung loncat). Param fromUs sudah TIDAK dipakai lagi
+// (step-based gak butuh referensi "titik awal" terpisah, currentUs SENDIRI itu titik awalnya) --
+// tetap dipertahankan di signature supaya semua caller lama gak perlu diubah.
+void startServoMove(uint8_t which, uint16_t /*fromUs*/) {
+  if (which == 1) servo1LastStepMs = millis();
+  else servo2LastStepMs = millis();
 }
-// Interpolasi linear non-blocking menuju targetUs, selama Interval servo yang bersangkutan.
-// Return true kalau SUDAH SAMPAI (durasi habis) -- PASTI selesai tepat waktu, tidak perlu
-// timeout pengaman terpisah lagi (beda dari desain lama yang menunggu sensor fisik).
 bool updateServoTrajectory(uint8_t which, uint16_t targetUs) {
-  uint16_t &currentUs   = (which == 1) ? servo1CurrentUs : servo2CurrentUs;
-  uint32_t moveStartMs  = (which == 1) ? servo1MoveStartMs : servo2MoveStartMs;
-  uint16_t moveFromUs   = (which == 1) ? servo1MoveFromUs : servo2MoveFromUs;
-  uint16_t intervalMs   = (which == 1) ? cfg.servo1IntervalMs : cfg.servo2IntervalMs;
-  uint8_t ch            = (which == 1) ? SERVO1_CH : SERVO2_CH;
-  uint32_t elapsed = millis() - moveStartMs;
-  if (elapsed >= intervalMs) { currentUs = targetUs; pcaSetServoUs(ch, currentUs); return true; }
-  float fraction = (float)elapsed / (float)intervalMs;
-  int32_t interpolated = (int32_t)moveFromUs + (int32_t)(((int32_t)targetUs - (int32_t)moveFromUs) * fraction);
-  currentUs = (uint16_t)constrain(interpolated, 500, 2500);
+  uint16_t &currentUs     = (which == 1) ? servo1CurrentUs : servo2CurrentUs;
+  uint32_t &lastStepMs    = (which == 1) ? servo1LastStepMs : servo2LastStepMs;
+  uint16_t stepUs         = (which == 1) ? cfg.servo1StepUs : cfg.servo2StepUs;
+  uint16_t stepIntervalMs = (which == 1) ? cfg.servo1StepIntervalMs : cfg.servo2StepIntervalMs;
+  uint8_t ch              = (which == 1) ? SERVO1_CH : SERVO2_CH;
+  if (currentUs == targetUs) return true;
+  // BARU: stepIntervalMs=0 = "opsional/tanpa jeda" -- step tiap loop tick, secepat mungkin.
+  if (stepIntervalMs > 0 && millis() - lastStepMs < stepIntervalMs) return false;
+  lastStepMs = millis();
+  int32_t diff = (int32_t)targetUs - (int32_t)currentUs;
+  int16_t step = (abs(diff) < (int32_t)stepUs) ? (int16_t)diff : (diff > 0 ? (int16_t)stepUs : -(int16_t)stepUs);
+  currentUs = (uint16_t)constrain((int32_t)currentUs + step, 500, 2500);
   pcaSetServoUs(ch, currentUs);
-  return false;
+  return (currentUs == targetUs);
 }
 
 // BARU: Test Sequence -- 1x siklus maju-mundur (Titik Awal->Titik Akhir->tahan->Titik Awal)
@@ -122,6 +163,13 @@ enum class TestServoCycleStage { NONE, TO_END, HOLD, TO_START };
 TestServoCycleStage testServoCycleStage = TestServoCycleStage::NONE;
 uint8_t testServoCycleWhich = 0;   // 1 atau 2
 uint32_t testServoCycleStateAt = 0;
+// DIPERBAIKI (bug ditemukan): layar kalibrasi "Servo1/2 Interval(ms)" sebelumnya cuma ubah
+// angka doang, servo TIDAK PERNAH bergerak buat operator amati efeknya live -- beda sama
+// Hopper SORTER yang punya mode test-live otomatis di layar Interval-nya. Sekarang sama pola:
+// selama operator ada di layar Interval, cycle TO_END->HOLD->TO_START otomatis LOOP terus
+// (bukan berhenti sekali), supaya perubahan Interval langsung kelihatan efeknya.
+bool servoIntervalTestMode = false;
+uint8_t servoIntervalTestWhich = 0;   // 1 atau 2, servo mana yang lagi di-loop
 void startTestServoCycle(uint8_t which) {
   if (currentState != NodeState::IDLE) { Serial.println("[TEST] Servo cycle ditolak -- node sedang tidak IDLE"); return; }
   testServoCycleWhich = which;
@@ -150,15 +198,23 @@ void updateTestServoCycle() {
       break;
     case TestServoCycleStage::TO_START:
       if (updateServoTrajectory(testServoCycleWhich, startUs)) {
-        testServoCycleStage = TestServoCycleStage::NONE;
-        Serial.printf("[TEST] Servo%u cycle SELESAI\n", testServoCycleWhich);
+        if (servoIntervalTestMode && servoIntervalTestWhich == testServoCycleWhich) {
+          // BARU: mode test-live -- ulangi cycle terus selama operator masih di layar Interval,
+          // bukan berhenti sekali. Ini yang bikin "servo tidak bergerak" saat test interval.
+          startServoMove(testServoCycleWhich, startUs);
+          testServoCycleStage = TestServoCycleStage::TO_END;
+          testServoCycleStateAt = millis();
+        } else {
+          testServoCycleStage = TestServoCycleStage::NONE;
+          Serial.printf("[TEST] Servo%u cycle SELESAI\n", testServoCycleWhich);
+        }
       }
       break;
     default: break;
   }
 }
 
-constexpr int PWM_FREQ = 20000, PWM_RES = 8, LEDC_CH_CONV2 = 0;
+constexpr int PWM_FREQ = 20000, PWM_RES = 8, LEDC_CH_CONV2 = 0, LEDC_CH_PUSH_TEST = 1;
 
 void motorWrite(uint8_t ain1, uint8_t ain2, bool forward) { io.write(ain1, forward); io.write(ain2, !forward); }
 void enterRefillState(RefillState s) { refillState = s; stateEnteredAt = millis(); }
@@ -166,7 +222,7 @@ void enterRefillState(RefillState s) { refillState = s; stateEnteredAt = millis(
 // --- Menu state (dideklarasikan awal, dipakai onCmdWrite) ---
 enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_PARAM,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
-                        TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
+                        TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
                         TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET };
 MenuState menuState = MenuState::NONE;
 
@@ -196,16 +252,27 @@ void resetConfigToDefault() {
 // state itu -- struktur asli (coast dulu di IDLE, baru drive di CONVEYOR_RUN) TETAP
 // dipertahankan persis, tidak dihilangkan.
 bool motorWriteDoneForState = false;
+
+// DIUBAH TOTAL: mekanisme 2-proximity. LIM_BOX_ARRIVED (PROX_1, UJUNG) = package FULL sampai
+// posisi ambil arm. PACKAGE_MIDDLE_SENSOR (PROX_2, TENGAH) = ada/tidaknya package di titik isi.
+// Servo refill SEKARANG di-trigger PACKAGE_MIDDLE_SENSOR (LOW->HIGH = package baru saja
+// ninggalin tengah krn didorong conveyor ke ujung) -- SENSOR-CONFIRMED, bukan delay tebakan lagi
+// (servoStartDelayMs pensiun). Servo refill dideklarasikan SEBELUM handleRefillFSM/handleMiddleSensor
+// karena dipakai di keduanya.
+enum class ServoRefillStage { NONE, SERVO1_TO_END, SERVO1_HOLD, SERVO1_TO_START,
+                               SERVO2_TO_END, SERVO2_HOLD, SERVO2_TO_START, WAIT_MIDDLE_CONFIRM };
+ServoRefillStage servoRefillStage = ServoRefillStage::NONE;
+uint32_t servoRefillStageAt = 0;
+
 void handleRefillFSM() {
   uint32_t elapsed = millis() - stateEnteredAt;
   switch (refillState) {
+    // DIPERBAIKI (bug ditemukan): semua guard (FAULT/ESTOPPED/PACKAGE_READY_FLAG/LIM_STOCK_EMPTY)
+    // dipindah ke applyCommand() -- REQUEST_REFILL SEKARANG cuma nyampe sini kalau memang SUDAH
+    // pasti mau dieksekusi (refillRequested cuma true kalau lolos semua guard). Case ini murni
+    // eksekusi, gak ada penolakan/penahanan diam-diam lagi.
     case RefillState::IDLE:
       if (refillRequested) {
-        if (io.read(CH::LIM_STOCK_EMPTY) == LOW) {
-          faultCode = (uint16_t)FaultCode::STOCK_EMPTY;
-          enterRefillState(RefillState::FAULT);
-          return;
-        }
         refillRequested = false;
         io.write(CH::CONV2_BIN1, false); io.write(CH::CONV2_BIN2, false);
         io.write(CH::DISP_STBY, HIGH);
@@ -214,56 +281,22 @@ void handleRefillFSM() {
       }
       break;
     case RefillState::CONVEYOR_RUN:
-      if (!motorWriteDoneForState) { motorWrite(CH::CONV2_BIN1, CH::CONV2_BIN2, true); motorWriteDoneForState = true; }
+      if (!motorWriteDoneForState) { motorWrite(CH::CONV2_BIN1, CH::CONV2_BIN2, cfg.conveyorDir); motorWriteDoneForState = true; }
       ledcWrite(LEDC_CH_CONV2, cfg.conveyorSpeed);
-      // DIUBAH: LIM_BOX_ARRIVED sekarang berfungsi sbg trigger proximity -- package berhenti
-      // di posisi yang diharapkan (sensor fisik boleh proximity ATAU limit switch, sinyalnya sama)
+      // DIUBAH: LIM_BOX_ARRIVED (PROX_1, UJUNG) = package FULL sampai, siap diambil arm --
+      // set PACKAGE_READY_FLAG, Orange Pi WAJIB ACK (Cmd::ACK_PACKAGE_TAKEN) sebelum refill berikutnya.
       if (io.read(CH::LIM_BOX_ARRIVED) == LOW) {
         ledcWrite(LEDC_CH_CONV2, 0);
-        startServoMove(1, cfg.servo1StartUs);   // BARU -- catat titik awal gerak Servo1
-        enterRefillState(RefillState::SERVO1_TO_END);
+        mb.Hreg(Reg::PACKAGE_READY_FLAG, 1);
+        Serial.println("[FEEDER] Package sampai UJUNG -- PACKAGE_READY_FLAG=1, siap diambil arm");
+        enterRefillState(RefillState::DONE);
       }
       else if (elapsed > 8000) { ledcWrite(LEDC_CH_CONV2, 0); faultCode = (uint16_t)FaultCode::BOX_NOT_ARRIVED; enterRefillState(RefillState::FAULT); }
       break;
-
-    // --- BARU: Servo 1 -- gerbang BAWAH, lepas package tingkat-2 turun ke conveyor ---
-    case RefillState::SERVO1_TO_END:
-      // DIHAPUS: timeout pengaman terpisah tidak perlu lagi -- durasi SUDAH eksplisit via
-      // Interval, updateServoTrajectory() PASTI selesai tepat waktu (bukan menunggu sensor).
-      if (updateServoTrajectory(1, cfg.servo1EndUs)) enterRefillState(RefillState::SERVO1_HOLD);
-      break;
-    case RefillState::SERVO1_HOLD:
-      if (elapsed >= cfg.servo1HoldMs) {
-        startServoMove(1, cfg.servo1EndUs);   // BARU -- mulai gerak balik dari titik akhir
-        enterRefillState(RefillState::SERVO1_TO_START);
-      }
-      break;
-    case RefillState::SERVO1_TO_START:
-      if (updateServoTrajectory(1, cfg.servo1StartUs)) {
-        startServoMove(2, cfg.servo2StartUs);   // BARU -- mulai gerak Servo2
-        enterRefillState(RefillState::SERVO2_TO_END);
-      }
-      break;
-
-    // --- BARU: Servo 2 -- gerbang ATAS, lepas package tingkat-3 turun isi ulang tingkat-2 ---
-    case RefillState::SERVO2_TO_END:
-      if (updateServoTrajectory(2, cfg.servo2EndUs)) enterRefillState(RefillState::SERVO2_HOLD);
-      break;
-    case RefillState::SERVO2_HOLD:
-      if (elapsed >= cfg.servo2HoldMs) {
-        startServoMove(2, cfg.servo2EndUs);   // BARU -- mulai gerak balik dari titik akhir
-        enterRefillState(RefillState::SERVO2_TO_START);
-      }
-      break;
-    case RefillState::SERVO2_TO_START:
-      if (updateServoTrajectory(2, cfg.servo2StartUs)) { enterRefillState(RefillState::DONE); triggerBuzzerBeep(); }
-      break;
-
     case RefillState::DONE:
       io.write(CH::DISP_STBY, LOW);
-      currentState = NodeState::IDLE;
       enterRefillState(RefillState::IDLE);
-      Serial.println("[FEEDER] Refill SELESAI");
+      Serial.println("[FEEDER] Conveyor SELESAI (servo refill nunggu PACKAGE_MIDDLE_SENSOR kosong)");
       break;
     case RefillState::FAULT: case RefillState::ESTOPPED:
       ledcWrite(LEDC_CH_CONV2, 0);
@@ -273,10 +306,178 @@ void handleRefillFSM() {
   }
 }
 
+// BARU: pantau PACKAGE_MIDDLE_SENSOR (PROX_2) terus-menerus, TERPISAH dari RefillState conveyor.
+// LOW->HIGH = package yang tadi duduk di tengah baru saja pergi (didorong conveyor ke ujung) --
+// itu sinyal "tengah sekarang kosong, aman jatuhin package baru" -- trigger servo LANGSUNG,
+// sensor-confirmed, bukan delay tebakan (servoStartDelayMs, pensiun).
+bool lastMiddleSensorState = HIGH;
+void handleMiddleSensor() {
+  bool cur = io.read(CH::PACKAGE_MIDDLE_SENSOR);
+  // BARU: register live -- Orange Pi bisa poll status tengah kapan saja (mis. cek startup),
+  // gak cuma nunggu edge produksi. Ditulis tiap panggilan (bukan cuma saat berubah).
+  mb.Hreg(Reg::MIDDLE_PACKAGE_PRESENT, cur == LOW ? 1 : 0);
+  if (cur != lastMiddleSensorState) {
+    if (lastMiddleSensorState == LOW && cur == HIGH &&
+        currentState != NodeState::FAULT && servoRefillStage == ServoRefillStage::NONE) {
+      startServoMove(1, cfg.servo1StartUs);
+      servoRefillStage = ServoRefillStage::SERVO1_TO_END;
+      servoRefillStageAt = millis();
+      Serial.println("[FEEDER] Tengah terdeteksi kosong -- servo refill mulai (Servo1 gerbang bawah)");
+    }
+    lastMiddleSensorState = cur;
+  }
+}
+
+// DIUBAH: FORCE_MIDDLE_REFILL -- utk startup/recovery kalau tengah kosong dari awal (gak ada
+// edge yg bisa dideteksi handleMiddleSensor). SAMA pola dgn alur produksi LAMA (sebelum
+// redesign PROX_2-edge-trigger): conveyor MAJU duluan, tunggu cfg.servoStartDelayMs, BARU
+// servo1+servo2 dieksekusi -- BUKAN paralel bareng dari t=0. Field servoStartDelayMs yang
+// tadinya pensiun (redesign PROX_2) dipakai lagi KHUSUS di sini. Keduanya (conveyor+servo)
+// tuntas/berhenti begitu PACKAGE_MIDDLE_SENSOR = LOW. Timeout fault kalau kelewat batas waktu.
+bool forceMiddleRefillActive = false;
+bool forceServoScheduled = false;
+uint32_t forceMiddleRefillAt = 0;
+uint32_t forceServoStartAt = 0;
+constexpr uint32_t FORCE_MIDDLE_REFILL_TIMEOUT_MS = 8000;
+
+void startForceMiddleRefill() {
+  if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
+    Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
+    return;
+  }
+  if (io.read(CH::LIM_STOCK_EMPTY) == LOW) {
+    faultCode = (uint16_t)FaultCode::STOCK_EMPTY;
+    currentState = NodeState::FAULT;
+    Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- stok tumpukan kosong");
+    return;
+  }
+  if (refillState != RefillState::IDLE || servoRefillStage != ServoRefillStage::NONE || forceMiddleRefillActive) {
+    Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- masih ada siklus lain jalan");
+    return;
+  }
+  forceMiddleRefillActive = true;
+  forceMiddleRefillAt = millis();
+  io.write(CH::CONV2_BIN1, false); io.write(CH::CONV2_BIN2, false);
+  io.write(CH::DISP_STBY, HIGH);
+  motorWrite(CH::CONV2_BIN1, CH::CONV2_BIN2, cfg.conveyorDir);
+  // BARU: servo BELUM langsung jalan -- dijadwalkan cfg.servoStartDelayMs dari sekarang,
+  // conveyor jalan duluan sendirian selama jeda itu.
+  forceServoScheduled = true;
+  forceServoStartAt = millis() + cfg.servoStartDelayMs;
+  currentState = NodeState::RUNNING_OR_MOVING;
+  Serial.println("[FEEDER] FORCE_MIDDLE_REFILL mulai -- conveyor MAJU duluan, servo nyusul setelah delay");
+}
+
+void updateForceMiddleRefill() {
+  if (!forceMiddleRefillActive) return;
+  ledcWrite(LEDC_CH_CONV2, cfg.conveyorSpeed);
+  if (forceServoScheduled && (int32_t)(millis() - forceServoStartAt) >= 0) {
+    forceServoScheduled = false;
+    if (servoRefillStage == ServoRefillStage::NONE) {
+      startServoMove(1, cfg.servo1StartUs);
+      servoRefillStage = ServoRefillStage::SERVO1_TO_END;
+      servoRefillStageAt = millis();
+      Serial.println("[FEEDER] FORCE_MIDDLE_REFILL -- delay abis, servo1+servo2 mulai eksekusi");
+    }
+  }
+  if (io.read(CH::PACKAGE_MIDDLE_SENSOR) == LOW) {
+    ledcWrite(LEDC_CH_CONV2, 0);
+    io.write(CH::DISP_STBY, LOW);
+    forceMiddleRefillActive = false;
+    forceServoScheduled = false;
+    triggerBuzzerBeep();
+    Serial.println("[FEEDER] FORCE_MIDDLE_REFILL SELESAI -- tengah terkonfirmasi terisi");
+  } else if (millis() - forceMiddleRefillAt > FORCE_MIDDLE_REFILL_TIMEOUT_MS) {
+    ledcWrite(LEDC_CH_CONV2, 0);
+    io.write(CH::DISP_STBY, LOW);
+    forceMiddleRefillActive = false;
+    forceServoScheduled = false;
+    servoRefillStage = ServoRefillStage::NONE;
+    faultCode = (uint16_t)FaultCode::MIDDLE_PACKAGE_MISSING;
+    currentState = NodeState::FAULT;
+    Serial.println("[FEEDER] !!! FAULT: FORCE_MIDDLE_REFILL timeout -- tengah tetap tidak terisi !!!");
+  }
+}
+
+// Siklus servo refill (gerbang bawah lalu atas), dipicu handleMiddleSensor() di atas. SETELAH
+// gerbang atas selesai jatuhin package baru, TUNGGU PACKAGE_MIDDLE_SENSOR konfirmasi LOW
+// (package baru BENERAN nyampe tengah) sebelum dianggap tuntas -- kalau kelewat batas waktu
+// (cfg.middleConfirmTimeoutMs), FAULT(MIDDLE_PACKAGE_MISSING) (macet/kehabisan stok tumpukan).
+void updateServoRefillStage() {
+  if (servoRefillStage == ServoRefillStage::NONE) return;
+  uint32_t elapsed = millis() - servoRefillStageAt;
+  switch (servoRefillStage) {
+    case ServoRefillStage::SERVO1_TO_END:
+      if (updateServoTrajectory(1, cfg.servo1EndUs)) { servoRefillStage = ServoRefillStage::SERVO1_HOLD; servoRefillStageAt = millis(); }
+      break;
+    case ServoRefillStage::SERVO1_HOLD:
+      if (elapsed >= cfg.servo1HoldMs) {
+        startServoMove(1, cfg.servo1EndUs);
+        servoRefillStage = ServoRefillStage::SERVO1_TO_START;
+        servoRefillStageAt = millis();
+      }
+      break;
+    case ServoRefillStage::SERVO1_TO_START:
+      if (updateServoTrajectory(1, cfg.servo1StartUs)) {
+        startServoMove(2, cfg.servo2StartUs);
+        servoRefillStage = ServoRefillStage::SERVO2_TO_END;
+        servoRefillStageAt = millis();
+      }
+      break;
+    case ServoRefillStage::SERVO2_TO_END:
+      if (updateServoTrajectory(2, cfg.servo2EndUs)) { servoRefillStage = ServoRefillStage::SERVO2_HOLD; servoRefillStageAt = millis(); }
+      break;
+    case ServoRefillStage::SERVO2_HOLD:
+      if (elapsed >= cfg.servo2HoldMs) {
+        startServoMove(2, cfg.servo2EndUs);
+        servoRefillStage = ServoRefillStage::SERVO2_TO_START;
+        servoRefillStageAt = millis();
+      }
+      break;
+    case ServoRefillStage::SERVO2_TO_START:
+      if (updateServoTrajectory(2, cfg.servo2StartUs)) {
+        servoRefillStage = ServoRefillStage::WAIT_MIDDLE_CONFIRM;
+        servoRefillStageAt = millis();
+      }
+      break;
+    case ServoRefillStage::WAIT_MIDDLE_CONFIRM:
+      if (io.read(CH::PACKAGE_MIDDLE_SENSOR) == LOW) {
+        servoRefillStage = ServoRefillStage::NONE;
+        triggerBuzzerBeep();
+        Serial.println("[FEEDER] Servo refill SELESAI -- package baru terkonfirmasi di tengah");
+      } else if (elapsed > cfg.middleConfirmTimeoutMs) {
+        faultCode = (uint16_t)FaultCode::MIDDLE_PACKAGE_MISSING;
+        currentState = NodeState::FAULT;
+        servoRefillStage = ServoRefillStage::NONE;
+        Serial.println("[FEEDER] !!! FAULT: package baru TIDAK terdeteksi di tengah setelah servo refill !!!");
+      }
+      break;
+    default: break;
+  }
+}
+
+// BARU: gabungkan 2 cabang paralel (conveyor + servo) -- currentState baru balik IDLE kalau
+// KEDUANYA sudah tuntas, supaya REQUEST_REFILL berikutnya (atau Orange Pi yang polling STATE)
+// tidak menyangka node sudah bebas padahal servo masih jalan.
+void updateRefillJoin() {
+  if (currentState == NodeState::RUNNING_OR_MOVING &&
+      refillState == RefillState::IDLE &&
+      servoRefillStage == ServoRefillStage::NONE &&
+      !forceMiddleRefillActive) {
+    currentState = NodeState::IDLE;
+  }
+}
+
 void handleSafety() {
   if (io.read(CH::ESTOP) == LOW) {   // DIUBAH dari HIGH ke LOW
     currentState = NodeState::ESTOPPED;
     enterRefillState(RefillState::ESTOPPED);
+    // BARU: reset tracking servo refill juga -- cegah siklus lama "nyangkut" nge-resume aneh
+    // begitu E-stop dilepas (servo diam di posisi terakhir, TIDAK otomatis lanjut).
+    servoRefillStage = ServoRefillStage::NONE;
+    forceMiddleRefillActive = false;
+    forceServoScheduled = false;
+    ledcWrite(LEDC_CH_CONV2, 0);
     return;
   }
   if (currentState == NodeState::ESTOPPED) {
@@ -296,35 +497,48 @@ const char* stateText(NodeState s) {
   }
 }
 
-// BARU: teks aktivitas spesifik -- refillState SUDAH persis memetakan ke tahapan refill
-String activityText() {
-  switch (refillState) {
-    case RefillState::IDLE:      return "Diam";
-    case RefillState::CONVEYOR_RUN: return "Conveyor ON";
-    case RefillState::SERVO1_TO_END:   return "Servo1 Buka";
-    case RefillState::SERVO1_HOLD:     return "Servo1 Tahan";
-    case RefillState::SERVO1_TO_START: return "Servo1 Tutup";
-    case RefillState::SERVO2_TO_END:   return "Servo2 Buka";
-    case RefillState::SERVO2_HOLD:     return "Servo2 Tahan";
-    case RefillState::SERVO2_TO_START: return "Servo2 Tutup";
-    case RefillState::DONE:      return "Selesai";
-    case RefillState::FAULT:     return "FAULT!";
-    case RefillState::ESTOPPED:  return "E-STOP!";
+// DIUBAH TOTAL: conveyor (refillState) & servo (servoRefillStage) sekarang PARALEL, jadi teks
+// aktivitas harus GABUNGKAN keduanya -- bukan lagi 1:1 dari 1 enum aja.
+const char* servoRefillStageText() {
+  switch (servoRefillStage) {
+    case ServoRefillStage::SERVO1_TO_END:   return "Srv1Buka";
+    case ServoRefillStage::SERVO1_HOLD:     return "Srv1Tahan";
+    case ServoRefillStage::SERVO1_TO_START: return "Srv1Tutup";
+    case ServoRefillStage::SERVO2_TO_END:   return "Srv2Buka";
+    case ServoRefillStage::SERVO2_HOLD:     return "Srv2Tahan";
+    case ServoRefillStage::SERVO2_TO_START: return "Srv2Tutup";
+    case ServoRefillStage::WAIT_MIDDLE_CONFIRM: return "TungguTengah";
+    default: return nullptr;
   }
-  return "?";
+}
+String activityText() {
+  if (refillState == RefillState::FAULT) return "FAULT!";
+  if (refillState == RefillState::ESTOPPED) return "E-STOP!";
+  bool convOn = (refillState == RefillState::CONVEYOR_RUN);
+  const char* srv = servoRefillStageText();
+  if (convOn && srv) return "Conv+" + String(srv);
+  if (convOn) return "Conveyor ON";
+  if (srv) return String(srv);
+  return "Diam";
 }
 
-// BARU: versi kode numerik dari activityText() -- dikirim ke register Modbus (Lapis 2)
+// BARU: versi kode numerik -- dikirim ke register Modbus (Lapis 2). Servo diprioritaskan
+// (lebih spesifik) kalau keduanya lagi jalan barengan -- STATE (RUNNING_OR_MOVING) tetap
+// nunjukin node sedang sibuk terlepas dari detail aktivitas mana yang kepilih di sini.
 ActivityCode activityCode() {
+  switch (servoRefillStage) {
+    case ServoRefillStage::SERVO1_TO_END:   return ActivityCode::SERVO1_BUKA;
+    case ServoRefillStage::SERVO1_HOLD:     return ActivityCode::SERVO1_TAHAN;
+    case ServoRefillStage::SERVO1_TO_START: return ActivityCode::SERVO1_TUTUP;
+    case ServoRefillStage::SERVO2_TO_END:   return ActivityCode::SERVO2_BUKA;
+    case ServoRefillStage::SERVO2_HOLD:     return ActivityCode::SERVO2_TAHAN;
+    case ServoRefillStage::SERVO2_TO_START: return ActivityCode::SERVO2_TUTUP;
+    case ServoRefillStage::WAIT_MIDDLE_CONFIRM: return ActivityCode::TUNGGU_KONFIRM_TENGAH;
+    default: break;
+  }
   switch (refillState) {
     case RefillState::IDLE:         return ActivityCode::DIAM;
     case RefillState::CONVEYOR_RUN: return ActivityCode::CONVEYOR_JALAN;
-    case RefillState::SERVO1_TO_END:   return ActivityCode::SERVO1_BUKA;
-    case RefillState::SERVO1_HOLD:     return ActivityCode::SERVO1_TAHAN;
-    case RefillState::SERVO1_TO_START: return ActivityCode::SERVO1_TUTUP;
-    case RefillState::SERVO2_TO_END:   return ActivityCode::SERVO2_BUKA;
-    case RefillState::SERVO2_HOLD:     return ActivityCode::SERVO2_TAHAN;
-    case RefillState::SERVO2_TO_START: return ActivityCode::SERVO2_TUTUP;
     case RefillState::DONE:         return ActivityCode::SELESAI;
     case RefillState::FAULT:        return ActivityCode::FAULT_AKTIF;
     case RefillState::ESTOPPED:     return ActivityCode::ESTOP_AKTIF;
@@ -356,9 +570,27 @@ void updateUniversalIndicators() {
 // (kelas bug sama dgn SORTER/PICKER/STOCKER yang sudah ditemukan)
 void applyCommand(uint16_t opcode, uint16_t arg) {
   switch ((Cmd)opcode) {
+    // DIPERBAIKI (bug ditemukan): cek PACKAGE_READY_FLAG & LIM_STOCK_EMPTY dulunya ada di DALAM
+    // handleRefillFSM (case IDLE), dieksekusi SATU LOOP TICK SETELAH currentState sudah kepalang
+    // di-set RUNNING_OR_MOVING di sini -- kalau ditolak di situ, refillState TETAP IDLE tanpa
+    // ada yg tau, lalu updateRefillJoin() langsung nge-balikin currentState ke IDLE lagi
+    // SEKETIKA (refillRequested nyangkut true diam-diam di background). Orange Pi poll STATE
+    // abis kirim command cuma lihat IDLE lagi -- kesannya command selesai/diabaikan, padahal
+    // masih pending nunggu ACK_PACKAGE_TAKEN, TANPA sinyal FAULT/apapun. Sekarang SEMUA guard
+    // dicek DI SINI, sebelum currentState berubah sama sekali -- reject SELALU eksplisit & instan.
     case Cmd::REQUEST_REFILL:
       if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
         Serial.println("[CMD] REQUEST_REFILL ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
+        return;
+      }
+      if (mb.Hreg(Reg::PACKAGE_READY_FLAG) != 0) {
+        Serial.println("[CMD] REQUEST_REFILL ditolak -- package UJUNG belum di-ACK diambil (ACK_PACKAGE_TAKEN dulu)");
+        return;
+      }
+      if (io.read(CH::LIM_STOCK_EMPTY) == LOW) {
+        faultCode = (uint16_t)FaultCode::STOCK_EMPTY;
+        currentState = NodeState::FAULT;
+        Serial.println("[CMD] REQUEST_REFILL ditolak -- stok tumpukan kosong");
         return;
       }
       refillRequested = true;
@@ -371,6 +603,16 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     case Cmd::SET_CONVEYOR_SPEED:
       cfg.conveyorSpeed = (uint8_t)constrain(arg, 0, 255);
       break;
+    case Cmd::SET_CONVEYOR_DIR:
+      cfg.conveyorDir = (arg != 0);
+      break;
+    // BARU: Orange Pi konfirmasi arm SUDAH ambil package di UJUNG -- clear PACKAGE_READY_FLAG,
+    // baru REQUEST_REFILL berikutnya diizinkan lanjut (lihat guard di handleRefillFSM IDLE).
+    case Cmd::ACK_PACKAGE_TAKEN:
+      mb.Hreg(Reg::PACKAGE_READY_FLAG, 0);
+      Serial.println("[CMD] ACK_PACKAGE_TAKEN -- PACKAGE_READY_FLAG di-clear");
+      break;
+    case Cmd::FORCE_MIDDLE_REFILL: startForceMiddleRefill(); break;
     case Cmd::TEST_SERVO1_CYCLE: startTestServoCycle(1); break;
     case Cmd::TEST_SERVO2_CYCLE: startTestServoCycle(2); break;
     default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); break;
@@ -424,11 +666,21 @@ void drawTopMenuFeeder() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-constexpr uint8_t CAL_COUNT = 13;
-const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Push Timeout (ms)",
-                                        "Servo1 Titik Awal", "Servo1 Titik Akhir", "Servo1 Waktu Tahan", "Servo1 Interval(ms)",
-                                        "Servo2 Titik Awal", "Servo2 Titik Akhir", "Servo2 Waktu Tahan", "Servo2 Interval(ms)",
-                                        "Buzzer On (ms)", "Buzzer Off (ms)", "Reset ke Default" };
+// DIUBAH: slot "Servo Start Delay(ms)" (pensiun -- servo sekarang trigger PACKAGE_MIDDLE_SENSOR,
+// bukan delay lagi) di-reuse jadi "Middle Confirm Timeout(ms)" -- batas tunggu konfirmasi sensor
+// tengah setelah servo jatuhin package baru.
+// DIUBAH: "Servo1/2 Interval(ms)" (target durasi tetap) diganti "Step(us)" + "Step Interval(ms)"
+// (kecepatan tetap, SAMA pola dgn hopper SORTER/PICKER) -- durasi jadi hasil jarak/kecepatan.
+// BARU: "Force Servo Delay(ms)" -- pakai field servoStartDelayMs (dulu pensiun) KHUSUS utk
+// FORCE_MIDDLE_REFILL (startup/recovery): conveyor jalan duluan, servo1+2 baru dieksekusi
+// setelah jeda ini -- BEDA dari siklus produksi normal yang PROX_2-edge-triggered.
+constexpr uint8_t CAL_COUNT = 18;
+const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Conveyor Dir", "Middle Confirm TO(ms)", "Push Timeout (ms)",
+                                        "Servo1 Titik Awal", "Servo1 Titik Akhir", "Servo1 Waktu Tahan",
+                                        "Servo1 Step (us)", "Servo1 Step Intv(ms)",
+                                        "Servo2 Titik Awal", "Servo2 Titik Akhir", "Servo2 Waktu Tahan",
+                                        "Servo2 Step (us)", "Servo2 Step Intv(ms)",
+                                        "Buzzer On (ms)", "Buzzer Off (ms)", "Force Servo Delay(ms)", "Reset ke Default" };
 uint8_t calCursor = 0;
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
 
@@ -447,33 +699,43 @@ void handleConfirmResetKey(char key) {
 void drawParamMenuFeeder() {
   switch (selParam) {
     case 1: lcdPrint(0, 0, "CONVEYOR SPEED"); break;
-    case 2: lcdPrint(0, 0, "PUSH TIMEOUT (ms)"); break;
-    case 3: lcdPrint(0, 0, "SERVO1 TITIK AWAL"); break;
-    case 4: lcdPrint(0, 0, "SERVO1 TITIK AKHIR"); break;
-    case 5: lcdPrint(0, 0, "SERVO1 WAKTU TAHAN"); break;
-    case 6: lcdPrint(0, 0, "SERVO1 INTERVAL(ms)"); break;
-    case 7: lcdPrint(0, 0, "SERVO2 TITIK AWAL"); break;
-    case 8: lcdPrint(0, 0, "SERVO2 TITIK AKHIR"); break;
-    case 9: lcdPrint(0, 0, "SERVO2 WAKTU TAHAN"); break;
-    case 10: lcdPrint(0, 0, "SERVO2 INTERVAL(ms)"); break;
-    case 11: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
-    case 12: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
+    case 2: lcdPrint(0, 0, "CONVEYOR DIR"); break;
+    case 3: lcdPrint(0, 0, "MID CONFIRM TIMEOUT"); break;
+    case 4: lcdPrint(0, 0, "PUSH TIMEOUT (ms)"); break;
+    case 5: lcdPrint(0, 0, "SERVO1 TITIK AWAL"); break;
+    case 6: lcdPrint(0, 0, "SERVO1 TITIK AKHIR"); break;
+    case 7: lcdPrint(0, 0, "SERVO1 WAKTU TAHAN"); break;
+    case 8: lcdPrint(0, 0, "SERVO1 STEP (us)"); break;
+    case 9: lcdPrint(0, 0, "SERVO1 STEP INTV(ms)"); break;
+    case 10: lcdPrint(0, 0, "SERVO2 TITIK AWAL"); break;
+    case 11: lcdPrint(0, 0, "SERVO2 TITIK AKHIR"); break;
+    case 12: lcdPrint(0, 0, "SERVO2 WAKTU TAHAN"); break;
+    case 13: lcdPrint(0, 0, "SERVO2 STEP (us)"); break;
+    case 14: lcdPrint(0, 0, "SERVO2 STEP INTV(ms)"); break;
+    case 15: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
+    case 16: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
+    case 17: lcdPrint(0, 0, "FORCE SERVO DELAY"); break;
   }
   String line1;
   if (selParam == 1) line1 = "Nilai:" + String(cfg.conveyorSpeed) + "   Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 2) line1 = "Nilai:" + String(cfg.pushTimeoutMs) + "   Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 3) line1 = "us:" + String(cfg.servo1StartUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 4) line1 = "us:" + String(cfg.servo1EndUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 5) line1 = "ms:" + String(cfg.servo1HoldMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 6) line1 = "ms:" + String(cfg.servo1IntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 7) line1 = "us:" + String(cfg.servo2StartUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 8) line1 = "us:" + String(cfg.servo2EndUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 9) line1 = "ms:" + String(cfg.servo2HoldMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 10) line1 = "ms:" + String(cfg.servo2IntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 11) line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
-  else if (selParam == 12) line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 2) line1 = "Arah:" + String(cfg.conveyorDir ? "FORWARD" : "REVERSE");
+  else if (selParam == 3) line1 = "ms:" + String(cfg.middleConfirmTimeoutMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 4) line1 = "Nilai:" + String(cfg.pushTimeoutMs) + "   Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 5) line1 = "us:" + String(cfg.servo1StartUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 6) line1 = "us:" + String(cfg.servo1EndUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 7) line1 = "ms:" + String(cfg.servo1HoldMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 8) line1 = "us:" + String(cfg.servo1StepUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 9) line1 = "ms:" + String(cfg.servo1StepIntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 10) line1 = "us:" + String(cfg.servo2StartUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 11) line1 = "us:" + String(cfg.servo2EndUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 12) line1 = "ms:" + String(cfg.servo2HoldMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 13) line1 = "us:" + String(cfg.servo2StepUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 14) line1 = "ms:" + String(cfg.servo2StepIntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 15) line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 16) line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
+  else if (selParam == 17) line1 = "ms:" + String(cfg.servoStartDelayMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]);
   lcdPrint(0, 1, line1);
-  lcdPrint(0, 2, "A+ B- C:step");
+  lcdPrint(0, 2, selParam == 2 ? "A=Forward B=Reverse" : "A+ B- C:step");
   lcdPrint(0, 3, "#=SIMPAN D=kembali");
 }
 void handleParamKeyFeeder(char key) {
@@ -482,46 +744,66 @@ void handleParamKeyFeeder(char key) {
     if (key == 'A') cfg.conveyorSpeed = (uint8_t)constrain((int)cfg.conveyorSpeed + step, 0, 255);
     else if (key == 'B') cfg.conveyorSpeed = (uint8_t)constrain((int)cfg.conveyorSpeed - step, 0, 255);
   } else if (selParam == 2) {
+    if (key == 'A') cfg.conveyorDir = true;
+    else if (key == 'B') cfg.conveyorDir = false;
+  } else if (selParam == 3) {
+    if (key == 'A') cfg.middleConfirmTimeoutMs = (uint16_t)constrain((int)cfg.middleConfirmTimeoutMs + step * 10, 500, 20000);
+    else if (key == 'B') cfg.middleConfirmTimeoutMs = (uint16_t)constrain((int)cfg.middleConfirmTimeoutMs - step * 10, 500, 20000);
+  } else if (selParam == 4) {
     if (key == 'A') cfg.pushTimeoutMs = (uint16_t)constrain((int)cfg.pushTimeoutMs + step, 100, 5000);
     else if (key == 'B') cfg.pushTimeoutMs = (uint16_t)constrain((int)cfg.pushTimeoutMs - step, 100, 5000);
-  } else if (selParam == 3) {
+  } else if (selParam == 5) {
     if (key == 'A') cfg.servo1StartUs = (uint16_t)constrain((int)cfg.servo1StartUs + step, 500, 2500);
     else if (key == 'B') cfg.servo1StartUs = (uint16_t)constrain((int)cfg.servo1StartUs - step, 500, 2500);
     pcaSetServoUs(SERVO1_CH, cfg.servo1StartUs); servo1CurrentUs = cfg.servo1StartUs;   // preview live
-  } else if (selParam == 4) {
+  } else if (selParam == 6) {
     if (key == 'A') cfg.servo1EndUs = (uint16_t)constrain((int)cfg.servo1EndUs + step, 500, 2500);
     else if (key == 'B') cfg.servo1EndUs = (uint16_t)constrain((int)cfg.servo1EndUs - step, 500, 2500);
     pcaSetServoUs(SERVO1_CH, cfg.servo1EndUs); servo1CurrentUs = cfg.servo1EndUs;   // preview live
-  } else if (selParam == 5) {
+  } else if (selParam == 7) {
     if (key == 'A') cfg.servo1HoldMs = (uint16_t)constrain((int)cfg.servo1HoldMs + step * 10, 50, 5000);
     else if (key == 'B') cfg.servo1HoldMs = (uint16_t)constrain((int)cfg.servo1HoldMs - step * 10, 50, 5000);
-  } else if (selParam == 6) {
-    if (key == 'A') cfg.servo1IntervalMs = (uint16_t)constrain((int)cfg.servo1IntervalMs + step * 10, 100, 10000);
-    else if (key == 'B') cfg.servo1IntervalMs = (uint16_t)constrain((int)cfg.servo1IntervalMs - step * 10, 100, 10000);
-  } else if (selParam == 7) {
+  } else if (selParam == 8) {
+    // BARU: batas atas dinaikkan 500->2500 -- rentang servo cuma 2000us (500-2500), jadi
+    // stepUs=2500 udah cukup lompat langsung ujung ke ujung dalam 1 tick kalau operator mau.
+    if (key == 'A') cfg.servo1StepUs = (uint16_t)constrain((int)cfg.servo1StepUs + step, 1, 2500);
+    else if (key == 'B') cfg.servo1StepUs = (uint16_t)constrain((int)cfg.servo1StepUs - step, 1, 2500);
+  } else if (selParam == 9) {
+    // BARU: batas bawah 1->0 -- 0 = tanpa jeda (step tiap loop tick, secepat mungkin). AWAS:
+    // stepUs besar + interval 0 = "selesai" logika dalam 1 tick, servo fisik belum tentu
+    // ngejar secepat itu. Kalibrasi hati-hati.
+    if (key == 'A') cfg.servo1StepIntervalMs = (uint16_t)constrain((int)cfg.servo1StepIntervalMs + step, 0, 500);
+    else if (key == 'B') cfg.servo1StepIntervalMs = (uint16_t)constrain((int)cfg.servo1StepIntervalMs - step, 0, 500);
+  } else if (selParam == 10) {
     if (key == 'A') cfg.servo2StartUs = (uint16_t)constrain((int)cfg.servo2StartUs + step, 500, 2500);
     else if (key == 'B') cfg.servo2StartUs = (uint16_t)constrain((int)cfg.servo2StartUs - step, 500, 2500);
     pcaSetServoUs(SERVO2_CH, cfg.servo2StartUs); servo2CurrentUs = cfg.servo2StartUs;   // preview live
-  } else if (selParam == 8) {
+  } else if (selParam == 11) {
     if (key == 'A') cfg.servo2EndUs = (uint16_t)constrain((int)cfg.servo2EndUs + step, 500, 2500);
     else if (key == 'B') cfg.servo2EndUs = (uint16_t)constrain((int)cfg.servo2EndUs - step, 500, 2500);
     pcaSetServoUs(SERVO2_CH, cfg.servo2EndUs); servo2CurrentUs = cfg.servo2EndUs;   // preview live
-  } else if (selParam == 9) {
+  } else if (selParam == 12) {
     if (key == 'A') cfg.servo2HoldMs = (uint16_t)constrain((int)cfg.servo2HoldMs + step * 10, 50, 5000);
     else if (key == 'B') cfg.servo2HoldMs = (uint16_t)constrain((int)cfg.servo2HoldMs - step * 10, 50, 5000);
-  } else if (selParam == 10) {
-    if (key == 'A') cfg.servo2IntervalMs = (uint16_t)constrain((int)cfg.servo2IntervalMs + step * 10, 100, 10000);
-    else if (key == 'B') cfg.servo2IntervalMs = (uint16_t)constrain((int)cfg.servo2IntervalMs - step * 10, 100, 10000);
-  } else if (selParam == 11) {
+  } else if (selParam == 13) {
+    if (key == 'A') cfg.servo2StepUs = (uint16_t)constrain((int)cfg.servo2StepUs + step, 1, 2500);
+    else if (key == 'B') cfg.servo2StepUs = (uint16_t)constrain((int)cfg.servo2StepUs - step, 1, 2500);
+  } else if (selParam == 14) {
+    if (key == 'A') cfg.servo2StepIntervalMs = (uint16_t)constrain((int)cfg.servo2StepIntervalMs + step, 0, 500);
+    else if (key == 'B') cfg.servo2StepIntervalMs = (uint16_t)constrain((int)cfg.servo2StepIntervalMs - step, 0, 500);
+  } else if (selParam == 15) {
     if (key == 'A') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs + step * 10, 50, 5000);
     else if (key == 'B') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs - step * 10, 50, 5000);
-  } else if (selParam == 12) {
+  } else if (selParam == 16) {
     if (key == 'A') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs + step * 10, 50, 5000);
     else if (key == 'B') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs - step * 10, 50, 5000);
+  } else if (selParam == 17) {
+    if (key == 'A') cfg.servoStartDelayMs = (uint16_t)constrain((int)cfg.servoStartDelayMs + step * 10, 0, 10000);
+    else if (key == 'B') cfg.servoStartDelayMs = (uint16_t)constrain((int)cfg.servoStartDelayMs - step * 10, 0, 10000);
   }
   if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
   else if (key == '#') { saveConfigToNvs(); lcdPrint(0, 3, "TERSIMPAN ke NVS!"); Serial.println("[CAL] FeederConfig disimpan ke NVS"); return; }
-  else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); return; }
+  else if (key == 'D') { servoIntervalTestMode = false; menuState = MenuState::CAL_LIST; drawCalList(); return; }
   drawParamMenuFeeder();
 }
 
@@ -529,8 +811,17 @@ void handleCalListKey(char key) {
   if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 12) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
-    else { selParam = calCursor + 1; menuState = MenuState::JOG_PARAM; lcd.clear(); drawParamMenuFeeder(); }
+    if (calCursor == 17) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
+    else {
+      selParam = calCursor + 1;
+      // BARU: aktifkan test-live di layar Servo1/2 Step(8/13) ATAU Step Interval(9/14) --
+      // sama pola dgn hopperIntervalTestMode SORTER, supaya servo keliatan gerak live pas
+      // salah satu dari 2 parameter kecepatan ini diubah, bukan diam kayak sebelumnya.
+      servoIntervalTestMode = (selParam == 8 || selParam == 9 || selParam == 13 || selParam == 14);
+      servoIntervalTestWhich = (selParam == 8 || selParam == 9) ? 1 : 2;
+      if (servoIntervalTestMode && testServoCycleStage == TestServoCycleStage::NONE) startTestServoCycle(servoIntervalTestWhich);
+      menuState = MenuState::JOG_PARAM; lcd.clear(); drawParamMenuFeeder();
+    }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuFeeder(); }
 }
 
@@ -592,34 +883,71 @@ void handleTestOutputItemKey(char key) {
   drawTestOutputItem();
 }
 
-// --- Kategori: Test Input -- semua input tampil sekaligus (live) ---
-constexpr uint8_t INPUT_TEST_COUNT = 5;
-IOTestItem INPUT_TEST_ITEMS[INPUT_TEST_COUNT] = {
-  {"IN1", CH::ESTOP,             false},
-  {"IN2", CH::LIM_STOCK_EMPTY,   false},
-  {"IN3", CH::LIM_BOX_ARRIVED,   false},
-  {"IN4", CH::LIM_PUSH_HOME,     false},
-  {"IN5", CH::LIM_PUSH_EXTENDED, false},
+// --- Kategori: Test Input -- 3 sub-kategori (Button/Proximity/Limit Switch), SAMA PERSIS
+// channel-nya di semua 4 node (board PCB universal) -- test channel mentah CH::xxx, TERLEPAS
+// dari alias/peran yang dipakai node ini (LIM_1..4 di node ini dipakai sbg LIM_STOCK_EMPTY/
+// LIM_BOX_ARRIVED/LIM_PUSH_HOME/LIM_PUSH_EXTENDED, tapi diuji sbg LIM1..LIM10 mentah di sini).
+constexpr uint8_t BUTTON_TEST_COUNT = 3;
+IOTestItem BUTTON_TEST_ITEMS[BUTTON_TEST_COUNT] = {
+  {"ESTOP", CH::ESTOP,    false},
+  {"BTN2",  CH::BUTTON_2, false},
+  {"BTN3",  CH::BUTTON_3, false},
 };
+constexpr uint8_t PROX_TEST_COUNT = 2;
+IOTestItem PROX_TEST_ITEMS[PROX_TEST_COUNT] = {
+  {"PROX1", CH::PROX_1, false},
+  {"PROX2", CH::PROX_2, false},
+};
+constexpr uint8_t LIMIT_TEST_COUNT = 10;
+IOTestItem LIMIT_TEST_ITEMS[LIMIT_TEST_COUNT] = {
+  {"LIM1",  CH::LIM_1,  false}, {"LIM2",  CH::LIM_2,  false},
+  {"LIM3",  CH::LIM_3,  false}, {"LIM4",  CH::LIM_4,  false},
+  {"LIM5",  CH::LIM_5,  false}, {"LIM6",  CH::LIM_6,  false},
+  {"LIM7",  CH::LIM_7,  false}, {"LIM8",  CH::LIM_8,  false},
+  {"LIM9",  CH::LIM_9,  false}, {"LIM10", CH::LIM_10, false},
+};
+
+constexpr uint8_t INPUT_CAT_COUNT = 3;
+const char* INPUT_CAT_LABELS[INPUT_CAT_COUNT] = { "Button", "Proximity", "Limit Switch" };
+uint8_t inputCatCursor = 0;
+void drawInputCategorySelect() { drawListMenu("TEST INPUT", INPUT_CAT_LABELS, INPUT_CAT_COUNT, inputCatCursor); }
+
+IOTestItem* activeInputItems = BUTTON_TEST_ITEMS;
+uint8_t activeInputCount = BUTTON_TEST_COUNT;
 uint8_t inputTestScrollTop = 0;
-bool testInputLiveLastVal[INPUT_TEST_COUNT];
+constexpr uint8_t INPUT_TEST_MAX = LIMIT_TEST_COUNT;
+bool testInputLiveLastVal[INPUT_TEST_MAX];
 uint8_t testInputLastScrollTop = 255;
 void drawTestInputList() {
   bool scrollChanged = (inputTestScrollTop != testInputLastScrollTop);
   if (scrollChanged) { lcd.clear(); testInputLastScrollTop = inputTestScrollTop; }
   for (uint8_t row = 0; row < 4; row++) {
     uint8_t idx = inputTestScrollTop + row;
-    if (idx >= INPUT_TEST_COUNT) continue;
-    bool val = io.read(INPUT_TEST_ITEMS[idx].ch);
+    if (idx >= activeInputCount) continue;
+    bool val = io.read(activeInputItems[idx].ch);
     if (scrollChanged || val != testInputLiveLastVal[idx]) {
       testInputLiveLastVal[idx] = val;
-      lcdPrint(0, row, String(INPUT_TEST_ITEMS[idx].label) + " = " + String(val ? 1 : 0) + "         ");
+      lcdPrint(0, row, String(activeInputItems[idx].label) + " = " + String(val ? 1 : 0) + "         ");
     }
   }
 }
 void handleTestInputListKey(char key) {
   if (key == 'A') { if (inputTestScrollTop > 0) { inputTestScrollTop--; drawTestInputList(); } }
-  else if (key == 'B') { if (inputTestScrollTop < (INPUT_TEST_COUNT > 4 ? INPUT_TEST_COUNT - 4 : 0)) { inputTestScrollTop++; drawTestInputList(); } }
+  else if (key == 'B') { if (inputTestScrollTop < (activeInputCount > 4 ? activeInputCount - 4 : 0)) { inputTestScrollTop++; drawTestInputList(); } }
+  else if (key == 'D') { menuState = MenuState::TEST_INPUT_CATEGORY; drawInputCategorySelect(); }
+}
+void handleInputCategoryKey(char key) {
+  if (key == 'A') { inputCatCursor = (inputCatCursor == 0) ? INPUT_CAT_COUNT - 1 : inputCatCursor - 1; drawInputCategorySelect(); }
+  else if (key == 'B') { inputCatCursor = (inputCatCursor + 1) % INPUT_CAT_COUNT; drawInputCategorySelect(); }
+  else if (key == 'C') {
+    switch (inputCatCursor) {
+      case 0: activeInputItems = BUTTON_TEST_ITEMS; activeInputCount = BUTTON_TEST_COUNT; break;
+      case 1: activeInputItems = PROX_TEST_ITEMS;   activeInputCount = PROX_TEST_COUNT;   break;
+      case 2: activeInputItems = LIMIT_TEST_ITEMS;  activeInputCount = LIMIT_TEST_COUNT;  break;
+    }
+    inputTestScrollTop = 0; testInputLastScrollTop = 255;
+    menuState = MenuState::TEST_INPUT_LIST; drawTestInputList();
+  }
   else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
 }
 
@@ -721,26 +1049,35 @@ void handleTestModStepperKey(char key) {
 // produksi (alias). Guard IDLE-only belum ditambahkan -- operator perlu pastikan dispenser
 // sedang tidak REFILLING sebelum test modul ini.
 uint8_t testModMotorAState = 0, testModMotorBState = 0;
+constexpr uint8_t TEST_PUSH_SPEED = 200;   // BARU -- ChA (push) gak punya cfg speed produksi lagi (sekarang servo), pakai speed tetap khusus test
 void testModSetMotor(bool channelA, uint8_t dirState) {
+  // DIPERBAIKI: sebelumnya cuma set arah (AIN/BIN) + STBY, TANPA pernah ledcWrite ke PWMA/PWMB
+  // -- TB6612FNG butuh sinyal PWM aktif spy motor benar-benar berputar, arah doang tidak cukup.
   uint8_t ain1 = channelA ? CH::AIN1 : CH::BIN1, ain2 = channelA ? CH::AIN2 : CH::BIN2;
+  uint8_t pwmCh = channelA ? LEDC_CH_PUSH_TEST : LEDC_CH_CONV2;
+  uint8_t speed = channelA ? TEST_PUSH_SPEED : cfg.conveyorSpeed;
   if (channelA) testModMotorAState = dirState; else testModMotorBState = dirState;
-  if (dirState == 0) { io.write(ain1, LOW); io.write(ain2, LOW); }
-  else { io.write(ain1, dirState == 1); io.write(ain2, dirState != 1); }
+  if (dirState == 0) { io.write(ain1, LOW); io.write(ain2, LOW); ledcWrite(pwmCh, 0); }
+  else { io.write(ain1, dirState == 1); io.write(ain2, dirState != 1); ledcWrite(pwmCh, speed); }
   io.write(CH::STBY, (testModMotorAState != 0 || testModMotorBState != 0));
 }
+// DIPERBAIKI (bug ditemukan): sebelumnya A/B cuma toggle stop<->maju, dirState=2 (mundur)
+// TIDAK PERNAH bisa dicapai dari menu -- arah mundur gak bisa ditest/dikalibrasi sama sekali.
+// Sekarang A/B cycle stop->maju->mundur->stop tiap ditekan.
+const char* motorDirName(uint8_t s) { return s == 0 ? "STOP" : (s == 1 ? "FWD" : "REV"); }
 void drawTestModMotorDC() {
   if (testModFirstDraw) {
     lcd.clear(); lcdPrint(0, 0, "MODUL: MOTOR DC");
     lcdPrint(0, 3, "A=chA B=chB D=kmb");
     testModFirstDraw = false; testModLine1 = "\x01";
   }
-  String line1 = "ChA:" + String(testModMotorAState) + " ChB:" + String(testModMotorBState);
+  String line1 = "ChA:" + String(motorDirName(testModMotorAState)) + " ChB:" + String(motorDirName(testModMotorBState));
   if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
-  lcdPrint(0, 2, "A/B=maju,lg=stop");
+  lcdPrint(0, 2, "A/B=cycle arah");
 }
 void handleTestModMotorDCKey(char key) {
-  if (key == 'A') { testModSetMotor(true, testModMotorAState == 0 ? 1 : 0); }
-  else if (key == 'B') { testModSetMotor(false, testModMotorBState == 0 ? 1 : 0); }
+  if (key == 'A') { testModSetMotor(true, (testModMotorAState + 1) % 3); }
+  else if (key == 'B') { testModSetMotor(false, (testModMotorBState + 1) % 3); }
   else if (key == 'D') {
     testModSetMotor(true, 0); testModSetMotor(false, 0);
     menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return;
@@ -821,7 +1158,7 @@ void handleTestIoCategoryKey(char key) {
     switch (testIoCatCursor) {
       case 0: menuState = MenuState::TEST_IO_I2CSCAN; runI2CScanFromMenu(); break;
       case 1: menuState = MenuState::TEST_OUTPUT_LIST; outputTestCursor = 0; drawTestOutputList(); break;
-      case 2: menuState = MenuState::TEST_INPUT_LIST; inputTestScrollTop = 0; testInputLastScrollTop = 255; drawTestInputList(); break;
+      case 2: menuState = MenuState::TEST_INPUT_CATEGORY; inputCatCursor = 0; drawInputCategorySelect(); break;
       case 3: menuState = MenuState::TEST_RS485; drawTestRs485(); break;
       case 4: menuState = MenuState::TEST_MODULE_SELECT; moduleTypeCursor = 0; drawModuleTypeSelect(); break;
     }
@@ -830,10 +1167,13 @@ void handleTestIoCategoryKey(char key) {
 
 // --- LEVEL 1c: TEST COMMAND ---
 struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
-constexpr uint8_t CMD_TEST_COUNT = 5;
+constexpr uint8_t CMD_TEST_COUNT = 8;
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"REQUEST_REFILL",       Cmd::REQUEST_REFILL,     0},
   {"SET_SPEED (test=200)", Cmd::SET_CONVEYOR_SPEED, 200},
+  {"SET_DIR (test=REV)",   Cmd::SET_CONVEYOR_DIR,   0},
+  {"ACK_PACKAGE_TAKEN",    Cmd::ACK_PACKAGE_TAKEN,  0},
+  {"FORCE_MIDDLE_REFILL",  Cmd::FORCE_MIDDLE_REFILL,0},
   {"RESET_FAULT",          Cmd::RESET_FAULT,        0},
   {"Test Srv1 M/M", Cmd::TEST_SERVO1_CYCLE, 0},
   {"Test Srv2 M/M", Cmd::TEST_SERVO2_CYCLE, 0},
@@ -881,19 +1221,24 @@ void handleSerialCommand() {
   cmd.toUpperCase();
 
   if (cmd == "REFILL")           applyCommand((uint16_t)Cmd::REQUEST_REFILL, 0);
+  else if (cmd == "ACK")         applyCommand((uint16_t)Cmd::ACK_PACKAGE_TAKEN, 0);
+  else if (cmd == "FORCEFILL")   applyCommand((uint16_t)Cmd::FORCE_MIDDLE_REFILL, 0);
   else if (cmd == "RESET_FAULT") applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
   else if (cmd == "SPEED")       applyCommand((uint16_t)Cmd::SET_CONVEYOR_SPEED, arg);
+  else if (cmd == "DIR")         applyCommand((uint16_t)Cmd::SET_CONVEYOR_DIR, arg);
   else if (cmd == "TIMEOUT") { cfg.pushTimeoutMs = constrain((int)arg, 100, 5000); saveConfigToNvs(); Serial.printf("[TIMEOUT] pushTimeoutMs=%u\n", cfg.pushTimeoutMs); }
   else if (cmd == "RESET") resetConfigToDefault();
   else if (cmd == "STATUS") {
-    Serial.printf("[STATUS] state=%s refillState=%d fault=%u ESTOP=%d speed=%u timeout=%u stockEmpty=%d\n",
+    Serial.printf("[STATUS] state=%s refillState=%d fault=%u ESTOP=%d speed=%u dir=%s timeout=%u stockEmpty=%d packageReady=%u\n",
                   stateText(currentState), (int)refillState, faultCode, io.read(CH::ESTOP),
-                  cfg.conveyorSpeed, cfg.pushTimeoutMs, io.read(CH::LIM_STOCK_EMPTY) == LOW);
-    Serial.printf("[STATUS] activity=%u i2cErrCount=%u lastFault=%u uptime=%lus\n",
-                  (uint16_t)activityCode(), i2cErrorCount, lastFaultCode, (unsigned long)(millis() / 1000));
+                  cfg.conveyorSpeed, cfg.conveyorDir ? "FWD" : "REV", cfg.pushTimeoutMs, io.read(CH::LIM_STOCK_EMPTY) == LOW,
+                  mb.Hreg(Reg::PACKAGE_READY_FLAG));
+    Serial.printf("[STATUS] activity=%u i2cErrCount=%u lastFault=%u uptime=%lus servoRefillStage=%d middleSensor=%d middleTimeoutMs=%u forceRefillActive=%d\n",
+                  (uint16_t)activityCode(), i2cErrorCount, lastFaultCode, (unsigned long)(millis() / 1000),
+                  (int)servoRefillStage, io.read(CH::PACKAGE_MIDDLE_SENSOR) == LOW, cfg.middleConfirmTimeoutMs, forceMiddleRefillActive);
   }
   else if (cmd == "HELP") {
-    Serial.println("[HELP] REFILL | RESET_FAULT | SPEED <0-255> | TIMEOUT <100-5000> | RESET | STATUS | HELP");
+    Serial.println("[HELP] REFILL | ACK | FORCEFILL | RESET_FAULT | SPEED <0-255> | DIR <0|1> | TIMEOUT <100-5000> | RESET | STATUS | HELP");
   }
   else Serial.printf("[SERIAL] '%s' tidak dikenal -- ketik HELP\n", cmd.c_str());
 }
@@ -928,7 +1273,7 @@ void checkLcdKeypadHotplug() {
   else if (keypadPresent && !kpPing) {
     keypadPresent = false;
     Serial.println("[HOTPLUG] !!! Keypad TIDAK TERDETEKSI LAGI !!!");
-    if (menuState != MenuState::NONE) { menuState = MenuState::NONE; Serial.println("[HOTPLUG] Keluar OTOMATIS dari mode kalibrasi -- cegah node terjebak"); }
+    if (menuState != MenuState::NONE) { menuState = MenuState::NONE; servoIntervalTestMode = false; Serial.println("[HOTPLUG] Keluar OTOMATIS dari mode kalibrasi -- cegah node terjebak"); }
   }
 }
 
@@ -946,6 +1291,7 @@ void setup() {
 
   if (keypadPresent) { keypad.begin(); Serial.println("[BOOT] Keypad OK"); }
   else Serial.println("[BOOT] Keypad dilewati");
+  lcdBootProgress("I2C + LCD/Keypad");
 
   bool ioOk = io.begin(I2CAddr::MCP1, I2CAddr::MCP2);
   if (!ioOk) { faultCode = (uint16_t)FaultCode::IO_EXPANDER_MISSING; currentState = NodeState::FAULT; }
@@ -966,15 +1312,29 @@ void setup() {
   io.pinMode(CH::DIR_1_MCP, OUTPUT); io.pinMode(CH::DIR_2_MCP, OUTPUT); io.pinMode(CH::DIR_3_MCP, OUTPUT);
   io.pinMode(CH::EN_123, OUTPUT);
   io.pinMode(CH::RLY1, OUTPUT); io.pinMode(CH::RLY2, OUTPUT);
+  // DIPERBAIKI (bug ditemukan): pin native STEP_1/2/3 dipakai testStepperPulse() (Test Modul
+  // Stepper) via digitalWrite() langsung -- io.pinMode() di atas cuma berlaku utk channel
+  // MCP23017, BUKAN pin native ESP32 ini. Tanpa pinMode(OUTPUT), default boot = INPUT, pulsa
+  // STEP tidak pernah keluar elektrik meski DIR/EN (MCP) sudah benar.
+  pinMode(GP::STEP_1, OUTPUT); pinMode(GP::STEP_2, OUTPUT); pinMode(GP::STEP_3, OUTPUT);
   io.pinMode(CH::LIM_STOCK_EMPTY, INPUT_PULLUP);
   io.pinMode(CH::LIM_BOX_ARRIVED, INPUT_PULLUP);
+  io.pinMode(CH::PACKAGE_MIDDLE_SENSOR, INPUT_PULLUP);   // BARU -- mekanisme 2-proximity (UJUNG+TENGAH)
   io.pinMode(CH::LIM_PUSH_HOME, INPUT_PULLUP);
   io.pinMode(CH::LIM_PUSH_EXTENDED, INPUT_PULLUP);
+  lastMiddleSensorState = io.read(CH::PACKAGE_MIDDLE_SENSOR);   // BARU -- baca kondisi awal, cegah false-edge saat boot
   Serial.printf("[BOOT] MCP23017: %s, pinMode selesai\n", ioOk ? "OK" : "GAGAL");
+  lcdBootProgress("I/O Expander MCP23017");
 
   ledcSetup(LEDC_CH_CONV2, PWM_FREQ, PWM_RES);
   ledcAttachPin(GP::CONV2_PWM, LEDC_CH_CONV2);
+  // BARU: channel A (dulu push DC, sekarang push produksi sudah pindah ke servo) TIDAK PERNAH
+  // di-setup PWM-nya sebelum ini -- Test Modul Motor DC ChA gak bisa muter chip TB6612 kalau
+  // fisiknya masih terpasang. Setup terpisah, HANYA dipakai test menu, TIDAK ganggu produksi.
+  ledcSetup(LEDC_CH_PUSH_TEST, PWM_FREQ, PWM_RES);
+  ledcAttachPin(GP::PWMA_TB6612, LEDC_CH_PUSH_TEST);
   Serial.println("[BOOT] LEDC PWM conveyor2 OK");
+  lcdBootProgress("PWM Conveyor2");
 
   loadConfigFromNvs();
   Serial.println("[BOOT] FeederConfig dimuat dari NVS");
@@ -984,6 +1344,7 @@ void setup() {
   pcaSetServoUs(SERVO1_CH, cfg.servo1StartUs); servo1CurrentUs = cfg.servo1StartUs;
   pcaSetServoUs(SERVO2_CH, cfg.servo2StartUs); servo2CurrentUs = cfg.servo2StartUs;
   Serial.println("[BOOT] Servo1/Servo2 diposisikan ke titik awal");
+  lcdBootProgress("Kalibrasi NVS");
 
   Serial2.begin(Rs485Cfg::BAUD, SERIAL_8N1, Rs485Cfg::RX_PIN, Rs485Cfg::TX_PIN);
   mb.begin(&Serial2);
@@ -996,8 +1357,11 @@ void setup() {
   mb.addHreg(Reg::STOCK_EMPTY_FLAG, 0);
   mb.addHreg(Reg::ACTIVITY_CODE, 0); mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
+  mb.addHreg(Reg::PACKAGE_READY_FLAG, 0);   // BARU -- mekanisme 2-proximity
+  mb.addHreg(Reg::MIDDLE_PACKAGE_PRESENT, 0);   // BARU -- status live PROX_2 utk cek startup
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
+  lcdBootProgress("Modbus RS485");
 
   if (currentState != NodeState::FAULT) currentState = NodeState::IDLE;
   Serial.println("[BOOT] setup SELESAI -- ketik HELP di serial monitor");
@@ -1020,6 +1384,7 @@ void loop() {
       else if (menuState == MenuState::TEST_IO_I2CSCAN) handleTestIoI2CScanKey(key);
       else if (menuState == MenuState::TEST_OUTPUT_LIST) handleTestOutputListKey(key);
       else if (menuState == MenuState::TEST_OUTPUT_ITEM) handleTestOutputItemKey(key);
+      else if (menuState == MenuState::TEST_INPUT_CATEGORY) handleInputCategoryKey(key);
       else if (menuState == MenuState::TEST_INPUT_LIST) handleTestInputListKey(key);
       else if (menuState == MenuState::TEST_RS485) handleTestRs485Key(key);
       else if (menuState == MenuState::TEST_MODULE_SELECT) handleModuleTypeKey(key);
@@ -1080,7 +1445,13 @@ void loop() {
     if (millis() - lastTestModRefresh2 > 150) { lastTestModRefresh2 = millis(); drawTestModRelay(); }
   }
   handleSafety();
-  if (currentState != NodeState::ESTOPPED) handleRefillFSM();
+  if (currentState != NodeState::ESTOPPED) {
+    handleRefillFSM();
+    handleMiddleSensor();       // BARU -- trigger servo refill dari PACKAGE_MIDDLE_SENSOR, bukan delay lagi
+    updateServoRefillStage();   // BARU -- siklus servo refill, PARALEL dgn conveyor (lihat komentar di atas)
+    updateForceMiddleRefill();  // BARU -- utk startup/recovery, lihat komentar di definisinya
+    updateRefillJoin();         // BARU -- currentState balik IDLE hanya kalau semua cabang SUDAH tuntas
+  }
   updateTestServoCycle();   // BARU -- proses test sequence non-blocking (independen dari RefillState produksi)
   updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking
 

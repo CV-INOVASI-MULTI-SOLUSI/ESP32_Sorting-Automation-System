@@ -43,5 +43,7 @@ enum class Cmd : uint16_t {
   RUN_SEQUENCE = 1,   // arg: 1=pass, 2=reject -- urutan penuh home->target->pick->lift->place->home
   GOTO_HOME = 2, GOTO_PASS = 3, GOTO_REJECT = 4,   // manual override
   PICK = 5, PLACE = 6,                              // manual override
-  RESET_FAULT = 7
+  RESET_FAULT = 7,
+  MOVE_PACKAGE = 8   // BARU -- urutan penuh home->PACKAGE_PICKUP(pose4)->pick->LIFT_LOAD(pose5)->place->home,
+                      // dipicu Orange Pi saat SORTER.PASS_COUNT capai batch (mis. 20), TANPA arg
 };

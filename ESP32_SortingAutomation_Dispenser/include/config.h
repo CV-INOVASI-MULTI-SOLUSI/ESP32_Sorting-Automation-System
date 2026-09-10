@@ -36,8 +36,11 @@ namespace CH {
   // MCP1 (0x22) CH6-15
   constexpr uint8_t OE_PCA     = 6;    // PICKER
   constexpr uint8_t EN_123     = 7;    // STOCKER
-  constexpr uint8_t AIN1       = 8;    // Dispenser push / SORTER motor-A
-  constexpr uint8_t AIN2       = 9;
+  // DIKOREKSI: AIN1/AIN2 TERTUKAR dari wiring fisik nyata -- user konfirmasi AIN2 ada di
+  // GPB0(ch8), AIN1 di GPB1(ch9). Nilai di bawah SUDAH disesuaikan supaya CH::AIN1 software
+  // = pin AIN1 fisik TB6612 yang sebenarnya. Harus SAMA di keempat config.h (board universal).
+  constexpr uint8_t AIN1       = 9;    // Dispenser push / SORTER motor-A
+  constexpr uint8_t AIN2       = 8;
   constexpr uint8_t BIN1       = 10;   // Dispenser conveyor2 / SORTER conveyor
   constexpr uint8_t BIN2       = 11;
   constexpr uint8_t STBY       = 12;   // dipakai bersama AIN+BIN (1 chip TB6612FNG)
@@ -46,10 +49,12 @@ namespace CH {
   constexpr uint8_t DIR_3_MCP  = 15;
 
   // MCP2 (0x23) CH16-31
-  constexpr uint8_t RLY1      = 16;   // SORTER
-  constexpr uint8_t RLY2      = 17;
-  constexpr uint8_t PROX_1    = 18;   // SORTER
-  constexpr uint8_t PROX_2    = 19;
+  constexpr uint8_t RLY1      = 17;   // SORTER
+  constexpr uint8_t RLY2      = 16;
+  // DIKOREKSI: PROX_1/PROX_2 TERTUKAR dari wiring fisik nyata -- user konfirmasi PROX_1 ada
+  // di GPA3(ch19), PROX_2 di GPA2(ch18). Harus SAMA di keempat config.h (board universal).
+  constexpr uint8_t PROX_1    = 19;   // SORTER
+  constexpr uint8_t PROX_2    = 18;
   constexpr uint8_t BUTTON_2  = 20;   // SORTER
   constexpr uint8_t BUTTON_3  = 21;   // SORTER
   constexpr uint8_t LIM_1     = 23;   // Dispenser=LIM_STOCK_EMPTY / STOCKER=LIM_X
@@ -68,7 +73,13 @@ namespace CH {
   constexpr uint8_t DISP_STBY = STBY;
   constexpr uint8_t CONV2_BIN1 = BIN1, CONV2_BIN2 = BIN2;
   constexpr uint8_t LIM_STOCK_EMPTY   = LIM_1;
-  constexpr uint8_t LIM_BOX_ARRIVED   = LIM_2;
+  // DIKOREKSI: sensor fisik "box arrived" ternyata diwiring ke PROX_1(ch19), BUKAN LIM_2(ch22)
+  // -- user konfirmasi. Sebelumnya FSM nungguin LIM_2 yang gak pernah nyala, conveyor selalu
+  // timeout 8 detik (FAULT BOX_NOT_ARRIVED), servo gak pernah kepanggil sama sekali.
+  constexpr uint8_t LIM_BOX_ARRIVED   = PROX_1;   // sensor UJUNG conveyor -- package FULL siap diambil arm
+  // BARU: sensor TENGAH conveyor -- posisi package KOSONG yang diisi objek dari Sorter. Dulu
+  // PROX_2 nganggur/spare di Dispenser, sekarang jadi bagian mekanisme 2-proximity.
+  constexpr uint8_t PACKAGE_MIDDLE_SENSOR = PROX_2;
   constexpr uint8_t LIM_PUSH_HOME     = LIM_3;
   constexpr uint8_t LIM_PUSH_EXTENDED = LIM_4;
 }
