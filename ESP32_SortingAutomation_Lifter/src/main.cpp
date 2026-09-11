@@ -9,10 +9,13 @@
 #include <ModbusRTU.h>
 #include <Preferences.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
 #include "config.h"
 #include "registers.h"
 #include "keypad4x4.h"
 #include "io_expander.h"
+#include "wifi_credentials.h"
 
 // BARU: objek pwm global, dipakai Test Modul Servo -- SAMA PERSIS pola dgn SORTER/PICKER
 Adafruit_PWMServoDriver pwm(I2CAddr::PCA9685);
@@ -545,6 +548,69 @@ void handleSafety() {
     setStepperEnabled(true);   // aman dioptimasi -- bukan jalur darurat
     currentState = NodeState::IDLE; state = LiftState::IDLE;
     for (uint8_t i = 0; i < 3; i++) homed[i] = false;
+  }
+}
+
+// ============================================================
+// OTA (WiFi) -- update firmware tanpa colok-cabut USB. Lihat wifi_credentials.h
+// (gitignored, isi asli SSID/password/OTA password per file .example di include/).
+// ============================================================
+bool otaReady = false;   // true == WiFi connect & ArduinoOTA siap terima update sekarang
+bool otaBegun = false;   // ArduinoOTA.begin() sudah dipanggil sekali (callback ter-register)
+
+// Dipanggil dari ArduinoOTA.onStart() -- proses tulis flash BLOCKING selama beberapa detik,
+// matikan driver stepper dulu (unconditional, sama pola fail-safe dgn handleSafety()) supaya
+// tidak ada step nyasar selama CPU sibuk nulis flash.
+void otaSafeStop() {
+  io.write(CH::EN_STEPPERS, HIGH);
+  steppersEnabled = false;
+  cycleStage = CycleStage::NONE; ackPending = false; yRetracting = false;
+}
+
+void beginOtaService() {
+  if (otaBegun) return;
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() { Serial.println("[OTA] Update mulai -- stop semua actuator"); otaSafeStop(); });
+  ArduinoOTA.onEnd([]() { Serial.println("[OTA] Update selesai, reboot..."); });
+  ArduinoOTA.onError([](ota_error_t err) { Serial.printf("[OTA] Error [%u]\n", err); });
+  ArduinoOTA.begin();
+  otaBegun = true;
+  Serial.println("[OTA] Siap terima update");
+}
+
+// Dipanggil SEKALI di setup() -- boleh nunggu (blocking) sebentar, ini masih fase boot.
+void setupOTA() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("[OTA] Menyambung WiFi '%s'...\n", WIFI_SSID);
+  uint32_t deadline = millis() + 8000;
+  while (WiFi.status() != WL_CONNECTED && millis() < deadline) delay(250);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[OTA] WiFi OK, IP=%s\n", WiFi.localIP().toString().c_str());
+    beginOtaService();
+    otaReady = true;
+  } else {
+    Serial.println("[OTA] WiFi gagal connect (timeout) -- lanjut boot, auto-retry non-blocking di loop()");
+  }
+}
+
+// Dipanggil TIAP loop() -- NON-BLOCKING (tidak ada delay()), supaya polling Modbus dari
+// Orange Pi tidak pernah telat/timeout gara-gara WiFi reconnect.
+void updateOTA() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!otaBegun) beginOtaService();
+    otaReady = true;
+    ArduinoOTA.handle();
+    return;
+  }
+  otaReady = false;
+  static uint32_t lastRetryMs = 0;
+  if (millis() - lastRetryMs > 30000) {
+    lastRetryMs = millis();
+    Serial.println("[OTA] WiFi belum/tidak connect, retry (non-blocking)...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
 }
 
@@ -1415,11 +1481,16 @@ void setup() {
   lcdBootProgress("Modbus RS485");
 
   if (currentState != NodeState::FAULT) currentState = NodeState::IDLE;
+
+  setupOTA();
+  lcdBootProgress("WiFi OTA");
+
   Serial.println("[BOOT] setup SELESAI -- ketik HELP di serial monitor");
 }
 
 void loop() {
   mb.task();
+  updateOTA();
 
   if (keypadPresent) {
     char key = keypad.scan();
