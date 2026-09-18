@@ -69,6 +69,11 @@ enum class Cmd : uint16_t {
   // package baru, PARALEL) sampai PACKAGE_MIDDLE_SENSOR=LOW -- BUKAN nunggu edge produksi biasa.
   // Dipakai kalau boot pertama kali tengah masih kosong dari awal (gak ada edge yg bisa dideteksi).
   FORCE_MIDDLE_REFILL = 6,
+  // BARU -- biar kecepatan servo1/servo2 bisa di-tuning dari Orange Pi langsung.
+  SET_SERVO1_STEP = 7,           // arg: servo1StepUs, 1-2500
+  SET_SERVO1_STEP_INTERVAL = 8,  // arg: servo1StepIntervalMs, 0-500
+  SET_SERVO2_STEP = 9,           // arg: servo2StepUs, 1-2500
+  SET_SERVO2_STEP_INTERVAL = 10, // arg: servo2StepIntervalMs, 0-500
   TEST_SERVO1_CYCLE = 97,   // test-only -- 1x siklus maju-mundur pakai nilai KALIBRASI servo1
   TEST_SERVO2_CYCLE = 98    // test-only -- 1x siklus maju-mundur pakai nilai KALIBRASI servo2
 };

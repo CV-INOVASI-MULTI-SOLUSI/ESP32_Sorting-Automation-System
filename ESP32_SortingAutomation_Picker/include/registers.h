@@ -44,6 +44,10 @@ enum class Cmd : uint16_t {
   GOTO_HOME = 2, GOTO_PASS = 3, GOTO_REJECT = 4,   // manual override
   PICK = 5, PLACE = 6,                              // manual override
   RESET_FAULT = 7,
-  MOVE_PACKAGE = 8   // BARU -- urutan penuh home->PACKAGE_PICKUP(pose4)->pick->LIFT_LOAD(pose5)->place->home,
+  MOVE_PACKAGE = 8,  // BARU -- urutan penuh home->PACKAGE_PICKUP(pose4)->pick->LIFT_LOAD(pose5)->place->home,
                       // dipicu Orange Pi saat SORTER.PASS_COUNT capai batch (mis. 20), TANPA arg
+  // BARU -- biar kecepatan trajectory (berlaku SAMA ke semua 6 joint) bisa di-tuning dari
+  // Orange Pi langsung, gak wajib lewat LCD/Serial lokal.
+  SET_TRAJ_STEP = 9,           // arg: trajStepUs, 1-500
+  SET_TRAJ_STEP_INTERVAL = 10  // arg: trajStepIntervalMs, 5-200
 };

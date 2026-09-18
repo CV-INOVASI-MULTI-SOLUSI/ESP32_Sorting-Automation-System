@@ -57,10 +57,12 @@ namespace CH {
   constexpr uint8_t PROX_2    = 18;
   constexpr uint8_t BUTTON_2  = 20;   // SORTER
   constexpr uint8_t BUTTON_3  = 21;   // SORTER
-  constexpr uint8_t LIM_1     = 23;   // Dispenser=LIM_STOCK_EMPTY / STOCKER=LIM_X
-  constexpr uint8_t LIM_2     = 22;   // Dispenser=LIM_BOX_ARRIVED / STOCKER=LIM_Y
-  constexpr uint8_t LIM_3     = 24;   // Dispenser=LIM_PUSH_HOME   / STOCKER=LIM_Z
-  constexpr uint8_t LIM_4     = 25;   // Dispenser=LIM_PUSH_EXTENDED / STOCKER=RACK_LIM[0]
+  // Dispenser TIDAK PAKAI LIM_1..4 lagi (limit switch dihapus total, lihat alias section di
+  // bawah) -- nomor channel tetap ada di sini demi konsistensi board universal (dipakai node lain).
+  constexpr uint8_t LIM_1     = 23;   // STOCKER=LIM_X
+  constexpr uint8_t LIM_2     = 22;   // STOCKER=LIM_Y
+  constexpr uint8_t LIM_3     = 24;   // STOCKER=LIM_Z
+  constexpr uint8_t LIM_4     = 25;   // STOCKER=RACK_LIM[0]
   constexpr uint8_t LIM_5     = 26;
   constexpr uint8_t LIM_6     = 27;
   constexpr uint8_t LIM_7     = 28;
@@ -72,16 +74,16 @@ namespace CH {
   constexpr uint8_t DISP_AIN1 = AIN1, DISP_AIN2 = AIN2;
   constexpr uint8_t DISP_STBY = STBY;
   constexpr uint8_t CONV2_BIN1 = BIN1, CONV2_BIN2 = BIN2;
-  constexpr uint8_t LIM_STOCK_EMPTY   = LIM_1;
-  // DIKOREKSI: sensor fisik "box arrived" ternyata diwiring ke PROX_1(ch19), BUKAN LIM_2(ch22)
-  // -- user konfirmasi. Sebelumnya FSM nungguin LIM_2 yang gak pernah nyala, conveyor selalu
-  // timeout 8 detik (FAULT BOX_NOT_ARRIVED), servo gak pernah kepanggil sama sekali.
-  constexpr uint8_t LIM_BOX_ARRIVED   = PROX_1;   // sensor UJUNG conveyor -- package FULL siap diambil arm
-  // BARU: sensor TENGAH conveyor -- posisi package KOSONG yang diisi objek dari Sorter. Dulu
-  // PROX_2 nganggur/spare di Dispenser, sekarang jadi bagian mekanisme 2-proximity.
+  // DIHAPUS: LIM_STOCK_EMPTY/LIM_PUSH_HOME/LIM_PUSH_EXTENDED (limit switch) -- Dispenser TIDAK
+  // PAKAI limit switch sama sekali, murni 2 proximity (UJUNG+TENGAH). Deteksi stok habis
+  // dihapus total (jadi tanggung jawab operator/Orange Pi pantau manual); Reg::STOCK_EMPTY_FLAG
+  // tetap ada di register map tapi nilainya selalu 0 sekarang.
+  constexpr uint8_t PROX_BOX_ARRIVED  = PROX_1;   // sensor UJUNG conveyor -- package FULL siap diambil arm
+  // Sensor TENGAH conveyor -- posisi package KOSONG yang diisi objek dari Sorter.
   constexpr uint8_t PACKAGE_MIDDLE_SENSOR = PROX_2;
-  constexpr uint8_t LIM_PUSH_HOME     = LIM_3;
-  constexpr uint8_t LIM_PUSH_EXTENDED = LIM_4;
+  // BARU: tombol fisik khusus TEST REFILL LOOP (mode test lokal, tanpa Modbus/Orange Pi) --
+  // pakai channel BUTTON_2 yang di produksi Dispenser gak dipakai apa-apa.
+  constexpr uint8_t BTN_TEST_BOX_FULL = BUTTON_2;
 }
 
 // --- Native GPIO -- UNIVERSAL, SAMA PERSIS DI SEMUA 4 NODE ---

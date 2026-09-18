@@ -113,6 +113,13 @@ struct SorterConfig {
   // Interval di-set lebih kecil dari kecepatan fisik servo yang sebenarnya sanggup.
   uint16_t hopperStepUs         = 20;   // besar lompatan tiap tick (us)
   uint16_t hopperStepIntervalMs = 20;   // jeda antar tick (ms)
+  // BARU: hopper masih open-loop (gak ada sensor posisi fisik) -- "sampai" itu murni hitungan
+  // software (hopperCurrentUs==target), BUKAN konfirmasi fisik beneran. Kalau kalibrasi Step/
+  // Interval kebetulan lebih cepat dari kemampuan fisik servo, software bisa declare "sampai"
+  // SEBELUM servo beneran nyampe -- gejala: "belum sampai ujung udah balik lagi". Field ini
+  // kasih jeda tahan WAJIB di titik dorong sebelum retract, independen dari kalibrasi Step/
+  // Interval, jadi ada jaminan waktu fisik walau kalibrasi kurang pas. DITARUH DI AKHIR struct.
+  uint16_t hopperPushHoldMs = 300;
 } cfg;
 
 uint32_t passCount = 0, rejectCount = 0;
@@ -172,17 +179,24 @@ uint32_t lastHopperStepMs = 0;     // kapan tick step TERAKHIR terjadi
 // Step/StepInterval), dipicu dari LCD Test Command ATAU langsung dari Orange Pi (opcode). REUSE
 // trajectory helper YANG SAMA dengan produksi (updateHopperTrajectory, didefinisikan di bawah).
 bool updateHopperTrajectory(uint16_t targetUs);   // forward declaration -- definisi lengkap di handleHopper()
-enum class TestHopperCycleStage { NONE, MOVING_TO_PUSH, MOVING_TO_START };
+enum class TestHopperCycleStage { NONE, MOVING_TO_PUSH, PUSH_HOLD, MOVING_TO_START };
 TestHopperCycleStage testHopperCycleStage = TestHopperCycleStage::NONE;
+uint32_t testHopperPushHoldStartMs = 0;
 void startTestHopperCycle() {
   if (currentState != NodeState::IDLE) { Serial.println("[TEST] Hopper cycle ditolak -- node sedang tidak IDLE"); return; }
   testHopperCycleStage = TestHopperCycleStage::MOVING_TO_PUSH;
-  Serial.println("[TEST] Hopper cycle dimulai (pakai nilai kalibrasi Step/StepInterval)");
+  Serial.println("[TEST] Hopper cycle dimulai (pakai nilai kalibrasi Step/StepInterval/PushHold)");
 }
 void updateTestHopperCycle() {
   switch (testHopperCycleStage) {
     case TestHopperCycleStage::MOVING_TO_PUSH:
-      if (updateHopperTrajectory(cfg.hopperPushUs)) testHopperCycleStage = TestHopperCycleStage::MOVING_TO_START;
+      if (updateHopperTrajectory(cfg.hopperPushUs)) {
+        testHopperCycleStage = TestHopperCycleStage::PUSH_HOLD;
+        testHopperPushHoldStartMs = millis();
+      }
+      break;
+    case TestHopperCycleStage::PUSH_HOLD:
+      if (millis() - testHopperPushHoldStartMs >= cfg.hopperPushHoldMs) testHopperCycleStage = TestHopperCycleStage::MOVING_TO_START;
       break;
     case TestHopperCycleStage::MOVING_TO_START:
       if (updateHopperTrajectory(cfg.hopperStartUs)) {
@@ -257,7 +271,8 @@ uint16_t onClassifyWrite(TRegister* reg, uint16_t val) {
 // DIREDESIGN: Interval sekarang = WAKTU TEMPUH satu arah (Titik Awal->Titik Dorong), BUKAN
 // lagi total 1 siklus. Servo bergerak BERTAHAP (ramped, non-blocking) selama durasi itu --
 // bukan lompat instan seperti sebelumnya. Arah kembali (Dorong->Awal) pakai durasi SAMA.
-enum class HopperState { AT_START, MOVING_TO_PUSH, AT_PUSH, MOVING_TO_START };
+enum class HopperState { AT_START, MOVING_TO_PUSH, PUSH_HOLD, MOVING_TO_START };
+uint32_t hopperPushHoldStartMs = 0;
 HopperState hopperState = HopperState::AT_START;
 bool hopperIntervalTestMode = false;   // di-set true/false dari handleCalListKey()/handleParamKey()
 
@@ -297,10 +312,16 @@ void handleHopper() {
       hopperState = HopperState::MOVING_TO_PUSH;
       break;
     case HopperState::MOVING_TO_PUSH:
-      if (updateHopperTrajectory(cfg.hopperPushUs)) hopperState = HopperState::AT_PUSH;
+      if (updateHopperTrajectory(cfg.hopperPushUs)) {
+        hopperState = HopperState::PUSH_HOLD;
+        hopperPushHoldStartMs = millis();
+      }
       break;
-    case HopperState::AT_PUSH:
-      hopperState = HopperState::MOVING_TO_START;
+    case HopperState::PUSH_HOLD:
+      // BARU: jeda tahan WAJIB sebelum retract -- lihat komentar cfg.hopperPushHoldMs. Ini
+      // jaminan waktu fisik independen dari kalibrasi Step/Interval, mencegah "belum sampai
+      // ujung udah balik lagi" kalau kalibrasi kebetulan lebih cepat dari kemampuan servo asli.
+      if (millis() - hopperPushHoldStartMs >= cfg.hopperPushHoldMs) hopperState = HopperState::MOVING_TO_START;
       break;
     case HopperState::MOVING_TO_START:
       if (updateHopperTrajectory(cfg.hopperStartUs)) hopperState = HopperState::AT_START;
@@ -538,6 +559,11 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       mb.Hreg(Reg::PASS_COUNT, 0); mb.Hreg(Reg::REJECT_COUNT, 0);
       break;
     case Cmd::SET_MOTOR_A: setMotorA((uint8_t)constrain(arg, 0, 2)); break;
+    // BARU -- biar Orange Pi bisa tuning kecepatan langsung. Sama pola dgn SET_CONVEYOR_SPEED/
+    // SET_HOPPER_INTERVAL di atas (runtime-only, gak auto-save NVS -- simpan permanen tetap
+    // lewat LCD '#' kalau mau bertahan setelah reboot).
+    case Cmd::SET_PALANG_SPEED: cfg.palangSpeed = (uint8_t)constrain(arg, 0, 255); break;
+    case Cmd::SET_HOPPER_STEP:  cfg.hopperStepUs = (uint16_t)constrain(arg, 1, 2500); break;
     case Cmd::TEST_HOPPER_CYCLE: startTestHopperCycle(); break;
     case Cmd::TEST_TRIGGER_PALANG:
       enqueueClassification(true, millis());
@@ -600,10 +626,11 @@ void drawTopMenuSorter() {
 // DIUBAH: "Hopper Interval(ms)" (target durasi tetap) diganti "Hopper Step(us)" + "Hopper Step
 // Interval(ms)" (kecepatan tetap, SAMA pola dgn "Speed (Step/Interval)" PICKER) -- durasi total
 // jadi hasil jarak/kecepatan, bukan dipaksa satu angka yang bisa gak realistis fisiknya.
-constexpr uint8_t CAL_COUNT = 15;
+constexpr uint8_t CAL_COUNT = 16;
 const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Conveyor Dir", "Palang Speed", "Palang Dir",
                                         "Palang Push (ms)", "Palang Retract (ms)", "Dist (TOF mm)", "Mm/s Max",
                                         "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Step (us)", "Hopper Step Interval(ms)",
+                                        "Hopper Push Hold(ms)",
                                         "Buzzer On (ms)", "Buzzer Off (ms)", "Reset ke Default" };
 uint8_t calCursor = 0;
 uint8_t selParam = 0;
@@ -639,7 +666,7 @@ void handleCalListKey(char key) {
   if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 14) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
+    if (calCursor == 15) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
       menuState = MenuState::CONFIRM_RESET;
       drawConfirmReset();
     } else {
@@ -668,8 +695,9 @@ void drawParamMenu() {
     case 10: lcdPrint(0, 0, "HOPPER TITIK DORONG"); break;
     case 11: lcdPrint(0, 0, "HOPPER STEP (us)"); break;
     case 12: lcdPrint(0, 0, "HOPPER STEP INTV(ms)"); break;
-    case 13: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
-    case 14: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
+    case 13: lcdPrint(0, 0, "HOPPER PUSH HOLD(ms)"); break;
+    case 14: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
+    case 15: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
   }
   String line1;
   switch (selParam) {
@@ -685,8 +713,9 @@ void drawParamMenu() {
     case 10: line1 = "us:" + String(cfg.hopperPushUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 11: line1 = "us:" + String(cfg.hopperStepUs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 12: line1 = "ms:" + String(cfg.hopperStepIntervalMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 13: line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
-    case 14: line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 13: line1 = "ms:" + String(cfg.hopperPushHoldMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 14: line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 15: line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
   }
   lcdPrint(0, 1, line1);
   lcdPrint(0, 2, (selParam == 2 || selParam == 4) ? "A=Forward B=Reverse" : "A+ B- C:step");
@@ -758,19 +787,25 @@ void handleParamKey(char key) {
       break;
     case 12:
       // BARU: batas bawah 1->0 -- 0 = tanpa jeda (step tiap loop tick, secepat mungkin).
-      // AWAS: stepUs besar + interval 0 = gerakan "selesai" logika dalam 1 tick, servo fisik
-      // belum tentu ngejar secepat itu -- balik ke resiko yang sama kayak model duration-based
-      // lama kalau dipaksa lebih cepat dari kemampuan mekanis servo. Kalibrasi hati-hati.
+      // Kalibrasi Step/Interval agresif sekarang AMAN dari sisi "reverse sebelum sampai" --
+      // ada Hopper Push Hold(ms) (param 13) yang jadi jaminan waktu fisik terpisah, independen
+      // dari seberapa cepat kalibrasi Step/Interval ini di-set.
       if (key == 'A') cfg.hopperStepIntervalMs = (uint16_t)constrain((int)cfg.hopperStepIntervalMs + step, 0, 500);
       else if (key == 'B') cfg.hopperStepIntervalMs = (uint16_t)constrain((int)cfg.hopperStepIntervalMs - step, 0, 500);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
     case 13:
+      // BARU: jeda tahan WAJIB di titik dorong sebelum retract -- lihat komentar cfg.hopperPushHoldMs.
+      if (key == 'A') cfg.hopperPushHoldMs = (uint16_t)constrain((int)cfg.hopperPushHoldMs + step * 10, 0, 5000);
+      else if (key == 'B') cfg.hopperPushHoldMs = (uint16_t)constrain((int)cfg.hopperPushHoldMs - step * 10, 0, 5000);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
+    case 14:
       if (key == 'A') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs + step * 10, 50, 5000);
       else if (key == 'B') cfg.buzzerOnMs = (uint16_t)constrain((int)cfg.buzzerOnMs - step * 10, 50, 5000);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
-    case 14:
+    case 15:
       if (key == 'A') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs + step * 10, 50, 5000);
       else if (key == 'B') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs - step * 10, 50, 5000);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;

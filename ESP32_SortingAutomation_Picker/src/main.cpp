@@ -418,6 +418,11 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb sebelum di-nol-kan
       faultCode = 0; currentState = NodeState::IDLE;
       break;
+    // BARU -- biar Orange Pi bisa tuning kecepatan trajectory langsung (berlaku sama ke semua
+    // 6 joint), runtime-only (gak auto-save NVS -- simpan permanen tetap lewat LCD '#' / Serial
+    // kalau mau bertahan setelah reboot, lihat saveSpeedToNvs()).
+    case Cmd::SET_TRAJ_STEP:          trajStepUs = (uint16_t)constrain(arg, 1, 500); break;
+    case Cmd::SET_TRAJ_STEP_INTERVAL: trajStepIntervalMs = (uint16_t)constrain(arg, 5, 200); break;
     default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); break;
   }
 }

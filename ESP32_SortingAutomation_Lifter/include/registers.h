@@ -49,5 +49,8 @@ enum class Cmd : uint16_t {
   MOVE_TO_RACK = 3,       // arg: rack_idx 0-5 -- manual, tanpa auto-push
   PUSH_BOX = 4,           // manual
   RESET_FAULT = 5,
-  GOTO_LOAD_POSITION = 6  // BARU -- manual, menuju Load Position (titik standby terima package)
+  GOTO_LOAD_POSITION = 6,  // BARU -- manual, menuju Load Position (titik standby terima package)
+  // BARU -- biar kecepatan bisa di-tuning dari Orange Pi langsung, gak wajib lewat LCD/Serial lokal.
+  SET_STEP_INTERVAL = 7,         // arg: stepIntervalUs (kecepatan jelajah normal), 20-5000
+  SET_HOMING_STEP_INTERVAL = 8   // arg: homingStepIntervalUs (kecepatan khusus homing), 20-5000
 };

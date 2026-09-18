@@ -70,10 +70,16 @@ uint16_t faultCode = 0;
 // BARU: Lapis 3 diagnostik -- sinkron pola SORTER
 uint16_t i2cErrorCount = 0;
 uint16_t lastFaultCode = 0;
-// BARU: Test ke Rak -- dideklarasikan awal karena dipakai di updateHoming() (definisi lebih
-// awal dari section menu tempat variabel ini logis berada)
-bool testRackSequencePending = false;
+// DIUBAH: Test ke Rak sekarang urutannya Load Position -> Rak -> Push -> Tarik -> Load Position
+// lagi (BUKAN lagi Home -> Rak doang) -- reuse cycleStage produksi (MOVING_XZ..RETURNING_XZ)
+// buat bagian push/tarik/balik, jadi behavior test 100% sama kayak RUN_FULL_CYCLE asli.
+bool testRackGoingToLoad = false;
 uint8_t testRackSequenceTarget = 0;
+// BARU: ukur waktu 1 siklus penuh Test Rak (Load Position -> Rak -> Push -> Tarik -> Load
+// Position lagi) -- mulai dihitung begitu berangkat menuju rak, berhenti begitu kembali ke
+// Load Position (bareng buzzer selesai), ditampilkan ke LCD + Serial.
+bool testRackTimingActive = false;
+uint32_t testRackCycleStartMs = 0;
 uint32_t lastRs485Rx = 0;
 bool modbusEverUsed = false;
 
@@ -126,7 +132,7 @@ bool ackPending = false; uint16_t pendingAckSeq = 0;
 
 uint16_t rampMinIntervalUs = 1200;
 uint16_t rampSteps = 300;
-uint8_t microstepMode = 2;
+uint8_t microstepMode = 8;   // 8 (MS1=GND,MS2=GND) = default fisik TMC2209 & paling cepat lewat jumper
 
 // --- Menu state (dideklarasikan awal, dipakai onCmdWrite) ---
 enum class MenuState { NONE, TOP_SELECT, CAL_LIST, MOVE_AXIS, WAIT_SAVE_SLOT, JOG_SPEED, TEST_RACK_SELECT,
@@ -166,7 +172,7 @@ void resetAllToDefault() {
   loadPos = {0, 0};   // BARU
   pushExtendSteps = 1000;
   stepIntervalUs = 600; homingStepIntervalUs = 150;
-  rampMinIntervalUs = 1200; rampSteps = 300; microstepMode = 2;
+  rampMinIntervalUs = 1200; rampSteps = 300; microstepMode = 8;
   buzzerOnMs = 500; buzzerOffMs = 500;   // BARU
   Serial.println("[RESET] Semua kalibrasi STOCKER dikembalikan ke default & NVS dihapus");
 }
@@ -244,7 +250,7 @@ bool steppersEnabled = false;                       // cache EN_STEPPERS -- hind
 void setStepperEnabled(bool enable) {
   if (steppersEnabled == enable) return;   // sudah di state itu, tidak perlu I2C lagi
   steppersEnabled = enable;
-  io.write(CH::EN_STEPPERS, enable ? LOW : HIGH);   // EN TMC2209 aktif-LOW
+  io.write(CH::EN_STEPPERS, enable ? LOW : HIGH);   // EN aktif-LOW (berlaku sama di TMC2209 & DRV8825)
 }
 
 // DIREVISI: tidak ada pin native lain tersedia di ESP32 untuk DIR -- kembali sepenuhnya ke
@@ -261,7 +267,7 @@ void setAxisDirection(uint8_t axis, bool forward) {
   dirState[axis] = actualForward;
   const uint8_t dirPinsMcp[3] = {CH::DIR_1_MCP, CH::DIR_2_MCP, CH::DIR_3_MCP};
   io.write(dirPinsMcp[axis], actualForward ? HIGH : LOW);
-  lastStepMicros[axis] = micros();   // settling time -- TMC2209 butuh jeda setelah DIR berubah sebelum STEP pertama valid
+  lastStepMicros[axis] = micros();   // settling time -- driver stepper butuh jeda setelah DIR berubah sebelum STEP pertama valid
 }
 
 // DIPERBAIKI (M02): STEP pulse non-blocking -- sebelumnya stepPulse() pakai
@@ -397,16 +403,6 @@ void updateHoming() {
     for (uint8_t i = 0; i < 3; i++) { curPos[i] = 0; tgtPos[i] = 0; }
     if (ackPending) { ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq); }
     Serial.println("[STOCKER] Homing SELESAI");
-    // BARU: kalau ini bagian dari "Test ke Rak", lanjutkan otomatis ke rak tujuan
-    if (testRackSequencePending) {
-      testRackSequencePending = false;
-      if (moveToRackXZ(testRackSequenceTarget)) {
-        currentState = NodeState::RUNNING_OR_MOVING;
-        Serial.printf("[TEST-RACK] Homing selesai, menuju Rak %u\n", testRackSequenceTarget);
-      } else {
-        Serial.println("[TEST-RACK] Gagal menuju rak setelah homing (cek log FaultCode)");
-      }
-    }
     return;
   }
 
@@ -487,41 +483,65 @@ bool moveToRackXZ(uint8_t rackIdx) {
   return true;
 }
 
+// BARU: diagnostik -- timestamp mulai stage cycleStage SEKARANG, buat ukur durasi per-tahap
+// (MOVING_XZ/PUSHING_Y/RETRACT_Y/RETURNING_XZ terpisah) dan bandingin ke kalkulasi teori
+// (steps x stepIntervalUs), cari tau di tahap mana ada waktu ekstra yang gak kejelasin.
+uint32_t cycleStageStartMs = 0;
+
 void handleCycle() {
   switch (cycleStage) {
     case CycleStage::NONE: break;
     case CycleStage::MOVING_XZ:
       if (state == LiftState::IDLE) {
+        Serial.printf("[CYCLE-TIMING] MOVING_XZ selesai dalam %lums\n", (unsigned long)(millis() - cycleStageStartMs));
         tgtPos[1] = pushExtendSteps; state = LiftState::MOVING; cycleStage = CycleStage::PUSHING_Y;
+        cycleStageStartMs = millis();
         triggerBuzzerBeep();   // BARU -- notifikasi: sudah masuk rack yang benar
       }
-      else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; }
+      else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; testRackTimingActive = false; }
       break;
     case CycleStage::PUSHING_Y:
       if (state == LiftState::IDLE) {
+        Serial.printf("[CYCLE-TIMING] PUSHING_Y selesai dalam %lums\n", (unsigned long)(millis() - cycleStageStartMs));
         startYRetract(); cycleStage = CycleStage::RETRACT_Y;
+        cycleStageStartMs = millis();
         triggerBuzzerBeep();   // BARU -- notifikasi: selesai dorong package
       }
-      else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; }
+      else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; testRackTimingActive = false; }
       break;
     case CycleStage::RETRACT_Y:
       if (!yRetracting) {
-        if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; return; }
+        if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; testRackTimingActive = false; return; }
+        Serial.printf("[CYCLE-TIMING] RETRACT_Y selesai dalam %lums\n", (unsigned long)(millis() - cycleStageStartMs));
         // DIUBAH: setelah RUN_FULL_CYCLE selesai, lift kembali ke LOAD POSITION
         // (bukan Home lagi) -- siap langsung terima package berikutnya dari robot arm
         // tanpa perlu re-homing tiap siklus. Home tetap ada, cuma dipakai referensi kalibrasi.
         tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z; state = LiftState::MOVING;
         mb.Hreg(Reg::CURRENT_RACK_IDX, 0xFF);
         cycleStage = CycleStage::RETURNING_XZ;
+        cycleStageStartMs = millis();
       }
       break;
     case CycleStage::RETURNING_XZ:
       if (state == LiftState::IDLE) {
+        Serial.printf("[CYCLE-TIMING] RETURNING_XZ selesai dalam %lums\n", (unsigned long)(millis() - cycleStageStartMs));
         cycleStage = CycleStage::NONE;
         if (ackPending) { ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq); }
         triggerBuzzerBeep();   // BARU -- notifikasi: sudah kembali ke Load Position
+        // BARU: kalau ini bagian dari Test Rak, tampilkan lama 1 siklus penuh (Load->Rak->
+        // Push->Tarik->Load) ke LCD + Serial, bareng buzzer selesai.
+        if (testRackTimingActive) {
+          testRackTimingActive = false;
+          float elapsedSec = (millis() - testRackCycleStartMs) / 1000.0f;
+          Serial.printf("[TEST-RACK] 1 siklus (Rak->Push->Tarik->Load) selesai dalam %.2f detik\n", elapsedSec);
+          if (menuState == MenuState::TEST_RACK_SELECT) {
+            char buf[21];
+            snprintf(buf, sizeof(buf), "Siklus: %.2f detik!", elapsedSec);
+            lcdPrint(0, 3, buf);
+          }
+        }
       }
-      else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; }
+      else if (state == LiftState::FAULT) { cycleStage = CycleStage::NONE; ackPending = false; testRackTimingActive = false; }
       break;
     case CycleStage::PUSHING_Y_STANDALONE:
       if (state == LiftState::IDLE) { startYRetract(); cycleStage = CycleStage::RETRACT_Y_STANDALONE; }
@@ -542,6 +562,8 @@ void handleSafety() {
     steppersEnabled = false;   // tetap sinkronkan cache setelahnya
     currentState = NodeState::ESTOPPED; state = LiftState::ESTOPPED;
     cycleStage = CycleStage::NONE; ackPending = false; yRetracting = false;
+    testRackGoingToLoad = false;   // BARU -- cegah chain Test Rak resume aneh setelah E-stop dilepas
+    testRackTimingActive = false;
     return;
   }
   if (currentState == NodeState::ESTOPPED) {
@@ -684,6 +706,7 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       currentState = NodeState::RUNNING_OR_MOVING;
       cycleStage = CycleStage::MOVING_XZ;
+      cycleStageStartMs = millis();
       triggerBuzzerBeep();   // BARU -- notifikasi: package sudah di lift, cycle mulai
       ackPending = true; pendingAckSeq = seq; return;
     case Cmd::MOVE_TO_RACK:
@@ -709,6 +732,19 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb sebelum di-nol-kan
       faultCode = 0; currentState = NodeState::IDLE; state = LiftState::IDLE;
+      break;
+    // BARU -- biar Orange Pi bisa tuning kecepatan langsung, sama rentang/pola dgn Serial STEPSPEED/HOMESPEED.
+    // DIUBAH: batas bawah 20->0 -- 0 = tanpa jeda sama sekali (step secepat loop() bisa jalan,
+    // sama konvensi dgn hopperStepIntervalMs SORTER/servo*StepIntervalMs DISPENSER).
+    case Cmd::SET_STEP_INTERVAL:
+      stepIntervalUs = (uint16_t)constrain((int)arg, 0, 5000);
+      saveStepIntervalToNvs();
+      Serial.printf("[CMD] SET_STEP_INTERVAL -- stepIntervalUs=%u\n", stepIntervalUs);
+      break;
+    case Cmd::SET_HOMING_STEP_INTERVAL:
+      homingStepIntervalUs = (uint16_t)constrain((int)arg, 20, 5000);
+      saveHomingIntervalToNvs();
+      Serial.printf("[CMD] SET_HOMING_STEP_INTERVAL -- homingStepIntervalUs=%u\n", homingStepIntervalUs);
       break;
     default: break;
   }
@@ -782,13 +818,20 @@ void handleTestRackSelectKey(char key) {
   else if (key == 'C') {
     if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
       lcdPrint(0, 3, "Tak bisa:FAULT/ESTOP");
+    } else if (!homed[0] || !homed[2]) {
+      lcdPrint(0, 3, "AutoHome dulu!");
+      Serial.println("[TEST-RACK] Ditolak -- belum di-Home (AutoHome dulu, item menu #1)");
     } else {
+      // DIUBAH: urutan sekarang Load Position -> Rak -> Push -> Tarik -> Load Position lagi
+      // (BUKAN lagi Home -> Rak). Bagian push/tarik/balik REUSE cycleStage produksi yang sama
+      // persis dengan RUN_FULL_CYCLE, dipicu begitu Load Position tercapai (lihat loop()).
       testRackSequenceTarget = testRackCursor;
-      testRackSequencePending = true;
-      startHomingInternal();
+      testRackGoingToLoad = true;
+      tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z;
+      state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
-      lcdPrint(0, 3, "Homing, lalu ke rak");
-      Serial.printf("[TEST-RACK] Home dulu, lalu menuju Rak %u\n", testRackSequenceTarget);
+      lcdPrint(0, 3, "Ke Load Pos dulu...");
+      Serial.printf("[TEST-RACK] Menuju Load Position, lalu Rak %u (push+tarik+balik)\n", testRackSequenceTarget);
     }
   }
   else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); }
@@ -840,10 +883,17 @@ void drawSpeedMenuStocker() {
 }
 void handleSpeedKeyStocker(char key) {
   int16_t step = JOG_STEPS[jogStepIdx];
-  // DIUBAH (migrasi A4988->TMC2209): tabel microstep TMC2209 pin-only BEDA dari A4988 --
-  // cuma 4 kombinasi lewat MS1/MS2 (bukan 5 lewat MS1/MS2/MS3), TIDAK ADA full-step (1/1).
-  // Tabel resmi TMC2209 (MS2,MS1): 00=1/8, 01=1/2, 10=1/4, 11=1/16
-  constexpr uint8_t MSTEP_VALUES[4] = {2, 4, 8, 16};   // urut kasar->halus, logis utk tombol A(naik)/B(turun)
+  // Tabel resmi TMC2209 standalone pin-only (sumber: Watterott SilentStepStick TMC2209 docs):
+  //   MS1=GND, MS2=GND -> 1/8   (PALING KASAR/CEPAT -- ini JUGA default kalau MS1/MS2 floating,
+  //                               driver TMC2209 punya internal pulldown)
+  //   MS1=VIO, MS2=GND -> 1/32
+  //   MS1=GND, MS2=VIO -> 1/64  (PALING HALUS/LAMBAT)
+  //   MS1=VIO, MS2=VIO -> 1/16
+  // TIDAK ADA cara dapet LEBIH CEPAT dari 1/8 lewat jumper MS1/MS2 -- itu sudah yang PALING
+  // KASAR yang bisa dipilih. Kalau butuh lebih cepat dari ini, satu-satunya jalan lain adalah
+  // UART (TMC2209 bisa full-step/half-step via register CHOPCONF.MRES, TAPI itu butuh wiring
+  // PDN_UART + library TMCStepper, BEDA dari pendekatan jumper pin murni di sini).
+  constexpr uint8_t MSTEP_VALUES[4] = {8, 16, 32, 64};   // urut kasar(cepat)->halus(lambat), utk tombol A(naik)/B(turun)
   if (key >= '1' && key <= '7') { selSpeedParam = key - '0'; }
   else if (key == 'A' || key == 'B') {
     if (selSpeedParam == 5) {
@@ -854,7 +904,7 @@ void handleSpeedKeyStocker(char key) {
     } else {
       int delta = (key == 'A') ? step : -step;
       switch (selSpeedParam) {
-        case 1: stepIntervalUs = (uint16_t)constrain((int)stepIntervalUs + delta, 20, 5000); break;
+        case 1: stepIntervalUs = (uint16_t)constrain((int)stepIntervalUs + delta, 0, 5000); break;   // DIUBAH: 20->0, 0=tanpa jeda
         case 2: homingStepIntervalUs = (uint16_t)constrain((int)homingStepIntervalUs + delta, 20, 5000); break;
         case 3: rampMinIntervalUs = (uint16_t)constrain((int)rampMinIntervalUs + delta, 20, 5000); break;
         case 4: rampSteps = (uint16_t)constrain((int)rampSteps + delta, 0, 5000); break;
@@ -1345,15 +1395,14 @@ void handleSerialCommand() {
     applyCommand((uint16_t)Cmd::RUN_FULL_CYCLE, slot, 0);
     Serial.printf("[FULLCYCLE] RUN_FULL_CYCLE ke RACK[%u] dimulai\n", slot);
   }
-  else if (cmd == "STEPSPEED") { stepIntervalUs = constrain((int)line.substring(sp1 + 1).toInt(), 20, 5000); saveStepIntervalToNvs(); Serial.printf("[STEPSPEED] %u\n", stepIntervalUs); }
+  else if (cmd == "STEPSPEED") { stepIntervalUs = constrain((int)line.substring(sp1 + 1).toInt(), 0, 5000); saveStepIntervalToNvs(); Serial.printf("[STEPSPEED] %u\n", stepIntervalUs); }
   else if (cmd == "HOMESPEED") { homingStepIntervalUs = constrain((int)line.substring(sp1 + 1).toInt(), 20, 5000); saveHomingIntervalToNvs(); Serial.printf("[HOMESPEED] %u\n", homingStepIntervalUs); }
   else if (cmd == "RAMPMIN") { rampMinIntervalUs = constrain((int)line.substring(sp1 + 1).toInt(), 20, 5000); saveRampToNvs(); Serial.printf("[RAMPMIN] %u\n", rampMinIntervalUs); }
   else if (cmd == "RAMPSTEPS") { rampSteps = constrain((int)line.substring(sp1 + 1).toInt(), 0, 5000); saveRampToNvs(); Serial.printf("[RAMPSTEPS] %u\n", rampSteps); }
   else if (cmd == "MICROSTEP") {
     uint8_t val = line.substring(sp1 + 1).toInt();
-    // DIUBAH (migrasi TMC2209): 1/1 (full-step) TIDAK TERSEDIA lagi via pin MS1/MS2 -- beda dari A4988
-    if (val == 2 || val == 4 || val == 8 || val == 16) { microstepMode = val; saveMicrostepToNvs(); Serial.printf("[MICROSTEP] Dicatat: 1/%u -- set jumper MS1/MS2 TMC2209 sesuai tabel (lihat HELP)\n", microstepMode); }
-    else Serial.println("[MICROSTEP] Nilai harus 2, 4, 8, atau 16 (TMC2209 pin-mode, TIDAK ada 1=full-step)");
+    if (val == 8 || val == 16 || val == 32 || val == 64) { microstepMode = val; saveMicrostepToNvs(); Serial.printf("[MICROSTEP] Dicatat: 1/%u -- set jumper MS1/MS2 TMC2209 sesuai tabel (lihat HELP)\n", microstepMode); }
+    else Serial.println("[MICROSTEP] Nilai harus 8, 16, 32, atau 64 (TMC2209 pin-mode, TIDAK ada 1=full-step, TIDAK ada 1/2 atau 1/4)");
   }
   else if (cmd == "RESET") { resetAllToDefault(); }
   else if (cmd == "STATUS") {
@@ -1369,7 +1418,7 @@ void handleSerialCommand() {
   else if (cmd == "HELP") {
     Serial.println("[HELP] HOME | JOG <0=X,1=Y-pusher,2=Z> <steps> | SETRACK <0-5> | SETPUSH");
     Serial.println("[HELP] MOVE <0-5> | PUSH | FULLCYCLE <0-5> | STEPSPEED <us> | HOMESPEED <us>");
-    Serial.println("[HELP] RAMPMIN <us> | RAMPSTEPS <n> | MICROSTEP <2|4|8|16 -- TMC2209, cek tabel MS1/MS2> | RESET | STATUS | HELP");
+    Serial.println("[HELP] RAMPMIN <us> | RAMPSTEPS <n> | MICROSTEP <8|16|32|64 -- TMC2209, cek tabel MS1/MS2, 8=paling cepat> | RESET | STATUS | HELP");
   }
   else Serial.printf("[SERIAL] '%s' tidak dikenal -- ketik HELP\n", cmd.c_str());
 }
@@ -1575,7 +1624,24 @@ void loop() {
       ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq);
     }
     if (state == LiftState::IDLE && !yRetracting && cycleStage == CycleStage::NONE
-        && currentState == NodeState::RUNNING_OR_MOVING) currentState = NodeState::IDLE;
+        && currentState == NodeState::RUNNING_OR_MOVING) {
+      if (testRackGoingToLoad) {
+        // Load Position tercapai -- lanjut ke Rak, REUSE cycleStage produksi buat push/tarik/balik.
+        testRackGoingToLoad = false;
+        if (moveToRackXZ(testRackSequenceTarget)) {
+          cycleStage = CycleStage::MOVING_XZ;
+          cycleStageStartMs = millis();
+          testRackTimingActive = true;
+          testRackCycleStartMs = millis();   // BARU -- mulai hitung 1 siklus (Rak->Push->Tarik->Load)
+          Serial.printf("[TEST-RACK] Load Position tercapai, menuju Rak %u\n", testRackSequenceTarget);
+        } else {
+          currentState = NodeState::IDLE;
+          Serial.println("[TEST-RACK] Gagal menuju rak dari Load Position (cek FaultCode)");
+        }
+      } else {
+        currentState = NodeState::IDLE;
+      }
+    }
   }
 
   // BARU (B06): Serial.printf() dipindah keluar dari updateSteppers() -- motion-critical

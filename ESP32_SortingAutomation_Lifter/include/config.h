@@ -90,9 +90,9 @@ namespace GP {
 // Berlaku OTOMATIS ke SEMUA gerakan (homing, jog, RUN_FULL_CYCLE) karena diterapkan di
 // SATU titik (setAxisDirection()), bukan perlu diubah di banyak tempat.
 namespace AxisInvert {
-  constexpr bool X = false;   // ubah ke true kalau axis X (STEP_1) berputar kebalik
+  constexpr bool X = true;   // ubah ke true kalau axis X (STEP_1) berputar kebalik
   constexpr bool Y = false;   // ubah ke true kalau axis Y (STEP_2) berputar kebalik
-  constexpr bool Z = false;   // ubah ke true kalau axis Z (STEP_3) berputar kebalik
+  constexpr bool Z = true;   // ubah ke true kalau axis Z (STEP_3) berputar kebalik
 }
 
 namespace LcdCfg {
