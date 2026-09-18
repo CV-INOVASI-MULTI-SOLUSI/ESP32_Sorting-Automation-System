@@ -64,6 +64,10 @@ void lcdBootProgress(const char* stepLabel) {
 
 NodeState currentState = NodeState::INIT;
 uint16_t faultCode = 0;
+// BARU: pemisah MAIN/TEST -- default FALSE (fail-safe, boot-IDLE). Cmd::START_MAIN/STOP_MAIN
+// (Orange Pi/master) nentuin RUN_SEQUENCE/MOVE_PACKAGE (produksi) vs GOTO_HOME/GOTO_PASS/
+// GOTO_REJECT/PICK/PLACE (manual override/test) -- dua kelompok ini saling eksklusif.
+bool mainModeActive = false;
 // BARU: Lapis 3 diagnostik -- sinkron pola SORTER
 uint16_t i2cErrorCount = 0;
 uint16_t lastFaultCode = 0;
@@ -382,7 +386,17 @@ bool blockIfFaulted(const char* opName) {
 
 void applyCommand(uint16_t opcode, uint16_t arg) {
   switch ((Cmd)opcode) {
+    case Cmd::START_MAIN:
+      if (blockIfFaulted("START_MAIN")) return;
+      mainModeActive = true;
+      Serial.println("[CMD] START_MAIN -- MAIN aktif, command manual override diblokir sampai STOP_MAIN");
+      break;
+    case Cmd::STOP_MAIN:
+      mainModeActive = false;
+      Serial.println("[CMD] STOP_MAIN -- MAIN mati, command manual override boleh dipakai lagi");
+      break;
     case Cmd::RUN_SEQUENCE:
+      if (!mainModeActive) { Serial.println("[CMD] RUN_SEQUENCE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); return; }
       if (blockIfFaulted("RUN_SEQUENCE")) return;
       enqueue(QCmd::GOTO_POSE, 0);
       enqueue(QCmd::CLEARANCE);
@@ -394,15 +408,38 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       enqueue(QCmd::POST_PLACE);   // BARU -- gerakan tambahan sebelum kembali Home
       enqueue(QCmd::GOTO_POSE, 0);
       break;
-    case Cmd::GOTO_HOME:   if (blockIfFaulted("GOTO_HOME")) return;   enqueue(QCmd::GOTO_POSE, 0); break;
-    case Cmd::GOTO_PASS:   if (blockIfFaulted("GOTO_PASS")) return;   enqueue(QCmd::GOTO_POSE, 1); break;
-    case Cmd::GOTO_REJECT: if (blockIfFaulted("GOTO_REJECT")) return; enqueue(QCmd::GOTO_POSE, 2); break;
-    case Cmd::PICK:  if (blockIfFaulted("PICK")) return;  enqueue(QCmd::PICK); break;
-    case Cmd::PLACE: if (blockIfFaulted("PLACE")) return; enqueue(QCmd::PLACE); break;
+    // BARU: 5 command di bawah ("manual override") DITOLAK TOTAL selama mainModeActive --
+    // Orange Pi wajib STOP_MAIN dulu.
+    case Cmd::GOTO_HOME:
+      if (mainModeActive) { Serial.println("[CMD] GOTO_HOME ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
+      if (blockIfFaulted("GOTO_HOME")) return;
+      enqueue(QCmd::GOTO_POSE, 0);
+      break;
+    case Cmd::GOTO_PASS:
+      if (mainModeActive) { Serial.println("[CMD] GOTO_PASS ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
+      if (blockIfFaulted("GOTO_PASS")) return;
+      enqueue(QCmd::GOTO_POSE, 1);
+      break;
+    case Cmd::GOTO_REJECT:
+      if (mainModeActive) { Serial.println("[CMD] GOTO_REJECT ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
+      if (blockIfFaulted("GOTO_REJECT")) return;
+      enqueue(QCmd::GOTO_POSE, 2);
+      break;
+    case Cmd::PICK:
+      if (mainModeActive) { Serial.println("[CMD] PICK ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
+      if (blockIfFaulted("PICK")) return;
+      enqueue(QCmd::PICK);
+      break;
+    case Cmd::PLACE:
+      if (mainModeActive) { Serial.println("[CMD] PLACE ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
+      if (blockIfFaulted("PLACE")) return;
+      enqueue(QCmd::PLACE);
+      break;
     // BARU: angkat 1 package (batch objek) dari posisi ujung conveyor (pose4=PACKAGE_PICKUP)
     // ke Lift Load Position STOCKER (pose5=LIFT_LOAD). Dipicu Orange Pi saat SORTER.PASS_COUNT
     // capai batas batch -- Orange Pi kirim RUN_FULL_CYCLE ke STOCKER SETELAH ack command ini.
     case Cmd::MOVE_PACKAGE:
+      if (!mainModeActive) { Serial.println("[CMD] MOVE_PACKAGE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); return; }
       if (blockIfFaulted("MOVE_PACKAGE")) return;
       enqueue(QCmd::GOTO_POSE, 0);
       enqueue(QCmd::CLEARANCE);
@@ -1225,6 +1262,7 @@ void setup() {
   mb.addHreg(Reg::HEARTBEAT, 0); mb.addHreg(Reg::CURRENT_POSE, 0);
   mb.addHreg(Reg::ACTIVITY_CODE, 0); mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
+  mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
@@ -1280,6 +1318,7 @@ void loop() {
   mb.Hreg(Reg::I2C_ERROR_COUNT, i2cErrorCount);
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
+  mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
 
   static uint32_t lastMcpHealthCheck = 0;
   if (millis() - lastMcpHealthCheck > 2000) {

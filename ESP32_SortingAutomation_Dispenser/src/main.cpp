@@ -128,6 +128,11 @@ RefillState refillState = RefillState::IDLE;
 uint32_t stateEnteredAt = 0;
 bool refillRequested = false;
 
+// BARU: pemisah MAIN/TEST -- default FALSE (fail-safe, boot-IDLE). Cmd::START_MAIN/STOP_MAIN
+// (Orange Pi/master doang yang boleh ubah ini) nentuin node lagi mode produksi otomatis (MAIN)
+// atau siap buat testing manual (TEST). Lihat guard di applyCommand() & handleMiddleSensor().
+bool mainModeActive = false;
+
 // DIUBAH TOTAL: trajectory servo STEP-RATE based (dulu duration-based -- bisa "mundur sebelum
 // sampai" kalau Interval di-set lebih kecil dari kecepatan fisik servo yang sebenarnya sanggup).
 // SAMA konsep dgn hopper SORTER/PICKER: tiap tick majukan posisi SEBESAR stepUs menuju target.
@@ -163,9 +168,17 @@ bool updateServoTrajectory(uint8_t which, uint16_t targetUs) {
   return (currentUs == targetUs);
 }
 
+// BARU: guard mutual-exclusion -- forward declaration, definisi lengkap di bawah (butuh
+// servoRefillStage yang dideklarasikan belakangan di file ini). DIPERLUKAN karena refill
+// otomatis dari handleMiddleSensor() TIDAK PERNAH mengubah currentState (jalan diam-diam di
+// servoRefillStage terpisah) -- guard currentState==IDLE SAJA gak cukup, servo bisa "direbut"
+// command manual (TEST_SERVOx_CYCLE/MOVE_SERVOx_TO) di tengah refill otomatis jalan.
+bool isServoRefillAutoActive();
+
 // BARU: Test Sequence -- 1x siklus maju-mundur (Titik Awal->Titik Akhir->tahan->Titik Awal)
 // PAKAI NILAI KALIBRASI, dipicu dari LCD Test Command ATAU langsung dari Orange Pi (opcode).
-// State TERPISAH dari RefillState produksi -- tidak boleh bentrok, makanya WAJIB currentState==IDLE.
+// State TERPISAH dari RefillState produksi -- tidak boleh bentrok, makanya WAJIB currentState==IDLE
+// DAN servoRefillStage==NONE (lihat isServoRefillAutoActive()).
 enum class TestServoCycleStage { NONE, TO_END, HOLD, TO_START };
 TestServoCycleStage testServoCycleStage = TestServoCycleStage::NONE;
 uint8_t testServoCycleWhich = 0;   // 1 atau 2
@@ -179,6 +192,7 @@ bool servoIntervalTestMode = false;
 uint8_t servoIntervalTestWhich = 0;   // 1 atau 2, servo mana yang lagi di-loop
 void startTestServoCycle(uint8_t which) {
   if (currentState != NodeState::IDLE) { Serial.println("[TEST] Servo cycle ditolak -- node sedang tidak IDLE"); return; }
+  if (isServoRefillAutoActive()) { Serial.println("[TEST] Servo cycle ditolak -- refill otomatis (PROX_2) lagi pegang servo"); return; }
   testServoCycleWhich = which;
   testServoCycleStage = TestServoCycleStage::TO_END;
   testServoCycleStateAt = millis();
@@ -221,9 +235,46 @@ void updateTestServoCycle() {
   }
 }
 
+// BARU: jog manual 1 ARAH (BUKAN round-trip) -- Cmd::MOVE_SERVO1_TO/MOVE_SERVO2_TO. Servo
+// gerak ke titik awal ATAU titik akhir (pilih via arg), berhenti DI SITU, gak balik sendiri --
+// buat kebutuhan operator masukin package manual pertama kali (buka gerbang, taruh package,
+// tutup lagi pakai command terpisah). TERPISAH dari testServoCycleStage produksi/test-cycle.
+bool manualServo1Moving = false, manualServo2Moving = false;
+uint16_t manualServo1Target = 0, manualServo2Target = 0;
+
+void startMoveServoTo(uint8_t which, bool toEnd) {
+  if (currentState != NodeState::IDLE) { Serial.printf("[CMD] MOVE_SERVO%u_TO ditolak -- node sedang tidak IDLE\n", which); return; }
+  if (isServoRefillAutoActive()) { Serial.printf("[CMD] MOVE_SERVO%u_TO ditolak -- refill otomatis (PROX_2) lagi pegang servo\n", which); return; }
+  uint16_t target = (which == 1)
+      ? (toEnd ? cfg.servo1EndUs : cfg.servo1StartUs)
+      : (toEnd ? cfg.servo2EndUs : cfg.servo2StartUs);
+  startServoMove(which, target);
+  if (which == 1) { manualServo1Target = target; manualServo1Moving = true; }
+  else { manualServo2Target = target; manualServo2Moving = true; }
+  Serial.printf("[CMD] MOVE_SERVO%u_TO -- menuju %s (%uus)\n", which, toEnd ? "titik akhir" : "titik awal", target);
+}
+void updateManualServoMove() {
+  if (manualServo1Moving && updateServoTrajectory(1, manualServo1Target)) manualServo1Moving = false;
+  if (manualServo2Moving && updateServoTrajectory(2, manualServo2Target)) manualServo2Moving = false;
+}
+
 constexpr int PWM_FREQ = 20000, PWM_RES = 8, LEDC_CH_CONV2 = 0, LEDC_CH_PUSH_TEST = 1;
 
 void motorWrite(uint8_t ain1, uint8_t ain2, bool forward) { io.write(ain1, forward); io.write(ain2, !forward); }
+
+// BARU: jog manual conveyor ON/OFF (Cmd::SET_CONVEYOR_ON_OFF) -- TIDAK terikat sensor apapun,
+// murni nyala/mati sesuai perintah. Dipisah dari mekanisme REQUEST_REFILL/FORCE_MIDDLE_REFILL
+// yang otomatis berhenti sendiri di sensor tertentu.
+void setConveyorManual(bool on) {
+  if (on) {
+    motorWrite(CH::CONV2_BIN1, CH::CONV2_BIN2, cfg.conveyorDir);
+    io.write(CH::DISP_STBY, HIGH);
+    ledcWrite(LEDC_CH_CONV2, cfg.conveyorSpeed);
+  } else {
+    ledcWrite(LEDC_CH_CONV2, 0);
+    io.write(CH::DISP_STBY, LOW);
+  }
+}
 void enterRefillState(RefillState s) { refillState = s; stateEnteredAt = millis(); }
 
 // ============================================================
@@ -249,6 +300,7 @@ void toggleTestRefillLoop() {
     Serial.println("[TESTLOOP] Dihentikan");
     return;
   }
+  if (mainModeActive) { Serial.println("[TESTLOOP] Ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
   if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
     Serial.println("[TESTLOOP] Ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
     return;
@@ -405,6 +457,10 @@ enum class ServoRefillStage { NONE, SERVO1_TO_END, SERVO1_HOLD, SERVO1_TO_START,
 ServoRefillStage servoRefillStage = ServoRefillStage::NONE;
 uint32_t servoRefillStageAt = 0;
 
+// BARU: definisi lengkap forward-declaration di atas -- dipakai guard mutual-exclusion
+// TEST_SERVOx_CYCLE/MOVE_SERVOx_TO, cegah bentrok rebutan servo sama refill otomatis PROX_2.
+bool isServoRefillAutoActive() { return servoRefillStage != ServoRefillStage::NONE; }
+
 void handleRefillFSM() {
   uint32_t elapsed = millis() - stateEnteredAt;
   switch (refillState) {
@@ -458,7 +514,10 @@ void handleMiddleSensor() {
   // gak cuma nunggu edge produksi. Ditulis tiap panggilan (bukan cuma saat berubah).
   mb.Hreg(Reg::MIDDLE_PACKAGE_PRESENT, cur == LOW ? 1 : 0);
   if (cur != lastMiddleSensorState) {
-    if (lastMiddleSensorState == LOW && cur == HIGH &&
+    // BARU: trigger otomatis WAJIB mainModeActive -- sebelum Orange Pi START_MAIN, edge PROX_2
+    // TIDAK memicu apa-apa (biar aman dites manual pakai TEST_SERVOx_CYCLE/MOVE_SERVOx_TO tanpa
+    // rebutan servo sama logic otomatis ini).
+    if (mainModeActive && lastMiddleSensorState == LOW && cur == HIGH &&
         currentState != NodeState::FAULT && servoRefillStage == ServoRefillStage::NONE) {
       startServoMove(1, cfg.servo1StartUs);
       servoRefillStage = ServoRefillStage::SERVO1_TO_END;
@@ -727,6 +786,9 @@ String activityText() {
 // (lebih spesifik) kalau keduanya lagi jalan barengan -- STATE (RUNNING_OR_MOVING) tetap
 // nunjukin node sedang sibuk terlepas dari detail aktivitas mana yang kepilih di sini.
 ActivityCode activityCode() {
+  // BARU: TEST REFILL LOOP prioritas tertinggi -- biar Orange Pi/skrip remote bisa TAU
+  // kenapa command lain (SET_CONVEYOR_ON_OFF dkk) ditolak, tanpa perlu akses Serial USB device.
+  if (testLoopStage != TestLoopStage::OFF) return ActivityCode::TEST_LOOP_AKTIF;
   switch (servoRefillStage) {
     case ServoRefillStage::SERVO1_TO_END:   return ActivityCode::SERVO1_BUKA;
     case ServoRefillStage::SERVO1_HOLD:     return ActivityCode::SERVO1_TAHAN;
@@ -779,7 +841,27 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // abis kirim command cuma lihat IDLE lagi -- kesannya command selesai/diabaikan, padahal
     // masih pending nunggu ACK_PACKAGE_TAKEN, TANPA sinyal FAULT/apapun. Sekarang SEMUA guard
     // dicek DI SINI, sebelum currentState berubah sama sekali -- reject SELALU eksplisit & instan.
+    case Cmd::START_MAIN:
+      if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
+        Serial.println("[CMD] START_MAIN ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
+        return;
+      }
+      if (testLoopStage != TestLoopStage::OFF) {
+        Serial.println("[CMD] START_MAIN ditolak -- TEST REFILL LOOP masih aktif, matikan dulu");
+        return;
+      }
+      mainModeActive = true;
+      Serial.println("[CMD] START_MAIN -- mode produksi otomatis AKTIF, command TEST diblokir sampai STOP_MAIN");
+      break;
+    case Cmd::STOP_MAIN:
+      mainModeActive = false;
+      Serial.println("[CMD] STOP_MAIN -- mode produksi otomatis MATI, command TEST boleh dipakai lagi");
+      break;
     case Cmd::REQUEST_REFILL:
+      if (!mainModeActive) {
+        Serial.println("[CMD] REQUEST_REFILL ditolak -- MAIN belum aktif, kirim START_MAIN dulu");
+        return;
+      }
       if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
         Serial.println("[CMD] REQUEST_REFILL ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
         return;
@@ -798,6 +880,17 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb sebelum di-nol-kan
       faultCode = 0; currentState = NodeState::IDLE; enterRefillState(RefillState::IDLE);
+      // BARU: RESET_FAULT sekarang JUGA paksa keluar dari TEST REFILL LOOP kalau kesisa aktif
+      // dari testing sebelumnya -- ini blocker tersembunyi yang gak keliatan dari Orange Pi
+      // (pesan "ditolak" cuma tercetak ke Serial USB device, gak lewat Modbus), jadi tanpa
+      // ini operator remote gak ada cara "bebasin paksa" node yang kesangkut testLoopStage.
+      if (testLoopStage != TestLoopStage::OFF) {
+        testLoopStopOutputs();
+        testLoopStage = TestLoopStage::OFF;
+        Serial.println("[CMD] RESET_FAULT -- TEST REFILL LOOP ikut dipaksa berhenti");
+      }
+      forceMiddleRefillActive = false;
+      forceServoScheduled = false;
       break;
     case Cmd::SET_CONVEYOR_SPEED:
       cfg.conveyorSpeed = (uint8_t)constrain(arg, 0, 255);
@@ -808,18 +901,48 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // BARU: Orange Pi konfirmasi arm SUDAH ambil package di UJUNG -- clear PACKAGE_READY_FLAG,
     // baru REQUEST_REFILL berikutnya diizinkan lanjut (lihat guard di handleRefillFSM IDLE).
     case Cmd::ACK_PACKAGE_TAKEN:
+      if (!mainModeActive) { Serial.println("[CMD] ACK_PACKAGE_TAKEN ditolak -- MAIN belum aktif"); return; }
       mb.Hreg(Reg::PACKAGE_READY_FLAG, 0);
       Serial.println("[CMD] ACK_PACKAGE_TAKEN -- PACKAGE_READY_FLAG di-clear");
       break;
-    case Cmd::FORCE_MIDDLE_REFILL: startForceMiddleRefill(); break;
+    case Cmd::FORCE_MIDDLE_REFILL:
+      if (!mainModeActive) { Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- MAIN belum aktif"); return; }
+      startForceMiddleRefill();
+      break;
     // BARU -- biar Orange Pi bisa tuning kecepatan servo langsung, runtime-only (gak auto-save
     // NVS -- simpan permanen tetap lewat LCD '#' kalau mau bertahan setelah reboot).
     case Cmd::SET_SERVO1_STEP:          cfg.servo1StepUs = (uint16_t)constrain(arg, 1, 2500); break;
     case Cmd::SET_SERVO1_STEP_INTERVAL: cfg.servo1StepIntervalMs = (uint16_t)constrain(arg, 0, 500); break;
     case Cmd::SET_SERVO2_STEP:          cfg.servo2StepUs = (uint16_t)constrain(arg, 1, 2500); break;
     case Cmd::SET_SERVO2_STEP_INTERVAL: cfg.servo2StepIntervalMs = (uint16_t)constrain(arg, 0, 500); break;
-    case Cmd::TEST_SERVO1_CYCLE: startTestServoCycle(1); break;
-    case Cmd::TEST_SERVO2_CYCLE: startTestServoCycle(2); break;
+    // BARU: semua command TEST/jog di bawah ini DITOLAK TOTAL selama mainModeActive -- Orange
+    // Pi wajib STOP_MAIN dulu. Ini gantiin guard granular satu-satu yang sebelumnya rawan bolong
+    // (lihat kasus MOVE_SERVOx_TO vs servoRefillStage otomatis yang baru ketemu & diperbaiki).
+    case Cmd::SET_CONVEYOR_ON_OFF:
+      if (mainModeActive) { Serial.println("[CMD] SET_CONVEYOR_ON_OFF ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
+      if (refillState != RefillState::IDLE || testLoopStage != TestLoopStage::OFF || forceMiddleRefillActive) {
+        Serial.println("[CMD] SET_CONVEYOR_ON_OFF ditolak -- ada siklus otomatis lain sedang jalan");
+        break;
+      }
+      setConveyorManual(arg != 0);
+      Serial.printf("[CMD] SET_CONVEYOR_ON_OFF -- conveyor %s\n", arg != 0 ? "ON" : "OFF");
+      break;
+    case Cmd::MOVE_SERVO1_TO:
+      if (mainModeActive) { Serial.println("[CMD] MOVE_SERVO1_TO ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
+      startMoveServoTo(1, arg != 0);
+      break;
+    case Cmd::MOVE_SERVO2_TO:
+      if (mainModeActive) { Serial.println("[CMD] MOVE_SERVO2_TO ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
+      startMoveServoTo(2, arg != 0);
+      break;
+    case Cmd::TEST_SERVO1_CYCLE:
+      if (mainModeActive) { Serial.println("[CMD] TEST_SERVO1_CYCLE ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
+      startTestServoCycle(1);
+      break;
+    case Cmd::TEST_SERVO2_CYCLE:
+      if (mainModeActive) { Serial.println("[CMD] TEST_SERVO2_CYCLE ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
+      startTestServoCycle(2);
+      break;
     default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); break;
   }
 }
@@ -1580,6 +1703,8 @@ void setup() {
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::PACKAGE_READY_FLAG, 0);   // BARU -- mekanisme 2-proximity
   mb.addHreg(Reg::MIDDLE_PACKAGE_PRESENT, 0);   // BARU -- status live PROX_2 utk cek startup
+  mb.addHreg(Reg::UJUNG_PACKAGE_PRESENT, 0);    // BARU -- status live PROX_1 (UJUNG)
+  mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);         // BARU -- status live MAIN vs TEST mode
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
@@ -1632,6 +1757,9 @@ void loop() {
   mb.Hreg(Reg::I2C_ERROR_COUNT, i2cErrorCount);
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
+  // BARU: status live PROX_BOX_ARRIVED (UJUNG), simetris dgn MIDDLE_PACKAGE_PRESENT.
+  mb.Hreg(Reg::UJUNG_PACKAGE_PRESENT, io.read(CH::PROX_BOX_ARRIVED) == LOW ? 1 : 0);
+  mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
 
   static uint32_t lastMcpHealthCheck = 0;
   if (millis() - lastMcpHealthCheck > 2000) {
@@ -1680,6 +1808,7 @@ void loop() {
     updateRefillJoin();         // BARU -- currentState balik IDLE hanya kalau semua cabang SUDAH tuntas
   }
   updateTestServoCycle();   // BARU -- proses test sequence non-blocking (independen dari RefillState produksi)
+  updateManualServoMove();  // BARU -- proses jog manual 1 arah MOVE_SERVO1_TO/MOVE_SERVO2_TO
   updateTestRefillLoop();   // BARU -- TEST REFILL LOOP, independen total dari RefillState produksi
   updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking
 

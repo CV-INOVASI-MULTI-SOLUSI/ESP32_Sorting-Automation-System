@@ -27,6 +27,9 @@ namespace Reg {
   constexpr uint16_t I2C_ERROR_COUNT  = 14;  // R -- naik tiap kali recheckHealth() gagal, indikasi EMI/gangguan fisik
   constexpr uint16_t LAST_FAULT_CODE  = 15;  // R -- fault TERAKHIR yang pernah terjadi (breadcrumb, walau sudah di-reset)
   constexpr uint16_t UPTIME_SEC       = 16;  // R -- detik sejak boot -- korelasikan dgn kapan fault/error terjadi
+  // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi, START
+  // sudah dikirim) atau TEST (manual, aman dipakai TEST_HOPPER_CYCLE/SET_MOTOR_A dkk).
+  constexpr uint16_t MAIN_MODE_ACTIVE = 17;  // R, 1 = MAIN aktif, 0 = TEST mode
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik (bukan cuma IDLE/RUNNING generik) ---

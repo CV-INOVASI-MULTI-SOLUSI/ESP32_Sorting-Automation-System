@@ -29,6 +29,13 @@ namespace Reg {
   // BARU: status live PACKAGE_MIDDLE_SENSOR (PROX_2) -- Orange Pi butuh ini buat cek startup
   // ("apa udah ada package siap diisi di tengah?") tanpa nunggu edge trigger produksi.
   constexpr uint16_t MIDDLE_PACKAGE_PRESENT = 16;  // R, 1 = ada package terdeteksi di tengah
+  // BARU: status live PROX_BOX_ARRIVED (PROX_1, UJUNG) -- simetris dgn MIDDLE_PACKAGE_PRESENT,
+  // buat Orange Pi/skrip test poll status UJUNG langsung tanpa lewat PACKAGE_READY_FLAG (yang
+  // cuma ke-set otomatis lewat alur REQUEST_REFILL, gak reflect sensor mentah pas mode manual).
+  constexpr uint16_t UJUNG_PACKAGE_PRESENT = 17;  // R, 1 = ada package terdeteksi di ujung
+  // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi otomatis)
+  // atau TEST (manual) tanpa perlu nebak dari efek command lain.
+  constexpr uint16_t MAIN_MODE_ACTIVE = 18;  // R, 1 = MAIN aktif, 0 = TEST mode
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik FEEDER (refillState yg sudah ada) ---
@@ -40,6 +47,10 @@ enum class ActivityCode : uint16_t {
   SERVO2_BUKA = 5, SERVO2_TAHAN = 6, SERVO2_TUTUP = 7,
   SELESAI = 8,
   TUNGGU_KONFIRM_TENGAH = 9,   // BARU -- servo selesai jatuhin, nunggu PACKAGE_MIDDLE_SENSOR konfirmasi
+  // BARU -- biar Orange Pi/skrip jarak jauh BISA TAU TEST REFILL LOOP lagi aktif lewat Modbus
+  // (sebelumnya blind spot total -- pesan "ditolak" cuma tercetak ke Serial USB device, gak
+  // ada jejak apapun di register, operator remote gak ada cara tau kenapa command lain ditolak).
+  TEST_LOOP_AKTIF = 10,
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
 };
 
@@ -74,6 +85,23 @@ enum class Cmd : uint16_t {
   SET_SERVO1_STEP_INTERVAL = 8,  // arg: servo1StepIntervalMs, 0-500
   SET_SERVO2_STEP = 9,           // arg: servo2StepUs, 1-2500
   SET_SERVO2_STEP_INTERVAL = 10, // arg: servo2StepIntervalMs, 0-500
+  // BARU -- jog manual conveyor ON/OFF (sama konsep dgn SORTER::SET_MOTOR_A), TIDAK terikat
+  // ke sensor apapun -- ganti nyala/mati bebas. Ditolak kalau ada siklus otomatis lain (refill/
+  // force-refill/test-loop) yang lagi jalan, biar gak rebutan output fisik yang sama.
+  SET_CONVEYOR_ON_OFF = 11,      // arg: 0=mati, 1=nyala (arah ikut cfg.conveyorDir)
+  // BARU -- jog manual 1 arah (BUKAN round-trip kayak TEST_SERVOx_CYCLE), buat kebutuhan
+  // masukin package pertama kali manual (operator buka gerbang, taruh package, tutup lagi
+  // pakai command terpisah -- gak otomatis balik sendiri kayak test cycle).
+  MOVE_SERVO1_TO = 12,   // arg: 0=titik awal (servo1StartUs), 1=titik akhir (servo1EndUs)
+  MOVE_SERVO2_TO = 13,   // arg: 0=titik awal (servo2StartUs), 1=titik akhir (servo2EndUs)
+  // BARU -- pemisah MAIN/TEST eksplisit: Orange Pi (master) WAJIB kirim START_MAIN dulu
+  // sebelum produksi otomatis (REQUEST_REFILL/FORCE_MIDDLE_REFILL/ACK_PACKAGE_TAKEN + trigger
+  // otomatis handleMiddleSensor()) mau jalan. Default boot = mainModeActive FALSE (fail-safe,
+  // sama prinsip "boot-IDLE" yang dipakai di semua node) -- SEBELUM ini, node cuma bisa
+  // dipakai testing manual (SET_CONVEYOR_ON_OFF/MOVE_SERVOx_TO/TEST_SERVOx_CYCLE/TESTLOOP).
+  // Command TEST DITOLAK TOTAL selama MAIN aktif (dan sebaliknya) -- gak ada celah bentrok lagi.
+  START_MAIN = 14,
+  STOP_MAIN = 15,
   TEST_SERVO1_CYCLE = 97,   // test-only -- 1x siklus maju-mundur pakai nilai KALIBRASI servo1
   TEST_SERVO2_CYCLE = 98    // test-only -- 1x siklus maju-mundur pakai nilai KALIBRASI servo2
 };

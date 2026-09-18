@@ -75,6 +75,10 @@ void lcdBootProgress(const char* stepLabel) {
 
 NodeState currentState = NodeState::INIT;
 uint16_t faultCode = 0;
+// BARU: pemisah MAIN/TEST -- default FALSE (fail-safe, boot-IDLE). Cmd::START menyalakan ini
+// (BUKAN cuma currentState), Cmd::STOP mematikannya lagi. Command TEST (SET_MOTOR_A/
+// TEST_HOPPER_CYCLE/TEST_TRIGGER_PALANG) DITOLAK TOTAL selama mainModeActive.
+bool mainModeActive = false;
 // BARU: Lapis 3 diagnostik -- bantu identifikasi masalah intermiten (mis. EMI relay) dari jarak jauh
 uint16_t i2cErrorCount = 0;
 uint16_t lastFaultCode = 0;
@@ -540,9 +544,14 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
         Serial.println("[CMD] START ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
       } else {
         currentState = NodeState::RUNNING_OR_MOVING;
+        mainModeActive = true;   // BARU -- MAIN aktif, command TEST diblokir sampai STOP
+        Serial.println("[CMD] START -- MAIN aktif, command TEST diblokir sampai STOP");
       }
       break;
-    case Cmd::STOP:  currentState = NodeState::IDLE; break;
+    case Cmd::STOP:
+      currentState = NodeState::IDLE;
+      mainModeActive = false;   // BARU -- balik ke TEST mode, command TEST boleh dipakai lagi
+      break;
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb, simpan SEBELUM di-nol-kan
       faultCode = 0; currentState = NodeState::IDLE;
@@ -558,14 +567,24 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       passCount = 0; rejectCount = 0;
       mb.Hreg(Reg::PASS_COUNT, 0); mb.Hreg(Reg::REJECT_COUNT, 0);
       break;
-    case Cmd::SET_MOTOR_A: setMotorA((uint8_t)constrain(arg, 0, 2)); break;
+    // BARU: command TEST/jog di bawah DITOLAK TOTAL selama mainModeActive -- Orange Pi wajib
+    // STOP dulu. SET_PALANG_SPEED/SET_HOPPER_STEP DIKECUALIKAN (cuma tuning angka, gak gerakin
+    // apa-apa sendiri, sengaja tetap boleh live selama produksi jalan).
+    case Cmd::SET_MOTOR_A:
+      if (mainModeActive) { Serial.println("[CMD] SET_MOTOR_A ditolak -- MAIN aktif, STOP dulu"); break; }
+      setMotorA((uint8_t)constrain(arg, 0, 2));
+      break;
     // BARU -- biar Orange Pi bisa tuning kecepatan langsung. Sama pola dgn SET_CONVEYOR_SPEED/
     // SET_HOPPER_INTERVAL di atas (runtime-only, gak auto-save NVS -- simpan permanen tetap
     // lewat LCD '#' kalau mau bertahan setelah reboot).
     case Cmd::SET_PALANG_SPEED: cfg.palangSpeed = (uint8_t)constrain(arg, 0, 255); break;
     case Cmd::SET_HOPPER_STEP:  cfg.hopperStepUs = (uint16_t)constrain(arg, 1, 2500); break;
-    case Cmd::TEST_HOPPER_CYCLE: startTestHopperCycle(); break;
+    case Cmd::TEST_HOPPER_CYCLE:
+      if (mainModeActive) { Serial.println("[CMD] TEST_HOPPER_CYCLE ditolak -- MAIN aktif, STOP dulu"); break; }
+      startTestHopperCycle();
+      break;
     case Cmd::TEST_TRIGGER_PALANG:
+      if (mainModeActive) { Serial.println("[CMD] TEST_TRIGGER_PALANG ditolak -- MAIN aktif, STOP dulu"); break; }
       enqueueClassification(true, millis());
       Serial.println("[SORTER] TEST_TRIGGER_PALANG -- simulasi reject dikirim");
       break;
@@ -1534,6 +1553,7 @@ void setup() {
   mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0);
   mb.addHreg(Reg::UPTIME_SEC, 0);
+  mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   mb.onSetHreg(Reg::CLASSIFY_IS_REJECT, onClassifyWrite);
   Serial.println("[BOOT] Modbus + register lengkap OK");
@@ -1607,6 +1627,7 @@ void loop() {
   mb.Hreg(Reg::I2C_ERROR_COUNT, i2cErrorCount);
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
+  mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
 
   // --- Logic fisik (safety, conveyor, palang, sensor) SELALU jalan, baik menu aktif atau tidak ---
   // DIUBAH: sebelumnya bagian ini ikut di-skip saat menu aktif, sekarang tetap jalan supaya

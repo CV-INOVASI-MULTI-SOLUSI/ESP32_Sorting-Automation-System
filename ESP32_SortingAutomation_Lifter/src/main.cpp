@@ -67,6 +67,10 @@ void lcdBootProgress(const char* stepLabel) {
 
 NodeState currentState = NodeState::INIT;
 uint16_t faultCode = 0;
+// BARU: pemisah MAIN/TEST -- default FALSE (fail-safe, boot-IDLE). RUN_FULL_CYCLE (produksi)
+// butuh MAIN aktif; MOVE_TO_RACK/PUSH_BOX (manual) butuh TEST mode. HOME_ALL/GOTO_LOAD_POSITION
+// sengaja TIDAK ikut di-gate (dipakai bareng produksi & Test Rak).
+bool mainModeActive = false;
 // BARU: Lapis 3 diagnostik -- sinkron pola SORTER
 uint16_t i2cErrorCount = 0;
 uint16_t lastFaultCode = 0;
@@ -695,6 +699,15 @@ bool blockIfFaulted(const char* opName, uint16_t seq) {
 
 void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
   switch ((Cmd)opcode) {
+    case Cmd::START_MAIN:
+      if (blockIfFaulted("START_MAIN", seq)) return;
+      mainModeActive = true;
+      Serial.println("[CMD] START_MAIN -- MAIN aktif, MOVE_TO_RACK/PUSH_BOX diblokir sampai STOP_MAIN");
+      mb.Hreg(Reg::CMD_ACK_SEQ, seq); return;
+    case Cmd::STOP_MAIN:
+      mainModeActive = false;
+      Serial.println("[CMD] STOP_MAIN -- MAIN mati, MOVE_TO_RACK/PUSH_BOX boleh dipakai lagi");
+      mb.Hreg(Reg::CMD_ACK_SEQ, seq); return;
     case Cmd::HOME_ALL:
       if (blockIfFaulted("HOME_ALL", seq)) return;
       startHomingInternal();
@@ -702,6 +715,7 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       ackPending = true; pendingAckSeq = seq; return;
     case Cmd::RUN_FULL_CYCLE:
       if (blockIfFaulted("RUN_FULL_CYCLE", seq)) return;
+      if (!mainModeActive) { Serial.println("[CMD] RUN_FULL_CYCLE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       if (!homed[1] || curPos[1] != 0) { faultCode = (uint16_t)FaultCode::NOT_HOMED; mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       currentState = NodeState::RUNNING_OR_MOVING;
@@ -711,11 +725,13 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       ackPending = true; pendingAckSeq = seq; return;
     case Cmd::MOVE_TO_RACK:
       if (blockIfFaulted("MOVE_TO_RACK", seq)) return;
+      if (mainModeActive) { Serial.println("[CMD] MOVE_TO_RACK ditolak -- MAIN aktif, STOP_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       currentState = NodeState::RUNNING_OR_MOVING;
       ackPending = true; pendingAckSeq = seq; return;
     case Cmd::PUSH_BOX:
       if (blockIfFaulted("PUSH_BOX", seq)) return;
+      if (mainModeActive) { Serial.println("[CMD] PUSH_BOX ditolak -- MAIN aktif, STOP_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       tgtPos[1] = curPos[1] + pushExtendSteps;
       state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
@@ -1525,6 +1541,7 @@ void setup() {
   mb.addHreg(Reg::RACK_OCCUPIED_BITMASK, 0);
   mb.addHreg(Reg::ACTIVITY_CODE, 0); mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
+  mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
@@ -1593,6 +1610,7 @@ void loop() {
   mb.Hreg(Reg::I2C_ERROR_COUNT, i2cErrorCount);
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
+  mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
   bool pauseAutoIndicators = (menuState == MenuState::TEST_OUTPUT_ITEM && OUTPUT_TEST_ITEMS[outputTestCursor].autoControlled);
   if (!pauseAutoIndicators) updateUniversalIndicators();
 

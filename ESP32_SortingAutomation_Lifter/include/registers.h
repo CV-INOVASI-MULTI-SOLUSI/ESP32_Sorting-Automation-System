@@ -22,6 +22,9 @@ namespace Reg {
   constexpr uint16_t I2C_ERROR_COUNT = 14;  // R
   constexpr uint16_t LAST_FAULT_CODE = 15;  // R
   constexpr uint16_t UPTIME_SEC      = 16;  // R
+  // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi,
+  // RUN_FULL_CYCLE boleh) atau TEST (manual, MOVE_TO_RACK/PUSH_BOX boleh).
+  constexpr uint16_t MAIN_MODE_ACTIVE = 17;  // R, 1 = MAIN aktif, 0 = TEST mode
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik STOCKER (cycleStage yg sudah ada) ---
@@ -52,5 +55,12 @@ enum class Cmd : uint16_t {
   GOTO_LOAD_POSITION = 6,  // BARU -- manual, menuju Load Position (titik standby terima package)
   // BARU -- biar kecepatan bisa di-tuning dari Orange Pi langsung, gak wajib lewat LCD/Serial lokal.
   SET_STEP_INTERVAL = 7,         // arg: stepIntervalUs (kecepatan jelajah normal), 20-5000
-  SET_HOMING_STEP_INTERVAL = 8   // arg: homingStepIntervalUs (kecepatan khusus homing), 20-5000
+  SET_HOMING_STEP_INTERVAL = 8,  // arg: homingStepIntervalUs (kecepatan khusus homing), 20-5000
+  // BARU -- pemisah MAIN/TEST eksplisit (sama konsep dgn SORTER/DISPENSER/PICKER). Default
+  // boot = mainModeActive FALSE. RUN_FULL_CYCLE (produksi) ditolak selama TEST mode;
+  // MOVE_TO_RACK/PUSH_BOX (manual) ditolak selama MAIN aktif. HOME_ALL/GOTO_LOAD_POSITION
+  // SENGAJA TIDAK di-gate (dipakai bareng produksi & Test Rak, gak ada auto-trigger background
+  // di Stocker yang bisa bentrok kayak kasus Dispenser).
+  START_MAIN = 9,
+  STOP_MAIN = 10
 };

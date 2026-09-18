@@ -20,6 +20,9 @@ namespace Reg {
   constexpr uint16_t I2C_ERROR_COUNT = 12;  // R
   constexpr uint16_t LAST_FAULT_CODE = 13;  // R
   constexpr uint16_t UPTIME_SEC      = 14;  // R
+  // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi) atau
+  // TEST (manual, aman dipakai GOTO_HOME/GOTO_PASS/GOTO_REJECT/PICK/PLACE).
+  constexpr uint16_t MAIN_MODE_ACTIVE = 15;  // R, 1 = MAIN aktif, 0 = TEST mode
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik PICKER ---
@@ -49,5 +52,11 @@ enum class Cmd : uint16_t {
   // BARU -- biar kecepatan trajectory (berlaku SAMA ke semua 6 joint) bisa di-tuning dari
   // Orange Pi langsung, gak wajib lewat LCD/Serial lokal.
   SET_TRAJ_STEP = 9,           // arg: trajStepUs, 1-500
-  SET_TRAJ_STEP_INTERVAL = 10  // arg: trajStepIntervalMs, 5-200
+  SET_TRAJ_STEP_INTERVAL = 10, // arg: trajStepIntervalMs, 5-200
+  // BARU -- pemisah MAIN/TEST eksplisit (sama konsep dgn SORTER/DISPENSER/STOCKER). Default
+  // boot = mainModeActive FALSE. Selama MAIN aktif, command "manual override" (GOTO_HOME/
+  // GOTO_PASS/GOTO_REJECT/PICK/PLACE) DITOLAK TOTAL -- cuma RUN_SEQUENCE/MOVE_PACKAGE (produksi
+  // asli) yang jalan. Sebaliknya, RUN_SEQUENCE/MOVE_PACKAGE ditolak selama masih TEST mode.
+  START_MAIN = 11,
+  STOP_MAIN = 12
 };
