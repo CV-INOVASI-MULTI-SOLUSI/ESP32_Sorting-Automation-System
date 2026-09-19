@@ -198,27 +198,44 @@ def middle_triggered(instr):
         return False
 
 
-def conveyor_on_if_safe(instr, label="SET_CONVEYOR_ON_OFF(1)"):
-    """BARU -- dipakai di poin [13] (BUKAN [9b], lihat catatan di situ). Cuma nyalain
-    conveyor kalau PROX_2 LAGI GAK trigger -- soalnya kalau iya, artinya guard universal
-    (stop_conveyor_if_middle_triggered, dipanggil selama servo watch [10]/[12]) BARU AJA
-    matiin conveyor gara-gara package baru dateng -- ngirim ON lagi di sini bakal nge-undo
-    keputusan guard itu, jangan sampai."""
+def conveyor_on_if_safe(instr, label="SET_CONVEYOR_ON_OFF(1)", wait_timeout_s=PROX_WAIT_TIMEOUT_S):
+    """Dipakai di poin [13] (BUKAN [9b], lihat catatan di situ). Kalau PROX_2 lagi trigger --
+    artinya guard universal (stop_conveyor_if_middle_triggered, dipanggil selama servo watch
+    [10]/[12]) BARU AJA matiin conveyor gara-gara package baru dateng -- TUNGGU dulu sampai
+    PROX_2 CLEAR, baru nyalain lagi.
+
+    DIPERBAIKI (Celah A, ditemukan 2026-09-20): versi lama cuma CEK SEKALI, langsung nyerah
+    kalau masih trigger (conveyor dibiarkan mati selamanya, gak pernah dicoba nyalain lagi).
+    Akibatnya package 1 gak pernah kebawa maju, [14] nunggu PROX_1 yang GAK AKAN PERNAH trigger
+    (conveyor mati), sampai timeout 120 detik baru seluruh script ke-abort. Sekarang nunggu
+    PROX_2 clear dulu (self-healing begitu package berikutnya udah lewat/diisi), baru nyalain --
+    cuma gagal beneran (return False, caller break) kalau PROX_2 GENUINELY macet/gak pernah
+    clear sampai wait_timeout_s (indikasi hardware, bukan cuma dua package numpuk deket-deketan)."""
     if middle_triggered(instr):
-        print("  !! PROX_2 masih/baru trigger -- conveyor DITAHAN mati (package sedang diisi), gak dinyalain di poin ini.")
-        return True   # bukan kegagalan -- ini keputusan yang BENAR, loop tetap lanjut
+        print("  !! PROX_2 masih/baru trigger -- tunggu CLEAR dulu sebelum nyalain conveyor lagi...")
+        if not wait_prox(instr, "PROX_2 (TENGAH) clear", REG_MIDDLE_PACKAGE_PRESENT, 0, timeout=wait_timeout_s):
+            print("  !! TIMEOUT nunggu PROX_2 clear -- conveyor TETAP mati, kemungkinan sensor macet/hardware.")
+            return False
+        print("  .. PROX_2 clear, lanjut nyalain conveyor")
     return do_command(instr, label, CMD_SET_CONVEYOR_ON_OFF, arg=1)
 
 
+_middle_guard_already_stopped = False   # BARU -- lihat catatan Celah B di stop_conveyor_if_middle_triggered()
+
 def stop_conveyor_if_middle_triggered(instr):
-    """BARU -- cek PROX_2, kalau trigger langsung kirim SET_CONVEYOR_ON_OFF(0) (best-effort,
-    gak nunggu ack lama, gak ganggu proses utama yang lagi jalan). Dipanggil BERULANG dari
-    do_command() (servo watch) dan timing_placeholder() -- biar reaktif, gak nunggu sampai
-    poin [14]/[16] baru ketauan. Aman dipanggil berkali-kali (idempotent secara fisik)."""
+    """Cek PROX_2, kalau trigger kirim SET_CONVEYOR_ON_OFF(0) SEKALI SAJA per episode trigger
+    (bukan tiap poll -- lihat Celah B, ditemukan 2026-09-20: dulu fungsi ini SPAM
+    SET_CONVEYOR_ON_OFF(0) tiap 0.2 detik SELAMA PROX_2 masih trigger, karena gak ada
+    penanda 'udah pernah kirim'. Sekarang edge-triggered -- flag di-reset begitu PROX_2
+    balik clear, biar episode trigger BERIKUTNYA tetap kedeteksi & direaksi)."""
+    global _middle_guard_already_stopped
     if middle_triggered(instr):
-        print("  !! [guard universal] PROX_2 trigger -- conveyor di-stop SEKARANG (package sedang diisi).")
-        do_command(instr, "SET_CONVEYOR_ON_OFF(0) [guard]", CMD_SET_CONVEYOR_ON_OFF, arg=0)
+        if not _middle_guard_already_stopped:
+            print("  !! [guard universal] PROX_2 trigger -- conveyor di-stop SEKARANG (package sedang diisi).")
+            do_command(instr, "SET_CONVEYOR_ON_OFF(0) [guard]", CMD_SET_CONVEYOR_ON_OFF, arg=0)
+            _middle_guard_already_stopped = True
         return True
+    _middle_guard_already_stopped = False
     return False
 
 
@@ -270,20 +287,23 @@ def wait_prox(instr, label, reg_addr, want_value, timeout=PROX_WAIT_TIMEOUT_S):
 
 
 def wait_prox_with_middle_guard(instr, label, reg_addr, want_value, timeout=PROX_WAIT_TIMEOUT_S):
-    """BARU -- dipakai KHUSUS di poin [14] dan [16], selama conveyor lagi jalan nungguin
-    package sampai UJUNG/diambil. Sensor PROX_2 (TENGAH) dipantau PARALEL (bareng PROX_1) --
-    kalau PROX_2 kedeteksi trigger LAGI di tengah nunggu ini (artinya package BERIKUTNYA udah
-    sampai TENGAH selagi package SEBELUMNYA masih di depan/UJUNG), conveyor langsung di-stop
-    (SET_CONVEYOR_ON_OFF(0)) SEKALI SAJA -- tapi fungsi TETAP LANJUT nunggu kondisi utama
-    (PROX_1), BUKAN break/berhenti total (DIUBAH -- keputusan sebelumnya "hentikan total"
-    dibalik lagi: harus lanjut proses, bukan berhenti)."""
+    """Dipakai KHUSUS di poin [14] (BUKAN [16] lagi -- lihat catatan di situ), selama conveyor
+    lagi jalan nungguin package sampai UJUNG. Sensor PROX_2 (TENGAH) dipantau PARALEL (bareng
+    PROX_1) -- kalau PROX_2 kedeteksi trigger LAGI (package berikutnya udah sampai TENGAH
+    selagi package SEBELUMNYA masih menuju UJUNG), conveyor di-stop SEMENTARA.
+
+    DIPERBAIKI (Celah A-2, kelas masalah SAMA dgn conveyor_on_if_safe -- ditemukan 2026-09-20):
+    dulu abis conveyor di-stop SEKALI, TIDAK PERNAH dinyalain lagi -- padahal kondisi UTAMA yang
+    ditunggu di sini (PROX_1 trigger) SENDIRI butuh conveyor jalan biar package sampai ke situ.
+    "Lanjut nunggu" versi lama tetap ujung-ujungnya timeout 120 detik, cuma nundur waktunya.
+    Sekarang: begitu PROX_2 clear lagi, conveyor otomatis DINYALAKAN ULANG, baru lanjut nunggu
+    kondisi utama seperti biasa -- self-healing, gak butuh intervensi manual."""
     kata = "trigger" if want_value == 1 else "CLEAR (gak ke-deteksi lagi)"
-    print(f"  .. TUNGGU {label} {kata} (PARAREL: pantau PROX_2 juga, stop conveyor kalau kepencet lagi, TETAP LANJUT nunggu)")
+    print(f"  .. TUNGGU {label} {kata} (PARAREL: pantau PROX_2 juga, stop+resume conveyor otomatis kalau kepencet lagi)")
     if DRY_RUN:
         print(f"  .. (DRY_RUN) anggap {label} sudah {kata}")
         return True
     deadline = time.monotonic() + timeout
-    middle_guard_fired = False   # BARU -- cuma kirim conveyor-off SEKALI, gak spam tiap poll
     while time.monotonic() < deadline:
         try:
             val = instr.read_register(reg_addr, functioncode=3)
@@ -293,16 +313,17 @@ def wait_prox_with_middle_guard(instr, label, reg_addr, want_value, timeout=PROX
         except Exception as e:
             print(f"  !! DISPENSER: gagal baca {label} ({e}), retry...")
 
-        if not middle_guard_fired:
-            try:
-                middle = instr.read_register(REG_MIDDLE_PACKAGE_PRESENT, functioncode=3)
-                if middle == 1:
-                    print("  !! PROX_2 (TENGAH) kepencet LAGI -- package berikutnya udah sampai."
-                          " Conveyor di-stop, TAPI tetap lanjut nunggu PROX_1.")
-                    do_command(instr, "SET_CONVEYOR_ON_OFF(0) [PROX_2 guard]", CMD_SET_CONVEYOR_ON_OFF, arg=0)
-                    middle_guard_fired = True
-            except Exception as e:
-                print(f"  !! DISPENSER: gagal baca PROX_2 guard ({e}), retry...")
+        if middle_triggered(instr):
+            print("  !! PROX_2 (TENGAH) kepencet LAGI -- package berikutnya udah sampai. Conveyor di-stop sementara.")
+            do_command(instr, "SET_CONVEYOR_ON_OFF(0) [PROX_2 guard]", CMD_SET_CONVEYOR_ON_OFF, arg=0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not wait_prox(instr, "PROX_2 (TENGAH) clear", REG_MIDDLE_PACKAGE_PRESENT, 0, timeout=remaining):
+                print("  !! TIMEOUT nunggu PROX_2 clear -- kemungkinan sensor macet/hardware, bukan cuma dua package numpuk.")
+                break
+            print("  .. PROX_2 clear -- nyalain conveyor lagi, lanjut nunggu")
+            do_command(instr, "SET_CONVEYOR_ON_OFF(1) [resume after guard]", CMD_SET_CONVEYOR_ON_OFF, arg=1)
 
         time.sleep(PROX_POLL_INTERVAL_S)
     print(f"  !! TIMEOUT: {label} tidak {kata} dalam {timeout}s")
@@ -464,15 +485,19 @@ def main():
             if not conveyor_on_if_safe(dispenser, "SET_CONVEYOR_ON_OFF(1)"):
                 break
 
-            print("\n=== [14] Tunggu package maju melewati PROX_1 (UJUNG) -- PROX_2 dipantau pararel ===")
+            print("\n=== [14] Tunggu package maju melewati PROX_1 (UJUNG) -- PROX_2 dipantau pararel, self-healing ===")
             if not wait_prox_with_middle_guard(dispenser, "PROX_1 (UJUNG)", REG_UJUNG_PACKAGE_PRESENT, 1):
                 break
 
             print("\n=== [15] Kirim command ambil package (TIMING placeholder) ===")
             timing_placeholder(dispenser, "command ambil package", KIRIM_AMBIL_PACKAGE_DELAY_S)
 
-            print("\n=== [16] Tunggu PROX_1 CLEAR -- PROX_2 dipantau pararel juga ===")
-            if not wait_prox_with_middle_guard(dispenser, "PROX_1 (UJUNG)", REG_UJUNG_PACKAGE_PRESENT, 0):
+            # DIUBAH (2026-09-20): [16] BALIK ke wait_prox biasa (TANPA guard PROX_2) --
+            # sesuai instruksi ASLI yang eksplisit soal poin ini: "prox_1 sudah 0 tapi prox_2
+            # belum 0 -> conveyor tetap maju". Temuan #12 kemarin salah perluas guard ke sini
+            # juga, padahal poin 16 punya pengecualian sendiri dari awal.
+            print("\n=== [16] Tunggu PROX_1 CLEAR -- conveyor TETAP MENYALA apapun status PROX_2 ===")
+            if not wait_prox(dispenser, "PROX_1 (UJUNG)", REG_UJUNG_PACKAGE_PRESENT, 0):
                 break
 
             print("\n=== [17] Balik ke poin 6 (tunggu PROX_2 trigger lagi) ===")
