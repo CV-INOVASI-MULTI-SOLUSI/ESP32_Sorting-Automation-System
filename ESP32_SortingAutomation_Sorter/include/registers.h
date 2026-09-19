@@ -35,6 +35,11 @@ namespace Reg {
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik (bukan cuma IDLE/RUNNING generik) ---
 enum class ActivityCode : uint16_t {
   DIAM = 0, CONVEYOR_JALAN = 1, CONVEYOR_JALAN_PALANG_AKTIF = 2, MOTOR_A_JALAN = 3,
+  // BARU: TEST_HOPPER_CYCLE (opcode 97, ATAU tombol fisik BTN_TEST_HOPPER) TIDAK pernah
+  // ubah currentState (sengaja, biar guard-nya cuma butuh currentState==IDLE) -- tanpa
+  // kode ini, ACTIVITY_CODE tetap DIAM(0) walau hopper BENERAN lagi gerak (bug sama persis
+  // yang ketemu di Dispenser TEST_SERVO1/2_CYCLE, lihat catatan analisa 2026-09-19).
+  TEST_HOPPER_AKTIF = 4,
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
 };
 

@@ -50,8 +50,8 @@ namespace CH {
   // di GPA3(ch19), PROX_2 di GPA2(ch18). Harus SAMA di keempat config.h (board universal).
   constexpr uint8_t PROX_1    = 19;   // SORTER -- proximity sorting
   constexpr uint8_t PROX_2    = 18;   // spare
-  constexpr uint8_t BUTTON_2  = 20;   // SORTER -- test pass
-  constexpr uint8_t BUTTON_3  = 21;   // SORTER -- test reject
+  constexpr uint8_t BUTTON_2  = 20;   // SORTER -- test hopper cycle
+  constexpr uint8_t BUTTON_3  = 21;   // SORTER -- test trigger palang
   constexpr uint8_t LIM_1     = 23;   // STOCKER/Dispenser
   constexpr uint8_t LIM_2     = 22;
   constexpr uint8_t LIM_3     = 24;
@@ -69,7 +69,10 @@ namespace CH {
   constexpr uint8_t CONV1_BIN1 = BIN1, CONV1_BIN2 = BIN2;   // conveyor existing
   constexpr uint8_t PALANG_RELAY  = RLY1;
   constexpr uint8_t PROX_PASS     = PROX_2;
-  constexpr uint8_t BTN_TEST_PASS = BUTTON_2, BTN_TEST_REJECT = BUTTON_3;
+  // DIUBAH: tombol fisik gak lagi simulasi klasifikasi pass/reject (celah -- bisa nyelip
+  // masuk produksi kapan saja) -- sekarang trigger test-cycle mekanisme sendiri, TEST-mode
+  // gated, sama pola dgn tombol node lain (Dispenser BTN_TEST_BOX_FULL dkk).
+  constexpr uint8_t BTN_TEST_HOPPER = BUTTON_2, BTN_TEST_PALANG = BUTTON_3;
 }
 
 // --- Native GPIO -- UNIVERSAL, SAMA PERSIS DI SEMUA 4 NODE ---

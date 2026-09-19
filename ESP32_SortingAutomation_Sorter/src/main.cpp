@@ -230,29 +230,40 @@ void enqueueClassification(bool isReject, uint32_t scanTimeMs) {
   qTail = next;
 }
 
-// --- BARU: push button uji manual PASS/REJECT -- panggil enqueueClassification() PERSIS SAMA
-// dengan yang dipakai onClassifyWrite() (jalur Modbus asli dari OrangePi/HuskyLens), supaya
-// perilaku TOF+palang yang diuji lewat tombol 100% identik dengan produksi sesungguhnya. ---
+// DIUBAH TOTAL (celah #1): tombol fisik DULU simulasi klasifikasi pass/reject lewat
+// enqueueClassification() PERSIS SAMA dgn jalur produksi asli (onClassifyWrite) -- masalahnya
+// itu TIDAK di-gate mainModeActive sama sekali, jadi bisa nyelip masuk antrian klasifikasi
+// asli kapan saja (termasuk pas produksi beneran jalan). Sekarang tombol jadi trigger TEST-only
+// (persis pola Cmd::TEST_HOPPER_CYCLE / Cmd::TEST_TRIGGER_PALANG, ditolak kalau mainModeActive)
+// -- konsisten sama tombol node lain (mis. Dispenser BTN_TEST_BOX_FULL).
 void handleTestButtons() {
-  static bool lastPass = HIGH, lastReject = HIGH;
-  static uint32_t lastPassEdge = 0, lastRejectEdge = 0;
+  static bool lastHopper = HIGH, lastPalang = HIGH;
+  static uint32_t lastHopperEdge = 0, lastPalangEdge = 0;
   constexpr uint32_t DEBOUNCE_MS = 50;
 
-  bool curPass = io.read(CH::BTN_TEST_PASS);
-  if (curPass == LOW && lastPass == HIGH && millis() - lastPassEdge > DEBOUNCE_MS) {
-    lastPassEdge = millis();
-    enqueueClassification(false, millis());
-    Serial.println("[TEST-BTN] Tombol PASS ditekan -- simulasi klasifikasi pass");
+  bool curHopper = io.read(CH::BTN_TEST_HOPPER);
+  if (curHopper == LOW && lastHopper == HIGH && millis() - lastHopperEdge > DEBOUNCE_MS) {
+    lastHopperEdge = millis();
+    if (mainModeActive) {
+      Serial.println("[TEST-BTN] Tombol Hopper ditolak -- MAIN aktif, STOP dulu");
+    } else {
+      startTestHopperCycle();
+      Serial.println("[TEST-BTN] Tombol Hopper ditekan -- TEST_HOPPER_CYCLE");
+    }
   }
-  lastPass = curPass;
+  lastHopper = curHopper;
 
-  bool curReject = io.read(CH::BTN_TEST_REJECT);
-  if (curReject == LOW && lastReject == HIGH && millis() - lastRejectEdge > DEBOUNCE_MS) {
-    lastRejectEdge = millis();
-    enqueueClassification(true, millis());
-    Serial.println("[TEST-BTN] Tombol REJECT ditekan -- simulasi klasifikasi reject");
+  bool curPalang = io.read(CH::BTN_TEST_PALANG);
+  if (curPalang == LOW && lastPalang == HIGH && millis() - lastPalangEdge > DEBOUNCE_MS) {
+    lastPalangEdge = millis();
+    if (mainModeActive) {
+      Serial.println("[TEST-BTN] Tombol Palang ditolak -- MAIN aktif, STOP dulu");
+    } else {
+      enqueueClassification(true, millis());
+      Serial.println("[TEST-BTN] Tombol Palang ditekan -- TEST_TRIGGER_PALANG (simulasi reject)");
+    }
   }
-  lastReject = curReject;
+  lastPalang = curPalang;
 }
 
 uint16_t onClassifyWrite(TRegister* reg, uint16_t val) {
@@ -645,8 +656,14 @@ void drawTopMenuSorter() {
 // DIUBAH: "Hopper Interval(ms)" (target durasi tetap) diganti "Hopper Step(us)" + "Hopper Step
 // Interval(ms)" (kecepatan tetap, SAMA pola dgn "Speed (Step/Interval)" PICKER) -- durasi total
 // jadi hasil jarak/kecepatan, bukan dipaksa satu angka yang bisa gak realistis fisiknya.
-constexpr uint8_t CAL_COUNT = 16;
-const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Conveyor Dir", "Palang Speed", "Palang Dir",
+// BARU: "Reset Fault" jadi item PERTAMA -- dulu RESET_FAULT cuma bisa dipicu lewat menu
+// "Test Command" yang terkubur (item ke-6 dari daftar generic simulasi command), gak
+// jelas/gak gampang ditemukan operator pas node FAULT. Sekarang langsung di halaman
+// utama Setting Kalibrasi. Item 1-15 (Conveyor Speed dst) TIDAK berubah urutan/nomornya
+// terhadap selParam (lihat handleCalListKey -- selParam = calCursor, bukan calCursor+1).
+constexpr uint8_t CAL_COUNT = 17;
+const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault",
+                                        "Conveyor Speed", "Conveyor Dir", "Palang Speed", "Palang Dir",
                                         "Palang Push (ms)", "Palang Retract (ms)", "Dist (TOF mm)", "Mm/s Max",
                                         "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Step (us)", "Hopper Step Interval(ms)",
                                         "Hopper Push Hold(ms)",
@@ -685,11 +702,15 @@ void handleCalListKey(char key) {
   if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 15) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
+    if (calCursor == 0) {   // BARU -- "Reset Fault", langsung eksekusi (tidak destruktif, gak perlu konfirmasi)
+      applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
+      lcdPrint(0, 3, "Fault direset!      ");
+      Serial.println("[CAL] Reset Fault dari menu LCD");
+    } else if (calCursor == 16) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
       menuState = MenuState::CONFIRM_RESET;
       drawConfirmReset();
     } else {
-      selParam = calCursor + 1;
+      selParam = calCursor;
       // BARU: aktifkan test-live di KEDUA layar Hopper Step(11)/Step Interval(12) -- operator
       // perlu liat efeknya live pas ngatur salah satu dari dua parameter ini.
       hopperIntervalTestMode = (selParam == 11 || selParam == 12);
@@ -1308,8 +1329,16 @@ void handleSerialCommand() {
   else if (cmd == "RESET_COUNT") applyCommand((uint16_t)Cmd::RESET_COUNTERS, 0);
   else if (cmd == "TEST_PALANG") applyCommand((uint16_t)Cmd::TEST_TRIGGER_PALANG, 0);
   else if (cmd == "TEST_FAULT")  applyCommand((uint16_t)Cmd::TEST_FAULT, 0);
-  else if (cmd == "TESTPASS")    { enqueueClassification(false, millis()); Serial.println("[SERIAL] Simulasi klasifikasi PASS"); }
-  else if (cmd == "TESTREJECT")  { enqueueClassification(true, millis());  Serial.println("[SERIAL] Simulasi klasifikasi REJECT"); }
+  // BARU (celah #1): TESTPASS/TESTREJECT sekarang ikut di-gate mainModeActive juga -- gak boleh
+  // simulasi klasifikasi manual selama produksi asli jalan, sama seperti tombol fisik.
+  else if (cmd == "TESTPASS") {
+    if (mainModeActive) Serial.println("[SERIAL] TESTPASS ditolak -- MAIN aktif, STOP dulu");
+    else { enqueueClassification(false, millis()); Serial.println("[SERIAL] Simulasi klasifikasi PASS"); }
+  }
+  else if (cmd == "TESTREJECT") {
+    if (mainModeActive) Serial.println("[SERIAL] TESTREJECT ditolak -- MAIN aktif, STOP dulu");
+    else { enqueueClassification(true, millis()); Serial.println("[SERIAL] Simulasi klasifikasi REJECT"); }
+  }
   else if (cmd == "MOTORA") { uint8_t d = line.substring(spaceIdx + 1).toInt(); setMotorA(constrain(d, 0, 2)); Serial.printf("[MOTORA] state=%u\n", d); }
   else if (cmd == "MOTORASPEED") {
     cfg.palangSpeed = (uint8_t)constrain((int)line.substring(spaceIdx + 1).toInt(), 0, 255);
@@ -1362,6 +1391,10 @@ String activityText() {
 ActivityCode activityCode() {
   if (currentState == NodeState::FAULT) return ActivityCode::FAULT_AKTIF;
   if (currentState == NodeState::ESTOPPED) return ActivityCode::ESTOP_AKTIF;
+  // BARU: testHopperCycleStage dicek SEBELUM currentState==RUNNING_OR_MOVING -- cycle ini
+  // sengaja gak ubah currentState (tetap IDLE), jadi kalau dicek belakangan gak akan
+  // kesampaian sama sekali. Lihat komentar TEST_HOPPER_AKTIF di registers.h.
+  if (testHopperCycleStage != TestHopperCycleStage::NONE) return ActivityCode::TEST_HOPPER_AKTIF;
   if (motorAState != 0) return ActivityCode::MOTOR_A_JALAN;
   if (currentState != NodeState::RUNNING_OR_MOVING) return ActivityCode::DIAM;
   return palangActive ? ActivityCode::CONVEYOR_JALAN_PALANG_AKTIF : ActivityCode::CONVEYOR_JALAN;
@@ -1482,8 +1515,8 @@ void setup() {
   // Motor A (AIN1/AIN2) -- SEKARANG dipakai produksi utk actuator palang, BUKAN lagi spare.
   io.pinMode(CH::CONV1_AIN1, OUTPUT); io.pinMode(CH::CONV1_AIN2, OUTPUT);
   io.pinMode(CH::PROX_PASS, INPUT_PULLUP);
-  io.pinMode(CH::BTN_TEST_PASS, INPUT_PULLUP);     // BARU
-  io.pinMode(CH::BTN_TEST_REJECT, INPUT_PULLUP);   // BARU
+  io.pinMode(CH::BTN_TEST_HOPPER, INPUT_PULLUP);
+  io.pinMode(CH::BTN_TEST_PALANG, INPUT_PULLUP);
   // DIPERBAIKI (bug ditemukan): channel Test Modul berikut TIDAK PERNAH di-pinMode OUTPUT --
   // io.write() ke pin yang masih default INPUT MCP23017 TIDAK ADA efek fisik sama sekali.
   // Ini penyebab "Test Modul cuma RLY2 doang yang jalan" -- selebihnya diam bukan krn hardware.

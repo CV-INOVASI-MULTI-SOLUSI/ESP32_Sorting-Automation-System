@@ -13,7 +13,7 @@ namespace Reg {
   constexpr uint16_t CMD_ACK_SEQ = 5;
   constexpr uint16_t HEARTBEAT   = 6;
 
-  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home,1=pass,2=reject,3=lift)
+  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home,1=pass,3=lift,4=pickup,5=lift_load)
 
   // BARU: Lapis 2 (SubState) + Lapis 3 (diagnostik) -- sinkron pola SORTER
   constexpr uint16_t ACTIVITY_CODE   = 11;  // R
@@ -21,13 +21,14 @@ namespace Reg {
   constexpr uint16_t LAST_FAULT_CODE = 13;  // R
   constexpr uint16_t UPTIME_SEC      = 14;  // R
   // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi) atau
-  // TEST (manual, aman dipakai GOTO_HOME/GOTO_PASS/GOTO_REJECT/PICK/PLACE).
+  // TEST (manual, aman dipakai GOTO_HOME/GOTO_PASS/PICK/PLACE).
   constexpr uint16_t MAIN_MODE_ACTIVE = 15;  // R, 1 = MAIN aktif, 0 = TEST mode
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik PICKER ---
 enum class ActivityCode : uint16_t {
-  DIAM = 0, MENUJU_HOME = 1, MENUJU_PASS = 2, MENUJU_REJECT = 3, MENUJU_LIFT = 4,
+  // DIHAPUS: MENUJU_REJECT (value 3) -- Picker gak pernah reject, pose 2 gak pernah dituju lagi.
+  DIAM = 0, MENUJU_HOME = 1, MENUJU_PASS = 2, MENUJU_LIFT = 4,
   MENGAMBIL = 5, MELETAKKAN = 6, NAIK_CLEARANCE = 7, BERGERAK = 8, POST_PLACE_GERAK = 9,
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
 };
@@ -43,8 +44,11 @@ enum class FaultCode : uint16_t {
 // --- Opcode CMD (§7.4) ---
 enum class Cmd : uint16_t {
   NONE = 0,
-  RUN_SEQUENCE = 1,   // arg: 1=pass, 2=reject -- urutan penuh home->target->pick->lift->place->home
-  GOTO_HOME = 2, GOTO_PASS = 3, GOTO_REJECT = 4,   // manual override
+  RUN_SEQUENCE = 1,   // urutan penuh home->PASS->pick->lift->place->home (arg diabaikan, cuma pass)
+  GOTO_HOME = 2, GOTO_PASS = 3,   // manual override
+  // DIHAPUS: GOTO_REJECT (opcode 4) -- Picker fisik cuma ambil dari PASS, gak pernah reject
+  // (reject ditangani hopper SORTER sebelum objek sampai ke Picker). Opcode 4 SENGAJA
+  // TIDAK dipakai ulang -- PICK/PLACE dkk tetap nomor eksplisit di bawah biar gak geser.
   PICK = 5, PLACE = 6,                              // manual override
   RESET_FAULT = 7,
   MOVE_PACKAGE = 8,  // BARU -- urutan penuh home->PACKAGE_PICKUP(pose4)->pick->LIFT_LOAD(pose5)->place->home,
@@ -55,7 +59,7 @@ enum class Cmd : uint16_t {
   SET_TRAJ_STEP_INTERVAL = 10, // arg: trajStepIntervalMs, 5-200
   // BARU -- pemisah MAIN/TEST eksplisit (sama konsep dgn SORTER/DISPENSER/STOCKER). Default
   // boot = mainModeActive FALSE. Selama MAIN aktif, command "manual override" (GOTO_HOME/
-  // GOTO_PASS/GOTO_REJECT/PICK/PLACE) DITOLAK TOTAL -- cuma RUN_SEQUENCE/MOVE_PACKAGE (produksi
+  // GOTO_PASS/PICK/PLACE) DITOLAK TOTAL -- cuma RUN_SEQUENCE/MOVE_PACKAGE (produksi
   // asli) yang jalan. Sebaliknya, RUN_SEQUENCE/MOVE_PACKAGE ditolak selama masih TEST mode.
   START_MAIN = 11,
   STOP_MAIN = 12

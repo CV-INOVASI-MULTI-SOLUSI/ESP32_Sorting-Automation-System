@@ -508,12 +508,45 @@ void handleRefillFSM() {
 // itu sinyal "tengah sekarang kosong, aman jatuhin package baru" -- trigger servo LANGSUNG,
 // sensor-confirmed, bukan delay tebakan (servoStartDelayMs, pensiun).
 bool lastMiddleSensorState = HIGH;
+// BARU: counter latch buat MIDDLE_ARRIVAL_COUNT -- lihat komentar di registers.h. uint16_t
+// SAMA lebar dgn register Modbus, wrap alami, gak perlu penanganan khusus.
+uint16_t middleArrivalCount = 0;
+// BARU: debounce counter arrival -- HIGH->LOW dalam 2 detik dari arrival TERAKHIR yang
+// kehitung DIABAIKAN (gak nambah counter lagi). Tujuannya mastiin package BENERAN udah
+// lewat sensor sebelum dihitung sebagai kedatangan baru -- cegah 1 package kehitung 2x
+// gara-gara noise/bounce sensor pas tepi objek lewat (bisa toggle LOW/HIGH cepat).
+uint32_t lastMiddleArrivalMs = 0;
+constexpr uint32_t MIDDLE_ARRIVAL_DEBOUNCE_MS = 2000;
+// BARU (diperluas): register live MIDDLE_PACKAGE_PRESENT SEKARANG ikut didebounce, SAMA
+// window (2 detik) dgn counter di atas -- dulu register ini ditulis MENTAH tiap loop tanpa
+// filter sama sekali, jadi guard di script Python (yang baca live, bukan counter) TETAP bisa
+// kena noise/bounce sensor walau counter-nya udah aman. Sekarang SATU sumber kebenaran: baik
+// counter maupun live register sama-sama nolak perubahan <2 detik dari perubahan TERAKHIR
+// yang di-commit -- konsisten di seluruh sistem (firmware DAN semua guard script).
+bool lastMiddlePresentReported = false;
+uint32_t lastMiddlePresentChangeMs = 0;
 void handleMiddleSensor() {
   bool cur = io.read(CH::PACKAGE_MIDDLE_SENSOR);
-  // BARU: register live -- Orange Pi bisa poll status tengah kapan saja (mis. cek startup),
-  // gak cuma nunggu edge produksi. Ditulis tiap panggilan (bukan cuma saat berubah).
-  mb.Hreg(Reg::MIDDLE_PACKAGE_PRESENT, cur == LOW ? 1 : 0);
+  bool curPresent = (cur == LOW);
+  if (curPresent != lastMiddlePresentReported &&
+      millis() - lastMiddlePresentChangeMs > MIDDLE_ARRIVAL_DEBOUNCE_MS) {
+    mb.Hreg(Reg::MIDDLE_PACKAGE_PRESENT, curPresent ? 1 : 0);
+    lastMiddlePresentReported = curPresent;
+    lastMiddlePresentChangeMs = millis();
+  }
   if (cur != lastMiddleSensorState) {
+    // BARU: package baru KEDETEKSI DATENG (HIGH->LOW, live 0->1) -- naikin counter latch,
+    // UNCONDITIONAL soal mainModeActive (gak digate, ini cuma tally pasif gak ada efek fisik
+    // apapun, aman kapan saja termasuk TEST mode) TAPI digate DEBOUNCE (lihat komentar var).
+    if (lastMiddleSensorState == HIGH && cur == LOW) {
+      if (millis() - lastMiddleArrivalMs > MIDDLE_ARRIVAL_DEBOUNCE_MS) {
+        middleArrivalCount++;
+        mb.Hreg(Reg::MIDDLE_ARRIVAL_COUNT, middleArrivalCount);
+        lastMiddleArrivalMs = millis();
+      } else {
+        Serial.println("[FEEDER] PROX_2 trigger diabaikan -- debounce (<2s dari arrival sebelumnya)");
+      }
+    }
     // BARU: trigger otomatis WAJIB mainModeActive -- sebelum Orange Pi START_MAIN, edge PROX_2
     // TIDAK memicu apa-apa (biar aman dites manual pakai TEST_SERVOx_CYCLE/MOVE_SERVOx_TO tanpa
     // rebutan servo sama logic otomatis ini).
@@ -525,6 +558,22 @@ void handleMiddleSensor() {
       Serial.println("[FEEDER] Tengah terdeteksi kosong -- servo refill mulai (Servo1 gerbang bawah)");
     }
     lastMiddleSensorState = cur;
+  }
+}
+
+// BARU: register live UJUNG_PACKAGE_PRESENT (PROX_1) JUGA didebounce, SAMA pola & window
+// (MIDDLE_ARRIVAL_DEBOUNCE_MS) dgn MIDDLE_PACKAGE_PRESENT di atas -- package yang permukaannya
+// gak rata bisa bikin sensor kebaca ulang dalam waktu singkat padahal package yang SAMA masih
+// di situ, jangan dianggap perubahan baru.
+bool lastUjungPresentReported = false;
+uint32_t lastUjungPresentChangeMs = 0;
+void updateUjungPresentDebounced() {
+  bool curPresent = (io.read(CH::PROX_BOX_ARRIVED) == LOW);
+  if (curPresent != lastUjungPresentReported &&
+      millis() - lastUjungPresentChangeMs > MIDDLE_ARRIVAL_DEBOUNCE_MS) {
+    mb.Hreg(Reg::UJUNG_PACKAGE_PRESENT, curPresent ? 1 : 0);
+    lastUjungPresentReported = curPresent;
+    lastUjungPresentChangeMs = millis();
   }
 }
 
@@ -799,6 +848,22 @@ ActivityCode activityCode() {
     case ServoRefillStage::WAIT_MIDDLE_CONFIRM: return ActivityCode::TUNGGU_KONFIRM_TENGAH;
     default: break;
   }
+  // BARU (bug ditemukan): testServoCycleStage (dipicu Cmd::TEST_SERVO1/2_CYCLE via Modbus,
+  // ATAU layar kalibrasi Servo Step/Interval) SEBELUMNYA gak pernah dicek di sini sama
+  // sekali -- ACTIVITY_CODE tetap DIAM(0) walau servo BENERAN lagi gerak, bikin diagnosa
+  // jarak jauh (tanpa Serial USB) keliatan "gak jalan" padahal firmware jalan normal. Reuse
+  // kode ActivityCode SERVO1/2_BUKA/TAHAN/TUTUP yang sama -- aksi fisiknya identik, cuma beda
+  // pemicu (test manual vs auto-refill), dan keduanya SALING EKSKLUSIF (lihat
+  // isServoRefillAutoActive() -- gak akan dua-duanya aktif bareng).
+  if (testServoCycleStage != TestServoCycleStage::NONE) {
+    bool isServo1 = (testServoCycleWhich == 1);
+    switch (testServoCycleStage) {
+      case TestServoCycleStage::TO_END:   return isServo1 ? ActivityCode::SERVO1_BUKA  : ActivityCode::SERVO2_BUKA;
+      case TestServoCycleStage::HOLD:     return isServo1 ? ActivityCode::SERVO1_TAHAN : ActivityCode::SERVO2_TAHAN;
+      case TestServoCycleStage::TO_START: return isServo1 ? ActivityCode::SERVO1_TUTUP : ActivityCode::SERVO2_TUTUP;
+      default: break;
+    }
+  }
   switch (refillState) {
     case RefillState::IDLE:         return ActivityCode::DIAM;
     case RefillState::CONVEYOR_RUN: return ActivityCode::CONVEYOR_JALAN;
@@ -1002,8 +1067,12 @@ void drawTopMenuFeeder() {
 // BARU: "Force Servo Delay(ms)" -- pakai field servoStartDelayMs (dulu pensiun) KHUSUS utk
 // FORCE_MIDDLE_REFILL (startup/recovery): conveyor jalan duluan, servo1+2 baru dieksekusi
 // setelah jeda ini -- BEDA dari siklus produksi normal yang PROX_2-edge-triggered.
-constexpr uint8_t CAL_COUNT = 19;
-const char* CAL_LABELS[CAL_COUNT] = { "Conveyor Speed", "Conveyor Dir", "Middle Confirm TO(ms)", "Push Timeout (ms)",
+// BARU: "Reset Fault" jadi item PERTAMA -- dulu cuma bisa dipicu lewat menu "Test Command"
+// yang terkubur. Item 1-18 (Conveyor Speed dst) TIDAK berubah nomornya terhadap selParam
+// (lihat handleCalListKey -- selParam = calCursor, bukan calCursor+1).
+constexpr uint8_t CAL_COUNT = 20;
+const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault",
+                                        "Conveyor Speed", "Conveyor Dir", "Middle Confirm TO(ms)", "Push Timeout (ms)",
                                         "Servo1 Titik Awal", "Servo1 Titik Akhir", "Servo1 Waktu Tahan",
                                         "Servo1 Step (us)", "Servo1 Step Intv(ms)",
                                         "Servo2 Titik Awal", "Servo2 Titik Akhir", "Servo2 Waktu Tahan",
@@ -1145,9 +1214,13 @@ void handleCalListKey(char key) {
   if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 18) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
+    if (calCursor == 0) {   // BARU -- Reset Fault, langsung eksekusi (tidak destruktif, gak perlu konfirmasi)
+      applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
+      lcdPrint(0, 3, "Fault direset!      ");
+      Serial.println("[CAL] Reset Fault dari menu LCD");
+    } else if (calCursor == 19) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
     else {
-      selParam = calCursor + 1;
+      selParam = calCursor;
       // BARU: aktifkan test-live di layar Servo1/2 Step(8/13) ATAU Step Interval(9/14) --
       // sama pola dgn hopperIntervalTestMode SORTER, supaya servo keliatan gerak live pas
       // salah satu dari 2 parameter kecepatan ini diubah, bukan diam kayak sebelumnya.
@@ -1667,6 +1740,8 @@ void setup() {
   io.pinMode(CH::PACKAGE_MIDDLE_SENSOR, INPUT_PULLUP);   // mekanisme 2-proximity (UJUNG+TENGAH)
   io.pinMode(CH::BTN_TEST_BOX_FULL, INPUT_PULLUP);   // BARU -- tombol fisik TEST REFILL LOOP
   lastMiddleSensorState = io.read(CH::PACKAGE_MIDDLE_SENSOR);   // BARU -- baca kondisi awal, cegah false-edge saat boot
+  lastMiddlePresentReported = (lastMiddleSensorState == LOW);   // BARU -- sinkron nilai awal register live-debounced
+  lastUjungPresentReported = (io.read(CH::PROX_BOX_ARRIVED) == LOW);   // BARU -- sinkron nilai awal PROX_1 live-debounced
   Serial.printf("[BOOT] MCP23017: %s, pinMode selesai\n", ioOk ? "OK" : "GAGAL");
   lcdBootProgress("I/O Expander MCP23017");
 
@@ -1702,9 +1777,10 @@ void setup() {
   mb.addHreg(Reg::ACTIVITY_CODE, 0); mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::PACKAGE_READY_FLAG, 0);   // BARU -- mekanisme 2-proximity
-  mb.addHreg(Reg::MIDDLE_PACKAGE_PRESENT, 0);   // BARU -- status live PROX_2 utk cek startup
-  mb.addHreg(Reg::UJUNG_PACKAGE_PRESENT, 0);    // BARU -- status live PROX_1 (UJUNG)
+  mb.addHreg(Reg::MIDDLE_PACKAGE_PRESENT, lastMiddlePresentReported ? 1 : 0);   // BARU -- status live PROX_2 utk cek startup (sinkron nilai awal, gak nunggu debounce 2s pertama)
+  mb.addHreg(Reg::UJUNG_PACKAGE_PRESENT, lastUjungPresentReported ? 1 : 0);    // BARU -- status live PROX_1 (UJUNG), sinkron nilai awal
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);         // BARU -- status live MAIN vs TEST mode
+  mb.addHreg(Reg::MIDDLE_ARRIVAL_COUNT, 0);     // BARU -- counter latch PROX_2, anti-kelewatan
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
@@ -1757,8 +1833,9 @@ void loop() {
   mb.Hreg(Reg::I2C_ERROR_COUNT, i2cErrorCount);
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
-  // BARU: status live PROX_BOX_ARRIVED (UJUNG), simetris dgn MIDDLE_PACKAGE_PRESENT.
-  mb.Hreg(Reg::UJUNG_PACKAGE_PRESENT, io.read(CH::PROX_BOX_ARRIVED) == LOW ? 1 : 0);
+  // BARU: status live PROX_BOX_ARRIVED (UJUNG), simetris dgn MIDDLE_PACKAGE_PRESENT --
+  // sekarang lewat updateUjungPresentDebounced() (didebounce), bukan tulis mentah lagi.
+  updateUjungPresentDebounced();
   mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
 
   static uint32_t lastMcpHealthCheck = 0;

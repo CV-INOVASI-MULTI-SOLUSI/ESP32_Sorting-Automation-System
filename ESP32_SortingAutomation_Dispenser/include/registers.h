@@ -36,6 +36,14 @@ namespace Reg {
   // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi otomatis)
   // atau TEST (manual) tanpa perlu nebak dari efek command lain.
   constexpr uint16_t MAIN_MODE_ACTIVE = 18;  // R, 1 = MAIN aktif, 0 = TEST mode
+  // BARU: counter LATCH -- naik +1 SETIAP kali PACKAGE_MIDDLE_SENSOR (PROX_2) kedeteksi
+  // package baru dateng (edge HIGH->LOW, live == MIDDLE_PACKAGE_PRESENT 0->1), TERLEPAS
+  // kapan Orange Pi sempat baca. Beda dari MIDDLE_PACKAGE_PRESENT (live/instant, bisa
+  // kelewatan kalau Orange Pi lagi sibuk poll command lain, mis. servo round-trip ~7 detik) --
+  // counter ini gak pernah kelewatan event, script tinggal bandingin nilai SEBELUM vs SESUDAH
+  // nunggu. Wrap dari 65535 balik ke 0 itu WAJAR (uint16_t Modbus), tetap valid dibandingkan
+  // != asal gak lebih dari 65535 event kelewatan di satu jendela tunggu (mustahil praktiknya).
+  constexpr uint16_t MIDDLE_ARRIVAL_COUNT = 19;  // R
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik FEEDER (refillState yg sudah ada) ---

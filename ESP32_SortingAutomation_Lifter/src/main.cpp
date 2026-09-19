@@ -476,9 +476,14 @@ void updateYRetract() {
   if (startStepPulse(1)) lastStepMicros[1] = now;
 }
 
+// DIUBAH: dulu batas rackIdx < 6 (RACK[6] penuh) -- sekarang fisik cuma ada 4 rack (Rak 1-4,
+// dikonfirmasi user). rackIdx 0 dan 5 SENGAJA gak valid lagi (walau slot array RACK[6] masih
+// ada, index 0/5 gak dipakai) -- cegah Orange Pi/test script kirim rack_idx ke rak yang gak
+// ada fisiknya.
 bool moveToRackXZ(uint8_t rackIdx) {
-  if (rackIdx >= 6 || !homed[0] || !homed[1] || !homed[2]) {
-    faultCode = rackIdx >= 6 ? (uint16_t)FaultCode::RACK_IDX_INVALID : (uint16_t)FaultCode::NOT_HOMED;
+  bool idxValid = (rackIdx >= 1 && rackIdx <= 4);
+  if (!idxValid || !homed[0] || !homed[1] || !homed[2]) {
+    faultCode = !idxValid ? (uint16_t)FaultCode::RACK_IDX_INVALID : (uint16_t)FaultCode::NOT_HOMED;
     return false;
   }
   tgtPos[0] = RACK[rackIdx].x; tgtPos[2] = RACK[rackIdx].z;
@@ -814,8 +819,10 @@ void drawTopMenuStocker() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-constexpr uint8_t CAL_COUNT = 8;
-const char* CAL_LABELS[CAL_COUNT] = { "AutoHome (wajib dulu)", "Jog Posisi (X/Y/Z)", "Test ke Rak",
+// BARU: "Reset Fault" jadi item pertama -- dulu cuma bisa dipicu lewat menu "Test Command"
+// yang terkubur, gak gampang ditemukan operator pas node FAULT.
+constexpr uint8_t CAL_COUNT = 9;
+const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault", "AutoHome (wajib dulu)", "Jog Posisi (X/Y/Z)", "Test ke Rak",
                                         "Simpan ke Slot Rak", "Simpan Load Position", "Simpan Jarak Dorong", "Kecepatan", "Reset ke Default" };
 uint8_t calCursor = 0;
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
@@ -823,14 +830,17 @@ void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, ca
 // BARU: Test ke Rak -- selalu HOME dulu, baru menuju rak (sesuai permintaan: "test rack 1
 // selalu urutannya ke home dulu baru ke tempat rack"). Homing + pindah-ke-rak digabung
 // jadi 1 urutan otomatis, bukan 2 langkah manual terpisah.
-constexpr uint8_t RACK_COUNT = 6;
-const char* RACK_LABELS[RACK_COUNT] = { "Rak 0", "Rak 1", "Rak 2", "Rak 3", "Rak 4", "Rak 5" };
-uint8_t testRackCursor = 0;
+// DIUBAH: fisik cuma ada 4 rack (Rak 1-4, dikonfirmasi user) -- dulu 6 (Rak 0-5). Label LCD
+// LANGSUNG jadi nomor rackIdx asli (bukan lagi index-0 array RACK_LABELS), jadi testRackCursor
+// disimpan sebagai rackIdx (1-4) langsung, bukan index 0-based lagi.
+constexpr uint8_t RACK_COUNT = 4;
+const char* RACK_LABELS[RACK_COUNT] = { "Rak 1", "Rak 2", "Rak 3", "Rak 4" };
+uint8_t testRackCursor = 1;   // rackIdx asli (1-4), BUKAN index array
 
-void drawTestRackSelect() { drawListMenu("TEST KE RAK", RACK_LABELS, RACK_COUNT, testRackCursor); }
+void drawTestRackSelect() { drawListMenu("TEST KE RAK", RACK_LABELS, RACK_COUNT, testRackCursor - 1); }
 void handleTestRackSelectKey(char key) {
-  if (key == 'A') { testRackCursor = (testRackCursor == 0) ? RACK_COUNT - 1 : testRackCursor - 1; drawTestRackSelect(); }
-  else if (key == 'B') { testRackCursor = (testRackCursor + 1) % RACK_COUNT; drawTestRackSelect(); }
+  if (key == 'A') { testRackCursor = (testRackCursor == 1) ? RACK_COUNT : testRackCursor - 1; drawTestRackSelect(); }
+  else if (key == 'B') { testRackCursor = (testRackCursor == RACK_COUNT) ? 1 : testRackCursor + 1; drawTestRackSelect(); }
   else if (key == 'C') {
     if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
       lcdPrint(0, 3, "Tak bisa:FAULT/ESTOP");
@@ -941,7 +951,7 @@ void handleSpeedKeyStocker(char key) {
 }
 
 void handleSaveSlotKeyStocker(char key) {
-  if (key >= '0' && key <= '5') {
+  if (key >= '1' && key <= '4') {   // DIUBAH: fisik cuma Rak 1-4 (dulu 0-5)
     uint8_t slot = key - '0';
     RACK[slot] = {curPos[0], curPos[2]};
     saveRackToNvs();
@@ -956,7 +966,12 @@ void handleCalListKey(char key) {
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
     switch (calCursor) {
-      case 0:   // AutoHome
+      case 0:   // BARU -- Reset Fault, langsung eksekusi (tidak destruktif, gak perlu konfirmasi)
+        applyCommand((uint16_t)Cmd::RESET_FAULT, 0, 0);
+        lcdPrint(0, 3, "Fault direset!      ");
+        Serial.println("[CAL] Reset Fault dari menu LCD");
+        break;
+      case 1:   // AutoHome
         if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
           lcdPrint(0, 3, "Tak bisa:FAULT/ESTOP");
         } else {
@@ -966,26 +981,26 @@ void handleCalListKey(char key) {
           Serial.println("[CAL] AUTO HOME dari menu dimulai");
         }
         break;
-      case 1:   // Jog Posisi
+      case 2:   // Jog Posisi
         if (!homed[0] || !homed[1] || !homed[2]) { lcdPrint(0, 3, "Home dulu! (opsi a)"); }
         else { menuState = MenuState::MOVE_AXIS; lcd.clear(); drawMoveAxisMenu(); }
         break;
-      case 2:   // BARU: Test ke Rak -- selalu home dulu, baru menuju rak
-        menuState = MenuState::TEST_RACK_SELECT; testRackCursor = 0; lcd.clear(); drawTestRackSelect();
+      case 3:   // BARU: Test ke Rak -- selalu home dulu, baru menuju rak
+        menuState = MenuState::TEST_RACK_SELECT; testRackCursor = 1; lcd.clear(); drawTestRackSelect();
         break;
-      case 3: menuState = MenuState::WAIT_SAVE_SLOT; lcdPrint(0, 3, "Simpan(X,Z)slot?0-5"); break;
-      case 4:   // BARU: Simpan Load Position -- simpan X,Z SAAT INI, cuma 1 titik (bukan slot 0-5)
+      case 4: menuState = MenuState::WAIT_SAVE_SLOT; lcdPrint(0, 3, "Simpan(X,Z)slot?1-4"); break;
+      case 5:   // BARU: Simpan Load Position -- simpan X,Z SAAT INI, cuma 1 titik (bukan slot 0-5)
         loadPos = {curPos[0], curPos[2]};
         saveLoadPosToNvs();
         lcdPrint(0, 3, "LoadPos disimpan!");
         Serial.printf("[CAL] X=%ld Z=%ld -> loadPos\n", (long)curPos[0], (long)curPos[2]);
         break;
-      case 5:
+      case 6:
         if (curPos[1] <= 0) { lcdPrint(0, 3, "Y harus>0(jog dulu)"); }
         else { pushExtendSteps = curPos[1]; savePushExtendToNvs(); lcdPrint(0, 3, "PushExtend disimpan!"); Serial.printf("[CAL] pushExtendSteps=%ld\n", (long)pushExtendSteps); }
         break;
-      case 6: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenuStocker(); break;
-      case 7: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
+      case 7: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenuStocker(); break;
+      case 8: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuStocker(); }
 }

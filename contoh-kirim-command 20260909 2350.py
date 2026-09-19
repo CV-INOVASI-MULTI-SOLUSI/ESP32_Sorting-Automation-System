@@ -7,8 +7,11 @@
 Instalasi dulu (sekali saja):
     pip3 install minimalmodbus pyserial
 
-Ini versi MINIMAL untuk belajar konsep dasarnya -- kalau butuh menu
-lengkap semua node/opcode, pakai orangepi-test-tool.py yang terpisah.
+Ini versi MINIMAL untuk belajar konsep dasarnya (cuma SORTER, START/STOP +
+tulis CLASSIFY_IS_REJECT). Untuk skrip PRODUKSI ASLI (4 node, MAIN/TEST mode,
+batch penuh Sorter->Dispenser->Picker->Stocker), pakai orangepi-orchestrator-batch.py.
+Untuk uji manual per-node, pakai test-stocker-rack-sequence*.py atau
+test-dispenser-full-protocol*.py.
 """
 
 import minimalmodbus

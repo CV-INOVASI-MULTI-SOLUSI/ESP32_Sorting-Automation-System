@@ -72,22 +72,29 @@ STATE_IDLE, STATE_RUNNING, STATE_FAULT, STATE_ESTOPPED = 1, 2, 3, 4
 # --- Register/opcode spesifik per node ---
 REG_SORTER_PASS_COUNT = 10
 CMD_SORTER_START = 1
+CMD_SORTER_STOP = 2    # BARU -- dipakai shutdown_sequence()
 CMD_SORTER_RESET_COUNTERS = 7
 
 CMD_PICKER_GOTO_HOME = 2
 CMD_PICKER_MOVE_PACKAGE = 8   # BARU -- lihat ESP32_SortingAutomation_Picker/include/registers.h
+CMD_PICKER_START_MAIN = 11    # BARU -- WAJIB sebelum MOVE_PACKAGE/RUN_SEQUENCE diterima
+CMD_PICKER_STOP_MAIN = 12
 
 REG_DISPENSER_PACKAGE_READY = 15     # BARU -- 1 = package di UJUNG siap diambil arm
 REG_DISPENSER_MIDDLE_PRESENT = 16    # BARU -- 1 = ada package terdeteksi di TENGAH
 CMD_DISPENSER_REQUEST_REFILL = 1
 CMD_DISPENSER_ACK_PACKAGE_TAKEN = 5      # BARU
 CMD_DISPENSER_FORCE_MIDDLE_REFILL = 6    # BARU -- utk startup, lihat startup_sequence()
+CMD_DISPENSER_START_MAIN = 14   # BARU -- WAJIB sebelum REQUEST_REFILL/FORCE_MIDDLE_REFILL/ACK_PACKAGE_TAKEN diterima
+CMD_DISPENSER_STOP_MAIN = 15
 
 REG_STOCKER_ALL_HOMED = 11
 REG_STOCKER_RACK_OCCUPIED = 12
 CMD_STOCKER_HOME_ALL = 1
 CMD_STOCKER_RUN_FULL_CYCLE = 2
 CMD_STOCKER_GOTO_LOAD_POSITION = 6
+CMD_STOCKER_START_MAIN = 9    # BARU -- WAJIB sebelum RUN_FULL_CYCLE diterima
+CMD_STOCKER_STOP_MAIN = 10
 
 
 def connect(slave_id):
@@ -161,12 +168,14 @@ def wait_register(instr, node_name, reg_addr, expected_value, timeout, poll_inte
 
 
 def find_free_rack(stocker):
-    """Baca RACK_OCCUPIED_BITMASK, cari slot 0-5 pertama yang kosong (bit=0)."""
+    """Baca RACK_OCCUPIED_BITMASK, cari rak 1-4 pertama yang kosong (bit=0).
+    DIUBAH: fisik cuma ada 4 rack (Rak 1-4, dikonfirmasi user) -- dulu loop 0-5 salah, bisa
+    balikin slot 0 (gak ada fisiknya) karena bit-nya emang selalu 0 (gak pernah kepakai)."""
     if DRY_RUN:
-        print("  .. (DRY_RUN) anggap rack slot 0 kosong")
-        return 0
+        print("  .. (DRY_RUN) anggap rack 1 kosong")
+        return 1
     bitmask = stocker.read_register(REG_STOCKER_RACK_OCCUPIED, functioncode=3)
-    for slot in range(6):
+    for slot in range(1, 5):
         if not (bitmask & (1 << slot)):
             return slot
     return None   # semua rack penuh
@@ -174,16 +183,29 @@ def find_free_rack(stocker):
 
 def startup_sequence(sorter, picker, dispenser, stocker):
     """Dijalankan SEKALI di awal, sebelum masuk loop monitoring batch. Urutan (dikonfirmasi user):
-    1. Pastikan package sudah ada di posisi TENGAH Dispenser (siap diisi) -- kalau belum,
-       paksa isi (FORCE_MIDDLE_REFILL: conveyor jalan duluan, servo nyusul setelah delay).
-    2. Pastikan Picker (arm robot) di posisi HOME.
-    3. Pastikan STOCKER (lift) di posisi LOAD_POSITION (homing dulu kalau belum pernah).
-    4. Baru jalankan SORTER.
-    5. Semua node berjalan -- lanjut ke loop monitoring batch.
+    0. Picker -> GOTO_HOME DULU (manual override, WAJIB masih TEST mode -- mainModeActive
+       default FALSE saat boot, jangan kirim START_MAIN dulu sebelum ini).
+    1. Dispenser -> START_MAIN (WAJIB sebelum FORCE_MIDDLE_REFILL/REQUEST_REFILL/ACK_PACKAGE_TAKEN
+       diterima firmware -- lihat guard applyCommand() Dispenser), lalu pastikan package sudah
+       ada di posisi TENGAH -- kalau belum, paksa isi (FORCE_MIDDLE_REFILL).
+    2. Picker -> START_MAIN (baru SEKARANG, setelah GOTO_HOME tuntas -- supaya MOVE_PACKAGE
+       diterima nanti pas run_batch_sequence()).
+    3. Stocker -> pastikan HOMED + GOTO_LOAD_POSITION (2 command ini sengaja TIDAK di-gate
+       firmware, aman kapan saja), lalu START_MAIN (WAJIB sebelum RUN_FULL_CYCLE diterima).
+    4. Baru jalankan SORTER -- START-nya sendiri yang set mainModeActive=true di firmware Sorter.
+    5. Semua node berjalan (MAIN mode aktif semua) -- lanjut ke loop monitoring batch.
     """
     print("\n=== STARTUP SEQUENCE ===")
 
-    print("[1/4] Cek Dispenser.MIDDLE_PACKAGE_PRESENT")
+    print("[0/5] Picker -> GOTO_HOME (masih TEST mode, sebelum START_MAIN)")
+    seq = send_command(picker, "PICKER", CMD_PICKER_GOTO_HOME)
+    if not wait_ack(picker, "PICKER", seq):
+        return False
+
+    print("[1/5] Dispenser -> START_MAIN, lalu cek MIDDLE_PACKAGE_PRESENT")
+    seq = send_command(dispenser, "DISPENSER", CMD_DISPENSER_START_MAIN)
+    if not wait_ack(dispenser, "DISPENSER", seq):
+        return False
     middle_present = True if DRY_RUN else (dispenser.read_register(REG_DISPENSER_MIDDLE_PRESENT, functioncode=3) == 1)
     if not middle_present:
         print("      Tengah KOSONG -- FORCE_MIDDLE_REFILL")
@@ -196,12 +218,12 @@ def startup_sequence(sorter, picker, dispenser, stocker):
     else:
         print("      Tengah sudah terisi, lanjut")
 
-    print("[2/4] Picker -> GOTO_HOME")
-    seq = send_command(picker, "PICKER", CMD_PICKER_GOTO_HOME)
+    print("[2/5] Picker -> START_MAIN")
+    seq = send_command(picker, "PICKER", CMD_PICKER_START_MAIN)
     if not wait_ack(picker, "PICKER", seq):
         return False
 
-    print("[3/4] Stocker -> pastikan HOMED, lalu GOTO_LOAD_POSITION")
+    print("[3/5] Stocker -> pastikan HOMED, GOTO_LOAD_POSITION, lalu START_MAIN")
     all_homed = True if DRY_RUN else (stocker.read_register(REG_STOCKER_ALL_HOMED, functioncode=3) == 1)
     if not all_homed:
         print("      Belum homed -- HOME_ALL dulu (bisa lama, 3 axis berurutan)")
@@ -211,14 +233,32 @@ def startup_sequence(sorter, picker, dispenser, stocker):
     seq = send_command(stocker, "STOCKER", CMD_STOCKER_GOTO_LOAD_POSITION)
     if not wait_ack(stocker, "STOCKER", seq):
         return False
+    seq = send_command(stocker, "STOCKER", CMD_STOCKER_START_MAIN)
+    if not wait_ack(stocker, "STOCKER", seq):
+        return False
 
-    print("[4/4] Sorter -> START")
+    print("[4/5] Sorter -> START (otomatis set mainModeActive=true di firmware Sorter)")
     seq = send_command(sorter, "SORTER", CMD_SORTER_START)
     if not wait_ack(sorter, "SORTER", seq):
         return False
 
-    print("=== STARTUP SELESAI -- semua node berjalan ===\n")
+    print("=== STARTUP SELESAI -- semua node MAIN mode aktif ===\n")
     return True
+
+
+def shutdown_sequence(sorter, picker, dispenser, stocker):
+    """Dipanggil pas orchestrator berhenti (Ctrl+C) -- balikin SEMUA node ke TEST mode
+    (STOP/STOP_MAIN), supaya script test manual (test-dispenser-*, test-stocker-*) bisa
+    langsung dipakai lagi tanpa perlu power-cycle fisik tiap node. Best-effort (fire-and-
+    forget, TIDAK nunggu ack) -- kalau ada node lagi fault/gak respon pas shutdown, tetap
+    lanjut ke node berikutnya, jangan sampai shutdown sendiri nyangkut nunggu ack yg gak
+    pernah datang."""
+    print("\n=== SHUTDOWN SEQUENCE -- balik semua node ke TEST mode ===")
+    send_command(sorter, "SORTER", CMD_SORTER_STOP)
+    send_command(picker, "PICKER", CMD_PICKER_STOP_MAIN)
+    send_command(dispenser, "DISPENSER", CMD_DISPENSER_STOP_MAIN)
+    send_command(stocker, "STOCKER", CMD_STOCKER_STOP_MAIN)
+    print("=== SHUTDOWN SELESAI ===\n")
 
 
 def run_batch_sequence(sorter, picker, dispenser, stocker):
@@ -309,6 +349,7 @@ def main():
 
         except KeyboardInterrupt:
             print("\n[STOP] Dihentikan manual (Ctrl+C)")
+            shutdown_sequence(sorter, picker, dispenser, stocker)
             sys.exit(0)
         except Exception as e:
             print(f"!! Error tak terduga di loop utama: {e}")

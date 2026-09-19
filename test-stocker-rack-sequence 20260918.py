@@ -21,9 +21,9 @@ ack baru muncul PAS SUDAH balik ke Load Position lagi, bukan pas baru nyampe
 rak doang), BARU setelah itu jeda 2 detik tambahan (buat amatan visual/settle)
 sebelum lanjut ke rak berikutnya.
 
-CATATAN index rak: firmware pakai rack_idx 0-5 (0-indexed, total 6 slot).
-Skrip ini pakai arg 1,2,3,4 apa adanya sesuai permintaan -- kalau maksudnya
-4 slot PERTAMA (0-indexed 0,1,2,3), ganti RACK_SEQUENCE di bawah.
+CATATAN index rak (SUDAH DIKONFIRMASI): fisik cuma ada 4 rack, rak 1-4 -- firmware sudah
+disesuaikan (moveToRackXZ() cuma terima rackIdx 1-4, RACK_IDX_INVALID kalau di luar itu).
+RACK_SEQUENCE di bawah [1,2,3,4] sudah BENAR, tidak perlu diubah.
 
 Instalasi (sekali saja):
     pip3 install minimalmodbus pyserial

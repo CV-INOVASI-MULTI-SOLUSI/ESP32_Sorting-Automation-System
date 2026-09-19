@@ -66,7 +66,7 @@ NodeState currentState = NodeState::INIT;
 uint16_t faultCode = 0;
 // BARU: pemisah MAIN/TEST -- default FALSE (fail-safe, boot-IDLE). Cmd::START_MAIN/STOP_MAIN
 // (Orange Pi/master) nentuin RUN_SEQUENCE/MOVE_PACKAGE (produksi) vs GOTO_HOME/GOTO_PASS/
-// GOTO_REJECT/PICK/PLACE (manual override/test) -- dua kelompok ini saling eksklusif.
+// PICK/PLACE (manual override/test) -- dua kelompok ini saling eksklusif.
 bool mainModeActive = false;
 // BARU: Lapis 3 diagnostik -- sinkron pola SORTER
 uint16_t i2cErrorCount = 0;
@@ -75,11 +75,15 @@ uint32_t lastRs485Rx = 0;
 bool modbusEverUsed = false;
 
 struct Pose { uint16_t us[ServoCfg::NUM_JOINTS]; };
-// Slot 0=home, 1=pass, 2=reject, 3=lift(clearance per-objek). BARU slot 4=PACKAGE_PICKUP
+// Slot 0=home, 1=pass, 3=lift(clearance per-objek). BARU slot 4=PACKAGE_PICKUP
 // (posisi ambil package berisi batch objek di ujung conveyor), 5=LIFT_LOAD (posisi taruh
 // package ke Lift Load Position STOCKER) -- dipakai Cmd::MOVE_PACKAGE. Default slot 4/5
 // SENGAJA disamakan dgn home (aman, tidak akan gerak ekstrem) sampai dikalibrasi manual
 // via menu Pose / SAVEPOSE.
+// Slot 2 SISA/GAK KEPAKE -- dulu "reject", sekarang gak ada Cmd/ActivityCode yang nunjuk ke
+// situ lagi (Picker fisik cuma ambil dari PASS, lihat Cmd::GOTO_REJECT DIHAPUS di registers.h).
+// Array TETAP 6 slot (index 0-5) -- ngosongin/nyusun ulang nomor slot lain berisiko
+// (pose 4/5 udah eksplisit dipakai produksi), array-nya dibiarkan apa adanya.
 Pose POSES[6] = {
   {{1500,1500,1500,1500,1500,1000}},
   {{1200,1600,1400,1500,1500,1000}},
@@ -343,7 +347,7 @@ ActivityCode activityCode() {
       switch (currentActionPoseIdx) {
         case 0: return ActivityCode::MENUJU_HOME;
         case 1: return ActivityCode::MENUJU_PASS;
-        case 2: return ActivityCode::MENUJU_REJECT;
+        // DIHAPUS: case 2 (MENUJU_REJECT) -- pose 2 gak pernah dituju lagi (reject dihapus)
         case 3: return ActivityCode::MENUJU_LIFT;
       }
       return ActivityCode::BERGERAK;
@@ -384,6 +388,28 @@ bool blockIfFaulted(const char* opName) {
   return false;
 }
 
+// BARU (celah #1): tombol fisik trigger GOTO_PASS test, TEST-mode gated -- sama pola dgn
+// tombol SORTER (Hopper/Palang) & DISPENSER (BTN_TEST_BOX_FULL).
+// DIHAPUS: tombol BTN3/GOTO_REJECT -- Picker fisik cuma ambil dari PASS, gak pernah reject
+// (reject sudah ditangani hopper SORTER sebelum objek sampai ke Picker).
+void handleTestButtons() {
+  static bool lastPass = HIGH;
+  static uint32_t lastPassEdge = 0;
+  constexpr uint32_t DEBOUNCE_MS = 50;
+
+  bool curPass = io.read(CH::BTN_TEST_GOTO_PASS);
+  if (curPass == LOW && lastPass == HIGH && millis() - lastPassEdge > DEBOUNCE_MS) {
+    lastPassEdge = millis();
+    if (mainModeActive) {
+      Serial.println("[TEST-BTN] Tombol GOTO_PASS ditolak -- MAIN aktif, STOP_MAIN dulu");
+    } else if (!blockIfFaulted("GOTO_PASS")) {
+      enqueue(QCmd::GOTO_POSE, 1);
+      Serial.println("[TEST-BTN] Tombol GOTO_PASS ditekan");
+    }
+  }
+  lastPass = curPass;
+}
+
 void applyCommand(uint16_t opcode, uint16_t arg) {
   switch ((Cmd)opcode) {
     case Cmd::START_MAIN:
@@ -401,7 +427,10 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       enqueue(QCmd::GOTO_POSE, 0);
       enqueue(QCmd::CLEARANCE);
       triggerBuzzerBeep();   // BARU -- notifikasi: arm mulai menuju objek untuk diambil
-      enqueue(QCmd::GOTO_POSE, arg == 1 ? 1 : 2);
+      // DIUBAH: dulu arg 1=pass/2=reject -- Picker fisik cuma ambil dari PASS (reject sudah
+      // ditangani hopper SORTER sebelum objek sampai ke Picker), jadi sekarang SELALU ke pose
+      // 1 (pass) apapun arg-nya. arg dibiarkan di signature demi kompatibilitas Modbus.
+      enqueue(QCmd::GOTO_POSE, 1);
       enqueue(QCmd::PICK);
       enqueue(QCmd::GOTO_POSE, 3);
       enqueue(QCmd::PLACE);
@@ -420,11 +449,9 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       if (blockIfFaulted("GOTO_PASS")) return;
       enqueue(QCmd::GOTO_POSE, 1);
       break;
-    case Cmd::GOTO_REJECT:
-      if (mainModeActive) { Serial.println("[CMD] GOTO_REJECT ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
-      if (blockIfFaulted("GOTO_REJECT")) return;
-      enqueue(QCmd::GOTO_POSE, 2);
-      break;
+    // DIHAPUS: Cmd::GOTO_REJECT (opcode 4) -- Picker fisik cuma ambil dari PASS, gak pernah
+    // reject. Opcode 4 SENGAJA gak dipakai ulang (lihat registers.h), biar nomor command lain
+    // (PICK=5 dst) gak geser/pecah kompatibilitas Modbus yang sudah ada.
     case Cmd::PICK:
       if (mainModeActive) { Serial.println("[CMD] PICK ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
       if (blockIfFaulted("PICK")) return;
@@ -518,8 +545,10 @@ void drawTopMenu() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-constexpr uint8_t CAL_COUNT = 7;
-const char* CAL_LABELS[CAL_COUNT] = { "Pose (Home/Pass/dll)", "Pick Offset", "Place Offset", "Clearance Offset", "Post-Place Offset", "Speed (Step/Interval)", "Reset ke Default" };
+// BARU: "Reset Fault" jadi item pertama -- dulu cuma bisa dipicu lewat menu "Test Command"
+// yang terkubur, gak gampang ditemukan operator pas node FAULT.
+constexpr uint8_t CAL_COUNT = 8;
+const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault", "Pose (Home/Pass/dll)", "Pick Offset", "Place Offset", "Clearance Offset", "Post-Place Offset", "Speed (Step/Interval)", "Reset ke Default" };
 uint8_t calCursor = 0;
 
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
@@ -645,13 +674,18 @@ void handleCalListKey(char key) {
   else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
   else if (key == 'C') {
     switch (calCursor) {
-      case 0: menuState = MenuState::JOG_JOINT; lcd.clear(); drawCalibrationLcd(); break;
-      case 1: editingOffset = PICK_OFFSET; editingOffsetName = "PICK"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
-      case 2: editingOffset = PLACE_OFFSET; editingOffsetName = "PLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
-      case 3: editingOffset = CLEARANCE_OFFSET; editingOffsetName = "CLEARANCE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
-      case 4: editingOffset = POST_PLACE_OFFSET; editingOffsetName = "POSTPLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
-      case 5: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenu(); break;
-      case 6: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
+      case 0:   // BARU -- Reset Fault, langsung eksekusi (tidak destruktif, gak perlu konfirmasi)
+        applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
+        lcdPrint(0, 3, "Fault direset!      ");
+        Serial.println("[CAL] Reset Fault dari menu LCD");
+        break;
+      case 1: menuState = MenuState::JOG_JOINT; lcd.clear(); drawCalibrationLcd(); break;
+      case 2: editingOffset = PICK_OFFSET; editingOffsetName = "PICK"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
+      case 3: editingOffset = PLACE_OFFSET; editingOffsetName = "PLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
+      case 4: editingOffset = CLEARANCE_OFFSET; editingOffsetName = "CLEARANCE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
+      case 5: editingOffset = POST_PLACE_OFFSET; editingOffsetName = "POSTPLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
+      case 6: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenu(); break;
+      case 7: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
 }
@@ -982,13 +1016,12 @@ void handleTestIoCategoryKey(char key) {
 
 // --- LEVEL 1c: TEST COMMAND ---
 struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
-constexpr uint8_t CMD_TEST_COUNT = 9;
+// DIHAPUS: "RUN_SEQUENCE(reject)" & "GOTO_REJECT" -- Picker fisik cuma ambil dari PASS.
+constexpr uint8_t CMD_TEST_COUNT = 7;
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"RUN_SEQUENCE(pass)",   Cmd::RUN_SEQUENCE, 1},
-  {"RUN_SEQUENCE(reject)", Cmd::RUN_SEQUENCE, 2},
   {"GOTO_HOME",            Cmd::GOTO_HOME,    0},
   {"GOTO_PASS",            Cmd::GOTO_PASS,    0},
-  {"GOTO_REJECT",          Cmd::GOTO_REJECT,  0},
   {"PICK",                 Cmd::PICK,         0},
   {"PLACE",                Cmd::PLACE,        0},
   {"MOVE_PACKAGE",         Cmd::MOVE_PACKAGE, 0},
@@ -1081,7 +1114,7 @@ void handleSerialCommand() {
     Serial.println();
   }
   else if (cmd == "HELP") {
-    Serial.println("[HELP] JOG <0-5> <us> | SAVEPOSE <0-5> | GOTO <0-5> | SEQ <1|2> | MOVEPKG | STEP <us> | INTERVAL <ms>");
+    Serial.println("[HELP] JOG <0-5> <us> | SAVEPOSE <0-5> | GOTO <0-5> | SEQ <1> | MOVEPKG | STEP <us> | INTERVAL <ms>");
     Serial.println("[HELP] RAMPMIN <us> | RAMPSTEPS <n> | RESET | STATUS | HELP");
   }
   else Serial.printf("[SERIAL] '%s' tidak dikenal -- ketik HELP\n", cmd.c_str());
@@ -1278,6 +1311,7 @@ void setup() {
 void loop() {
   mb.task();
   updateOTA();
+  handleTestButtons();
 
   if (keypadPresent) {
     char key = keypad.scan();
