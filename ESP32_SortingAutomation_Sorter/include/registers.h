@@ -30,6 +30,15 @@ namespace Reg {
   // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi, START
   // sudah dikirim) atau TEST (manual, aman dipakai TEST_HOPPER_CYCLE/SET_MOTOR_A dkk).
   constexpr uint16_t MAIN_MODE_ACTIVE = 17;  // R, 1 = MAIN aktif, 0 = TEST mode
+  // BARU (2026-09-20): menu kalibrasi LCD meng-IGNORE semua command Modbus (§12.6) TANPA
+  // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
+  // Register ini bikin master bisa bedain dua kondisi itu.
+  constexpr uint16_t MENU_ACTIVE = 18;  // R, 1 = operator lagi di menu kalibrasi LCD
+  // BARU (2026-09-20): berapa hasil klasifikasi REJECT yang TIDAK sempat jadi dorongan palang.
+  // Dua sebabnya: (a) antrian penuh saat klasifikasi baru datang, (b) giliran dorongnya sudah
+  // lewat (basi) pas antrian akhirnya sempat diproses. Sebelumnya dua-duanya hilang diam-diam
+  // tanpa jejak apa pun -- objek reject lolos ke jalur pass dan tidak ada yang tahu.
+  constexpr uint16_t REJECT_MISSED_COUNT = 19;  // R
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik (bukan cuma IDLE/RUNNING generik) ---
@@ -62,6 +71,8 @@ enum class Cmd : uint16_t {
   SET_PALANG_SPEED = 9,   // arg: palangSpeed PWM 0-255
   SET_HOPPER_STEP  = 10,  // arg: hopperStepUs (pasangan SET_HOPPER_INTERVAL yg sudah ada), 1-2500
   TEST_HOPPER_CYCLE = 97,      // test-only -- 1x siklus maju-mundur hopper pakai nilai KALIBRASI
-  TEST_TRIGGER_PALANG = 98,   // O12 -- simulasi 1 hasil reject tanpa HuskyLens, utk kalibrasi TOF
-  TEST_FAULT = 99             // test-only, HAPUS sebelum produksi riil
+  TEST_TRIGGER_PALANG = 98    // O12 -- simulasi 1 hasil reject tanpa HuskyLens, utk kalibrasi TOF
+  // DIHAPUS (2026-09-20): TEST_FAULT = 99 -- komentarnya sendiri sudah menyuruh hapus sebelum
+  // produksi. Opcode 99 SENGAJA dibiarkan kosong, jangan dipakai ulang untuk hal lain supaya
+  // script/master lama yang masih mengirimnya tidak memicu perintah yang berbeda arti.
 };

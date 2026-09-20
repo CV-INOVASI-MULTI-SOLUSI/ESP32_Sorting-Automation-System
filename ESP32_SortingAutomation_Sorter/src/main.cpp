@@ -1,6 +1,8 @@
 // ============================================================
-// SORTER — Conveyor1 + Palang + Proximity + Menu Kalibrasi LCD/Keypad
-// Hopper DINONAKTIFKAN sementara -- mekanisme fisiknya belum ditentukan.
+// SORTER — Conveyor1 + Palang + Proximity + Hopper + Menu Kalibrasi LCD/Keypad
+// DIPERBAIKI (2026-09-20): baris ini dulu bilang "Hopper DINONAKTIFKAN sementara" -- sudah
+// basi jauh sebelum ini. Hopper servo + rack-pinion AKTIF dan bersiklus otomatis selama
+// RUNNING (lihat handleHopper()), laju umpannya diatur cfg.hopperCycleGapMs.
 //
 // PRINSIP PENTING: LCD & Keypad HANYA untuk kalibrasi -- kalau tidak
 // terpasang (device tidak terdeteksi di I2C scan), firmware TETAP JALAN
@@ -124,6 +126,11 @@ struct SorterConfig {
   // kasih jeda tahan WAJIB di titik dorong sebelum retract, independen dari kalibrasi Step/
   // Interval, jadi ada jaminan waktu fisik walau kalibrasi kurang pas. DITARUH DI AKHIR struct.
   uint16_t hopperPushHoldMs = 300;
+  // BARU (2026-09-20): jeda DIAM antar siklus hopper. Sebelumnya HopperState::AT_START
+  // langsung lompat ke MOVING_TO_PUSH tanpa jeda sama sekali -- selama RUNNING hopper
+  // dorong-tarik nonstop, tidak ada kendali laju umpan objek ke conveyor sama sekali.
+  // 0 = perilaku lama (nonstop). DITARUH DI AKHIR struct supaya blob NVS lama tetap kebaca.
+  uint16_t hopperCycleGapMs = 1000;
 } cfg;
 
 uint32_t passCount = 0, rejectCount = 0;
@@ -151,8 +158,15 @@ bool lastProxState = HIGH;
 uint32_t lastProxEdge = 0;
 
 struct PendingClass { bool valid; uint32_t scanTimeMs; bool isReject; };
-PendingClass pendingQ[4];
+// DIUBAH (2026-09-20): kedalaman 4 -> 8. Antrian penuh berarti hasil REJECT dibuang, dan 4
+// slot itu tipis: satu siklus palang (push+retract) saja sudah ~600ms, sementara objek bisa
+// datang beruntun lebih cepat dari itu.
+constexpr uint8_t CLASS_QUEUE_LEN = 8;
+PendingClass pendingQ[CLASS_QUEUE_LEN];
 uint8_t qHead = 0, qTail = 0;
+// BARU: berapa REJECT yang gagal jadi dorongan palang (antrian penuh ATAU giliran dorongnya
+// sudah basi). Dikirim ke Reg::REJECT_MISSED_COUNT -- dulu hilang diam-diam tanpa jejak.
+uint32_t rejectMissedCount = 0;
 
 constexpr int PWM_FREQ = 20000, PWM_RES = 8, LEDC_CH_CONV1 = 0, LEDC_CH_MOTORA = 1;
 
@@ -224,10 +238,32 @@ uint32_t calculateTOF() {
 }
 
 void enqueueClassification(bool isReject, uint32_t scanTimeMs) {
-  uint8_t next = (qTail + 1) % 4;
-  if (next == qHead) return;
+  uint8_t next = (qTail + 1) % CLASS_QUEUE_LEN;
+  if (next == qHead) {
+    // DIPERBAIKI (2026-09-20): dulu cuma `return` -- antrian penuh = hasil klasifikasi HILANG
+    // tanpa counter, tanpa log, tanpa fault. Kalau yang hilang itu REJECT, objeknya lolos ke
+    // jalur pass dan tidak ada satu pun cara untuk tahu kejadiannya pernah terjadi.
+    if (isReject) {
+      rejectMissedCount++;
+      mb.Hreg(Reg::REJECT_MISSED_COUNT, (uint16_t)rejectMissedCount);
+      Serial.printf("[SORTER] !!! REJECT HILANG -- antrian klasifikasi PENUH (%u slot). Total terlewat=%lu !!!\n",
+                    CLASS_QUEUE_LEN, (unsigned long)rejectMissedCount);
+    } else {
+      Serial.println("[SORTER] Klasifikasi pass dibuang -- antrian penuh (tidak berdampak, pass tidak butuh aksi)");
+    }
+    return;
+  }
   pendingQ[qTail] = {true, scanTimeMs, isReject};
   qTail = next;
+}
+
+// BARU: kosongkan antrian + batalkan dorongan yang belum terjadi. Dipakai Cmd::STOP.
+// Tanpa ini, klasifikasi lama tetap mengendap di antrian: begitu START dikirim lagi, semuanya
+// langsung meletus sekaligus dengan waktu tempuh (TOF) yang sudah lama kedaluwarsa.
+void clearClassificationQueue(const char* alasan) {
+  uint8_t sisa = (qTail >= qHead) ? (qTail - qHead) : (uint8_t)(CLASS_QUEUE_LEN - qHead + qTail);
+  qHead = qTail = 0;
+  if (sisa > 0) Serial.printf("[SORTER] Antrian klasifikasi dikosongkan (%u entri) -- %s\n", sisa, alasan);
 }
 
 // DIUBAH TOTAL (celah #1): tombol fisik DULU simulasi klasifikasi pass/reject lewat
@@ -266,7 +302,18 @@ void handleTestButtons() {
   lastPalang = curPalang;
 }
 
+bool menuIsActive();   // forward declaration -- MenuState baru didefinisikan jauh di bawah
+
 uint16_t onClassifyWrite(TRegister* reg, uint16_t val) {
+  // DIPERBAIKI (2026-09-20): jalur ini SATU-SATUNYA callback Modbus di keempat node yang
+  // tidak pernah mengecek menu kalibrasi. onCmdWrite() menolak semua command saat operator
+  // berada di menu (§12.6), tapi klasifikasi tetap menembus -- artinya operator yang sedang
+  // mengkalibrasi, dengan tangan di area palang, tetap bisa membuat Motor A menghentak
+  // karena Orange Pi/HuskyLens mengirim hasil klasifikasi. Sekarang ikut ditolak.
+  if (menuIsActive()) {
+    Serial.println("[SORTER] Klasifikasi diabaikan -- mode kalibrasi aktif (§12.6)");
+    return val;
+  }
   enqueueClassification(val != 0, millis());
   Serial.printf("[SORTER] Klasifikasi diterima: %s, dijadwalkan trigger dlm %lu ms\n",
                 val ? "REJECT" : "pass", (unsigned long)calculateTOF());
@@ -288,6 +335,7 @@ uint16_t onClassifyWrite(TRegister* reg, uint16_t val) {
 // bukan lompat instan seperti sebelumnya. Arah kembali (Dorong->Awal) pakai durasi SAMA.
 enum class HopperState { AT_START, MOVING_TO_PUSH, PUSH_HOLD, MOVING_TO_START };
 uint32_t hopperPushHoldStartMs = 0;
+uint32_t hopperAtStartSinceMs = 0;   // BARU -- kapan hopper kembali diam di titik awal (utk jeda antar siklus)
 HopperState hopperState = HopperState::AT_START;
 bool hopperIntervalTestMode = false;   // di-set true/false dari handleCalListKey()/handleParamKey()
 
@@ -320,10 +368,15 @@ void handleHopper() {
     if (hopperState != HopperState::AT_START) {
       hopperCurrentUs = cfg.hopperStartUs; hopperSetUs(hopperCurrentUs); hopperState = HopperState::AT_START;
     }
+    hopperAtStartSinceMs = millis();   // BARU -- jeda dihitung dari saat RUNNING dimulai, bukan dari boot
     return;
   }
   switch (hopperState) {
     case HopperState::AT_START:
+      // DIPERBAIKI (2026-09-20): dulu langsung lompat ke MOVING_TO_PUSH tanpa jeda -- hopper
+      // dorong-tarik nonstop selama RUNNING. Sekarang diam dulu selama cfg.hopperCycleGapMs
+      // (0 = perilaku lama). Ini satu-satunya kendali laju umpan yang dimiliki Sorter.
+      if (cfg.hopperCycleGapMs > 0 && millis() - hopperAtStartSinceMs < cfg.hopperCycleGapMs) break;
       hopperState = HopperState::MOVING_TO_PUSH;
       break;
     case HopperState::MOVING_TO_PUSH:
@@ -339,7 +392,10 @@ void handleHopper() {
       if (millis() - hopperPushHoldStartMs >= cfg.hopperPushHoldMs) hopperState = HopperState::MOVING_TO_START;
       break;
     case HopperState::MOVING_TO_START:
-      if (updateHopperTrajectory(cfg.hopperStartUs)) hopperState = HopperState::AT_START;
+      if (updateHopperTrajectory(cfg.hopperStartUs)) {
+        hopperState = HopperState::AT_START;
+        hopperAtStartSinceMs = millis();   // BARU -- mulai hitung jeda antar siklus
+      }
       break;
   }
 }
@@ -379,6 +435,11 @@ void handleConveyor() {
 enum class PalangState { IDLE, PUSHING, RETRACTING };
 PalangState palangState = PalangState::IDLE;
 uint32_t palangStateAt = 0;
+// BARU (2026-09-20): berapa lama dorongan palang masih dianggap masuk akal setelah waktu
+// idealnya lewat. Di atas ini objeknya dianggap sudah kejauhan -- mendorong sekarang justru
+// menyerempet objek yang salah, jadi lebih baik dibatalkan dan dicatat. Sengaja longgar:
+// mendorong telat sedikit masih mengenai objek yang benar karena palangnya tidak setipis itu.
+constexpr uint32_t PALANG_STALE_TOLERANCE_MS = 400;
 
 // BARU: motor A -- channel yang tadinya menganggur di chip TB6612FNG yang sama dgn conveyor,
 // SEKARANG dipakai jadi actuator palang (lihat handlePalangQueue) -- fungsi ini tetap dipakai
@@ -403,8 +464,25 @@ void handlePalangQueue() {
   uint32_t now = millis();
   if (qHead != qTail && !palangPending && palangState == PalangState::IDLE) {
     PendingClass &pc = pendingQ[qHead];
-    if (pc.isReject) { palangTriggerAt = pc.scanTimeMs + calculateTOF(); palangPending = true; }
-    qHead = (qHead + 1) % 4;
+    if (pc.isReject) {
+      uint32_t trigAt = pc.scanTimeMs + calculateTOF();
+      // DIPERBAIKI (2026-09-20): antrian hanya diproses saat palang IDLE, padahal satu siklus
+      // palang (push+retract) memakan ~600ms. REJECT berikutnya baru sempat diambil setelah
+      // itu, dan waktu dorongnya bisa SUDAH LEWAT -- `now >= palangTriggerAt` langsung benar,
+      // palang menghentak seketika padahal objeknya sudah jauh melewati palang. Yang kena
+      // dorong malah objek di belakangnya (yang mungkin pass). Sekarang dorongan yang sudah
+      // basi DIBATALKAN dan dicatat, bukan dipaksakan.
+      if ((int32_t)(now - trigAt) > (int32_t)PALANG_STALE_TOLERANCE_MS) {
+        rejectMissedCount++;
+        mb.Hreg(Reg::REJECT_MISSED_COUNT, (uint16_t)rejectMissedCount);
+        Serial.printf("[SORTER] !!! REJECT dilewati -- giliran dorong sudah lewat %ldms (antrian nunggu palang). Total terlewat=%lu !!!\n",
+                      (long)(now - trigAt), (unsigned long)rejectMissedCount);
+      } else {
+        palangTriggerAt = trigAt;
+        palangPending = true;
+      }
+    }
+    qHead = (qHead + 1) % CLASS_QUEUE_LEN;
   }
   if (palangPending && palangState == PalangState::IDLE && now >= palangTriggerAt) {
     motorWrite(CH::CONV1_AIN1, CH::CONV1_AIN2, cfg.palangDir);   // arah PUSH sesuai kalibrasi
@@ -448,6 +526,7 @@ void handleSafety() {
   if (io.read(CH::ESTOP) == LOW) {   // DIUBAH ke aktif-LOW sesuai instruksi terbaru
     currentState = NodeState::ESTOPPED;
     io.write(CH::CONV1_STBY, LOW);
+    lastConv1StbyState = false;   // BARU -- lihat penjelasan di otaSafeStop()
     ledcWrite(LEDC_CH_CONV1, 0);
     // DIUBAH: palang sekarang motor DC (bukan relay) -- E-stop WAJIB potong daya motor langsung,
     // BUKAN coba retract dulu (itu masih butuh motor jalan, kontradiktif sama tujuan E-stop).
@@ -470,9 +549,16 @@ bool otaBegun = false;   // ArduinoOTA.begin() sudah dipanggil sekali (callback 
 // Dipanggil dari ArduinoOTA.onStart() -- proses tulis flash BLOCKING selama beberapa detik,
 // jadi motor/actuator yang lagi jalan HARUS dipaksa berhenti dulu (LEDC hardware PWM tetap
 // jalan otonom walau CPU sibuk nulis flash, jadi tidak otomatis berhenti sendiri).
+// DIPERBAIKI (2026-09-20): CONV1_STBY di sini (dan di handleSafety()) ditulis LANGSUNG,
+// melewati cache lastConv1StbyState milik updateConv1Stby(). Kalau saat itu cache berisi
+// `true` (conveyor sedang jalan), cache jadi berbohong: pin fisik LOW tapi software yakin
+// sudah HIGH, jadi tidak akan pernah ditulis ulang. Gejalanya: OTA gagal di tengah jalan
+// tanpa reboot -> conveyor mati senyap (PWM tetap keluar, STBY-nya yang mati) sampai ada
+// perubahan state yang kebetulan memaksa penulisan ulang. Cache disinkronkan di sini.
 void otaSafeStop() {
   ledcWrite(LEDC_CH_CONV1, 0);
   io.write(CH::CONV1_STBY, LOW);
+  lastConv1StbyState = false;
   ledcWrite(LEDC_CH_MOTORA, 0); motorAState = 0;
   palangState = PalangState::IDLE; palangActive = false; palangPending = false;
 }
@@ -562,6 +648,13 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     case Cmd::STOP:
       currentState = NodeState::IDLE;
       mainModeActive = false;   // BARU -- balik ke TEST mode, command TEST boleh dipakai lagi
+      // BARU (2026-09-20): STOP juga membatalkan klasifikasi yang belum sempat didorong.
+      // Dulu antrian + palangPending dibiarkan utuh: conveyor sudah berhenti tapi palang
+      // masih bisa menghentak sendiri setelahnya, dan sisa antrian meletus sekaligus saat
+      // START berikutnya. Siklus palang yang SEDANG berjalan sengaja dibiarkan selesai --
+      // menghentikannya di tengah meninggalkan palang menjulur di atas conveyor.
+      clearClassificationQueue("STOP diterima");
+      palangPending = false;
       break;
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb, simpan SEBELUM di-nol-kan
@@ -575,8 +668,8 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     case Cmd::SET_CONVEYOR_SPEED:  cfg.conveyorSpeed = (uint8_t)constrain(arg, 0, 255); break;
     case Cmd::SET_CONVEYOR_DIR:    cfg.conveyorDir = (arg != 0); break;
     case Cmd::RESET_COUNTERS:
-      passCount = 0; rejectCount = 0;
-      mb.Hreg(Reg::PASS_COUNT, 0); mb.Hreg(Reg::REJECT_COUNT, 0);
+      passCount = 0; rejectCount = 0; rejectMissedCount = 0;   // BARU -- ikut direset
+      mb.Hreg(Reg::PASS_COUNT, 0); mb.Hreg(Reg::REJECT_COUNT, 0); mb.Hreg(Reg::REJECT_MISSED_COUNT, 0);
       break;
     // BARU: command TEST/jog di bawah DITOLAK TOTAL selama mainModeActive -- Orange Pi wajib
     // STOP dulu. SET_PALANG_SPEED/SET_HOPPER_STEP DIKECUALIKAN (cuma tuning angka, gak gerakin
@@ -608,9 +701,8 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       enqueueClassification(true, millis());
       Serial.println("[SORTER] TEST_TRIGGER_PALANG -- simulasi reject dikirim");
       break;
-    case Cmd::TEST_FAULT:
-      faultCode = 99; currentState = NodeState::FAULT;
-      break;
+    // DIHAPUS (2026-09-20): Cmd::TEST_FAULT (opcode 99) -- memaksa node ke FAULT palsu.
+    // Komentar aslinya di registers.h sudah menyuruh menghapusnya sebelum produksi.
     default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); break;
   }
 }
@@ -633,6 +725,7 @@ enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_PARAM,
                         TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
                         TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET };
 MenuState menuState = MenuState::NONE;
+bool menuIsActive() { return menuState != MenuState::NONE; }   // BARU -- dipakai onClassifyWrite() di atas
 uint8_t jogStepIdx = 0;
 constexpr int16_t JOG_STEPS[4] = {5, 10, 20, 50};
 
@@ -670,13 +763,17 @@ void drawTopMenuSorter() {
 // jelas/gak gampang ditemukan operator pas node FAULT. Sekarang langsung di halaman
 // utama Setting Kalibrasi. Item 1-15 (Conveyor Speed dst) TIDAK berubah urutan/nomornya
 // terhadap selParam (lihat handleCalListKey -- selParam = calCursor, bukan calCursor+1).
-constexpr uint8_t CAL_COUNT = 17;
+// DIUBAH (2026-09-20): +1 item "Hopper Gap Siklus(ms)" (index 16) -- jeda antar siklus hopper,
+// satu-satunya kendali laju umpan yang dimiliki Sorter. Disisipkan SEBELUM "Reset ke Default"
+// supaya index 0-15 tidak bergeser sama sekali (selParam memakai angka yang sama).
+constexpr uint8_t CAL_COUNT = 18;
 const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault",
                                         "Conveyor Speed", "Conveyor Dir", "Palang Speed", "Palang Dir",
                                         "Palang Push (ms)", "Palang Retract (ms)", "Dist (TOF mm)", "Mm/s Max",
                                         "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Step (us)", "Hopper Step Interval(ms)",
                                         "Hopper Push Hold(ms)",
-                                        "Buzzer On (ms)", "Buzzer Off (ms)", "Reset ke Default" };
+                                        "Buzzer On (ms)", "Buzzer Off (ms)",
+                                        "Hopper Gap Siklus(ms)", "Reset ke Default" };
 uint8_t calCursor = 0;
 uint8_t selParam = 0;
 
@@ -715,7 +812,8 @@ void handleCalListKey(char key) {
       applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
       lcdPrint(0, 3, "Fault direset!      ");
       Serial.println("[CAL] Reset Fault dari menu LCD");
-    } else if (calCursor == 16) {   // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
+    } else if (calCursor == 17) {   // DIUBAH 16 -> 17 (item "Hopper Gap Siklus" disisipkan sebelumnya)
+                                     // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
       menuState = MenuState::CONFIRM_RESET;
       drawConfirmReset();
     } else {
@@ -747,6 +845,7 @@ void drawParamMenu() {
     case 13: lcdPrint(0, 0, "HOPPER PUSH HOLD(ms)"); break;
     case 14: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
     case 15: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
+    case 16: lcdPrint(0, 0, "HOPPER GAP SIKLUS"); break;
   }
   String line1;
   switch (selParam) {
@@ -765,6 +864,7 @@ void drawParamMenu() {
     case 13: line1 = "ms:" + String(cfg.hopperPushHoldMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 14: line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 15: line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 16: line1 = "ms:" + String(cfg.hopperCycleGapMs) + (cfg.hopperCycleGapMs == 0 ? " (NONSTOP)" : "") + " S:" + String(JOG_STEPS[jogStepIdx]); break;
   }
   lcdPrint(0, 1, line1);
   lcdPrint(0, 2, (selParam == 2 || selParam == 4) ? "A=Forward B=Reverse" : "A+ B- C:step");
@@ -859,6 +959,12 @@ void handleParamKey(char key) {
       else if (key == 'B') cfg.buzzerOffMs = (uint16_t)constrain((int)cfg.buzzerOffMs - step * 10, 50, 5000);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
+    case 16:
+      // BARU: jeda diam antar siklus hopper = kendali laju umpan. 0 = nonstop (perilaku lama).
+      if (key == 'A') cfg.hopperCycleGapMs = (uint16_t)constrain((int)cfg.hopperCycleGapMs + step * 10, 0, 10000);
+      else if (key == 'B') cfg.hopperCycleGapMs = (uint16_t)constrain((int)cfg.hopperCycleGapMs - step * 10, 0, 10000);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
   }
   if (key == '#') {
     saveConfigToNvs();
@@ -883,7 +989,7 @@ IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
   {"OPR",    CH::LED_OPERATION, true},
   {"RUN",    CH::LED_RUN,       true},
   {"MANUAL", CH::LED_MANUAL,    true},
-  {"FAULT",  CH::LED_FAULT,     false},
+  {"FAULT",  CH::LED_FAULT,     true},   // DIUBAH -- sekarang auto-controlled (lihat updateUniversalIndicators)
   {"BUZZER", CH::BUZZER,        false},
   {"CONV1_STBY", CH::CONV1_STBY, false},
   // DIUBAH: dulu "PALANG" (relay reject) -- sekarang palang pakai motor DC (Motor A), RLY1
@@ -1243,7 +1349,7 @@ void handleTestIoCategoryKey(char key) {
 
 // --- LEVEL 1c: TEST COMMAND (simulasi command SEOLAH dari node lain via Modbus) ---
 struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
-constexpr uint8_t CMD_TEST_COUNT = 11;
+constexpr uint8_t CMD_TEST_COUNT = 10;   // DIUBAH 11 -> 10, TEST_FAULT dihapus
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"START",             Cmd::START,               0},
   {"STOP",               Cmd::STOP,                0},
@@ -1255,7 +1361,7 @@ CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"MOTOR_A Stop",       Cmd::SET_MOTOR_A,         0},
   {"Test Hopper M/M",    Cmd::TEST_HOPPER_CYCLE,   0},
   {"TEST_TRIGGER_PALANG",Cmd::TEST_TRIGGER_PALANG, 0},
-  {"TEST_FAULT",         Cmd::TEST_FAULT,          0},
+  // DIHAPUS: {"TEST_FAULT", Cmd::TEST_FAULT, 0} -- opcode 99 sudah dibuang (lihat registers.h)
 };
 const char* CMD_TEST_LABELS_ONLY[CMD_TEST_COUNT];
 void buildCmdTestLabels() { for (uint8_t i = 0; i < CMD_TEST_COUNT; i++) CMD_TEST_LABELS_ONLY[i] = CMD_TEST_ITEMS[i].label; }
@@ -1337,7 +1443,7 @@ void handleSerialCommand() {
   else if (cmd == "DIR")         applyCommand((uint16_t)Cmd::SET_CONVEYOR_DIR, arg);
   else if (cmd == "RESET_COUNT") applyCommand((uint16_t)Cmd::RESET_COUNTERS, 0);
   else if (cmd == "TEST_PALANG") applyCommand((uint16_t)Cmd::TEST_TRIGGER_PALANG, 0);
-  else if (cmd == "TEST_FAULT")  applyCommand((uint16_t)Cmd::TEST_FAULT, 0);
+  // DIHAPUS: command Serial "TEST_FAULT" -- opcode-nya sudah tidak ada lagi
   // BARU (celah #1): TESTPASS/TESTREJECT sekarang ikut di-gate mainModeActive juga -- gak boleh
   // simulasi klasifikasi manual selama produksi asli jalan, sama seperti tombol fisik.
   else if (cmd == "TESTPASS") {
@@ -1359,6 +1465,8 @@ void handleSerialCommand() {
     Serial.printf("[STATUS] state=%s fault=%u pass=%lu reject=%lu ESTOP=%d speed=%u dir=%d dist=%.1f mmps=%.1f\n",
                   stateText(currentState), faultCode, (unsigned long)passCount, (unsigned long)rejectCount,
                   io.read(CH::ESTOP), cfg.conveyorSpeed, cfg.conveyorDir, cfg.distMm, cfg.mmPerSecAtMaxPwm);
+    Serial.printf("[STATUS] rejectMissed=%lu (antrian penuh / dorongan basi) menuAktif=%d\n",
+                  (unsigned long)rejectMissedCount, menuIsActive() ? 1 : 0);
     Serial.printf("[STATUS] activity=%u i2cErrCount=%u lastFault=%u uptime=%lus motorA=%u palangState=%d\n",
                   (uint16_t)activityCode(), i2cErrorCount, lastFaultCode, (unsigned long)(millis() / 1000), motorAState, (int)palangState);
     Serial.printf("[STATUS] FW=%s build=%s freeHeap=%u\n", FW_VERSION, FW_BUILD, ESP.getFreeHeap());
@@ -1367,7 +1475,7 @@ void handleSerialCommand() {
     Serial.println("[HELP] Command tersedia:");
     Serial.println("  START | STOP | RESET_FAULT | RESET_COUNT");
     Serial.println("  SPEED <0-255> | DIR <0|1>");
-    Serial.println("  TEST_PALANG | TEST_FAULT | TESTPASS | TESTREJECT | MOTORA <0-2> | MOTORASPEED <0-255> | STATUS");
+    Serial.println("  TEST_PALANG | TESTPASS | TESTREJECT | MOTORA <0-2> | MOTORASPEED <0-255> | STATUS");
   }
   else Serial.printf("[SERIAL] Command '%s' tidak dikenal -- ketik HELP untuk daftar\n", cmd.c_str());
 }
@@ -1429,6 +1537,12 @@ void updateUniversalIndicators() {
   bool ledManualNow = (menuState != MenuState::NONE);
   if (ledRunNow != lastLedRun) { io.write(CH::LED_RUN, ledRunNow); lastLedRun = ledRunNow; }
   if (ledManualNow != lastLedManual) { io.write(CH::LED_MANUAL, ledManualNow); lastLedManual = ledManualNow; }
+  // BARU (2026-09-20): LED_FAULT. Channel ini di-pinMode OUTPUT di setup() dan terdaftar di
+  // menu Test Output, TAPI tidak pernah ditulis satu kali pun secara otomatis -- lampu fault
+  // praktis mati permanen selama produksi di KEEMPAT node. Sekarang ikut dikelola di sini.
+  static bool lastLedFault = false;
+  bool ledFaultNow = (currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED);
+  if (ledFaultNow != lastLedFault) { io.write(CH::LED_FAULT, ledFaultNow); lastLedFault = ledFaultNow; }
 }
 
 // --- BARU: scan I2C, tentukan lcdPresent/keypadPresent -- LCD/Keypad OPSIONAL, hanya utk kalibrasi ---
@@ -1596,6 +1710,8 @@ void setup() {
   mb.addHreg(Reg::LAST_FAULT_CODE, 0);
   mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
+  mb.addHreg(Reg::MENU_ACTIVE, 0);           // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
+  mb.addHreg(Reg::REJECT_MISSED_COUNT, 0);   // BARU -- REJECT yang gagal jadi dorongan palang
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   mb.onSetHreg(Reg::CLASSIFY_IS_REJECT, onClassifyWrite);
   Serial.println("[BOOT] Modbus + register lengkap OK");
@@ -1670,6 +1786,9 @@ void loop() {
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
   mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
+  // BARU: master bisa bedain "node lagi dikalibrasi operator" vs "node mati/kabel putus" --
+  // dua-duanya sama-sama TIDAK membalas CMD_ACK_SEQ, jadi sebelumnya tidak bisa dibedakan.
+  mb.Hreg(Reg::MENU_ACTIVE, (menuState != MenuState::NONE) ? 1 : 0);
 
   // --- Logic fisik (safety, conveyor, palang, sensor) SELALU jalan, baik menu aktif atau tidak ---
   // DIUBAH: sebelumnya bagian ini ikut di-skip saat menu aktif, sekarang tetap jalan supaya
@@ -1698,10 +1817,15 @@ void loop() {
   if (!pauseAutoIndicators) updateUniversalIndicators();
 
   handleSafety();
+  // DIPERBAIKI (2026-09-20): buzzer dipindah KELUAR dari blok bersyarat di bawah. Komentarnya
+  // sendiri bilang "TIDAK di-skip walau menu aktif" -- itu benar, tapi tetap ikut ter-skip saat
+  // FAULT/ESTOPPED. Kalau fault terjadi tepat di tengah bunyi, tidak ada lagi yang mematikannya
+  // dan buzzer meraung terus tanpa henti.
+  updateBuzzerBeep();
+
   if (currentState != NodeState::ESTOPPED && currentState != NodeState::FAULT) {
     handleHopper();   // BARU -- servo hopper aktif otomatis selama RUNNING_OR_MOVING
     updateTestHopperCycle();   // BARU -- proses test sequence non-blocking (independen dari FSM hopper produksi)
-    updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking, TIDAK di-skip walau menu aktif
     handleConveyor();
     handlePalangQueue();
     handleSensors();

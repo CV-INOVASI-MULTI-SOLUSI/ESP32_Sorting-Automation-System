@@ -170,7 +170,15 @@ def wait_register(instr, node_name, reg_addr, expected_value, timeout, poll_inte
 def find_free_rack(stocker):
     """Baca RACK_OCCUPIED_BITMASK, cari rak 1-4 pertama yang kosong (bit=0).
     DIUBAH: fisik cuma ada 4 rack (Rak 1-4, dikonfirmasi user) -- dulu loop 0-5 salah, bisa
-    balikin slot 0 (gak ada fisiknya) karena bit-nya emang selalu 0 (gak pernah kepakai)."""
+    balikin slot 0 (gak ada fisiknya) karena bit-nya emang selalu 0 (gak pernah kepakai).
+
+    PENTING (diperbaiki 2026-09-20 di sisi FIRMWARE, bukan di sini): dulu firmware Stocker
+    menomori bit pakai INDEX ARRAY RACK_LIM (RACK_LIM[0] -> bit0), padahal RACK_LIM[0] itu
+    limit switch fisik RAK 1. Jadi bit yang dibaca loop di bawah geser 1: bit Rak 1 tidak
+    pernah dibaca (Rak 1 selalu kelihatan kosong -> SEMUA box ditumpuk ke Rak 1 terus),
+    sementara bit 4 yang dibaca justru LIM_8 yang tidak ada fisiknya. Firmware sekarang
+    memakai konvensi bit N = Rak N (bit1..bit4 = Rak 1..4, bit0 selalu 0) -- persis yang
+    diasumsikan loop di bawah. WAJIB flash ulang Stocker agar perbaikan ini berlaku."""
     if DRY_RUN:
         print("  .. (DRY_RUN) anggap rack 1 kosong")
         return 1

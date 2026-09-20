@@ -44,6 +44,10 @@ namespace Reg {
   // nunggu. Wrap dari 65535 balik ke 0 itu WAJAR (uint16_t Modbus), tetap valid dibandingkan
   // != asal gak lebih dari 65535 event kelewatan di satu jendela tunggu (mustahil praktiknya).
   constexpr uint16_t MIDDLE_ARRIVAL_COUNT = 19;  // R
+  // BARU (2026-09-20): menu kalibrasi LCD meng-IGNORE semua command Modbus (§12.6) TANPA
+  // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
+  // Register ini bikin master bisa bedain dua kondisi itu.
+  constexpr uint16_t MENU_ACTIVE = 20;  // R, 1 = operator lagi di menu kalibrasi LCD
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik FEEDER (refillState yg sudah ada) ---

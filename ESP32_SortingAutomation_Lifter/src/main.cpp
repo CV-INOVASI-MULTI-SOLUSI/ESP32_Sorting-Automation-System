@@ -181,9 +181,18 @@ void resetAllToDefault() {
   Serial.println("[RESET] Semua kalibrasi STOCKER dikembalikan ke default & NVS dihapus");
 }
 
+// DIPERBAIKI (bug ditemukan 2026-09-20, TERPARAH di STOCKER): penomoran bit GESER 1 dari
+// yang dibaca Orange Pi. Firmware dulu pakai bit = INDEX ARRAY (RACK_LIM[0] -> bit0), padahal
+// RACK_LIM[0] itu limit switch fisik RAK 1 (array RACK[] sendiri sudah 1-based, RACK[0] gak
+// dipakai). Orange Pi find_free_rack() baca bit 1-4 -- jadi bit RAK 1 GAK PERNAH DIBACA
+// (selalu kelihatan kosong -> semua box ditumpuk ke Rak 1 terus), sementara bit 4 yang dibaca
+// itu LIM_8 yang gak ada fisiknya. SEKARANG bit N = RAK N (1-based, bit0 sengaja selalu 0),
+// dan cuma 4 rak fisik yang di-scan (LIM_8/LIM_9 gak dipakai, floating INPUT_PULLUP).
+constexpr uint8_t RACK_PHYSICAL_COUNT = 4;   // Rak 1-4, dikonfirmasi user
 uint16_t readRackOccupiedBitmask() {
   uint16_t mask = 0;
-  for (uint8_t i = 0; i < 6; i++) if (io.read(CH::RACK_LIM[i]) == LOW) mask |= (1 << i);
+  for (uint8_t i = 0; i < RACK_PHYSICAL_COUNT; i++)
+    if (io.read(CH::RACK_LIM[i]) == LOW) mask |= (1 << (i + 1));
   return mask;
 }
 
@@ -198,10 +207,12 @@ void updateRackStatusTask() {
   static uint32_t lastUpdate = 0;
   if (millis() - lastUpdate < 100) return;
   lastUpdate = millis();
+  // DIPERBAIKI: penomoran bit SAMA dgn readRackOccupiedBitmask() di atas (bit N = Rak N,
+  // 1-based) -- dulu dua fungsi ini sama-sama salah, sekarang dua-duanya konsisten.
   uint16_t mask = 0;
-  for (uint8_t i = 0; i < 6; i++) {
+  for (uint8_t i = 0; i < RACK_PHYSICAL_COUNT; i++) {
     // DIHAPUS: io.write(CH::RACK_LED[i], ...) -- fitur RACK_LED tidak dipakai lagi di board universal baru
-    if (io.read(CH::RACK_LIM[i]) == LOW) mask |= (1 << i);
+    if (io.read(CH::RACK_LIM[i]) == LOW) mask |= (1 << (i + 1));
   }
   lastRackBitmask = mask;
 }
@@ -226,6 +237,12 @@ void updateUniversalIndicators() {
   bool ledManualNow = (menuState != MenuState::NONE);
   if (ledRunNow != lastLedRun) { io.write(CH::LED_RUN, ledRunNow); lastLedRun = ledRunNow; }
   if (ledManualNow != lastLedManual) { io.write(CH::LED_MANUAL, ledManualNow); lastLedManual = ledManualNow; }
+  // BARU (2026-09-20): LED_FAULT. Channel ini di-pinMode OUTPUT di setup() dan terdaftar di
+  // menu Test Output, TAPI tidak pernah ditulis satu kali pun secara otomatis -- lampu fault
+  // praktis mati permanen selama produksi di KEEMPAT node. Sekarang ikut dikelola di sini.
+  static bool lastLedFault = false;
+  bool ledFaultNow = (currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED);
+  if (ledFaultNow != lastLedFault) { io.write(CH::LED_FAULT, ledFaultNow); lastLedFault = ledFaultNow; }
 }
 
 // DIHAPUS: stepPulse() lama (blocking, delayMicroseconds) -- sudah tidak dipakai
@@ -364,6 +381,49 @@ void updateSteppers() {
   if (!anyMoving && state == LiftState::MOVING) state = LiftState::IDLE;
 }
 
+// ============================================================
+// BARU (2026-09-20) -- penghentian gerak terpusat + pemicu FAULT yang KONSISTEN.
+//
+// Masalah yang diperbaiki:
+//   1. FAULT TIDAK menghentikan gerakan. loop() cuma menjaga `currentState != ESTOPPED`,
+//      dan cabang FAULT di handleCycle() mengecek `state` (LiftState) bukan `currentState`.
+//      Akibatnya COMM_TIMEOUT / MCP23017 mati di tengah RUN_FULL_CYCLE: stepper tetap jalan
+//      dan siklus tetap selesai sampai habis sambil melaporkan FAULT ke master. Kalau yang
+//      mati MCP-nya, limit switch dibaca ngawur tapi homing tetap lanjut sampai timeout 30s.
+//   2. faultCode di-set TANPA currentState/state ikut FAULT (moveToRackXZ, updateYRetract).
+//      Register STATE melaporkan IDLE/RUNNING padahal FAULT_CODE bukan 0, dan activityCode()
+//      tidak pernah mengembalikan FAULT_AKTIF.
+//   3. ackPending menggantung kalau gerak non-cycle (MOVE_TO_RACK/GOTO_LOAD_POSITION) kena
+//      fault -- baru terkirim belakangan saat RESET_FAULT, sehingga CMD_ACK_SEQ ketimpa
+//      seq LAMA dan master mengira RESET_FAULT tidak di-ack.
+//
+// CATATAN KESELAMATAN (disengaja): haltMotion() TIDAK mematikan driver stepper. Axis Z itu
+// vertikal -- mematikan driver berarti melepas torsi tahan dan beban bisa jatuh karena
+// gravitasi. Jadi saat FAULT, langkah dihentikan (target disamakan dengan posisi sekarang)
+// tapi driver tetap energized supaya Z tertahan. Mematikan driver hanya dilakukan oleh
+// E-stop, yang memang tujuannya memutus daya secara sengaja.
+// ============================================================
+void haltMotion() {
+  for (uint8_t i = 0; i < 3; i++) { tgtPos[i] = curPos[i]; stepHigh[i] = false; }
+  yRetracting = false;
+  cycleStage = CycleStage::NONE;
+  testRackGoingToLoad = false;
+  testRackTimingActive = false;
+}
+
+// Pemicu FAULT tunggal: set kode + state + hentikan gerak + tuntaskan ack yang menggantung.
+// Ack tetap dikirim karena konvensi protokol di node ini "ack = command diterima & selesai
+// diproses", BUKAN "command berhasil" -- master membedakan berhasil/gagal lewat FAULT_CODE.
+void raiseFault(uint16_t code, const char* why) {
+  if (faultCode == 0) faultCode = code;
+  currentState = NodeState::FAULT;
+  state = LiftState::FAULT;
+  haltMotion();
+  if (ackPending) { ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq); }
+  Serial.printf("[FAULT] %s (code=%u) -- gerak dihentikan, driver stepper TETAP aktif (Z tertahan)\n",
+                why, faultCode);
+}
+
 uint32_t homingStepCount = 0;
 bool moveToRackXZ(uint8_t rackIdx);   // forward declaration -- dipakai di updateHoming() (Test ke Rak), didefinisikan di bawah
 // BARU (perbaikan M05/B02 + celah yang saya temukan di draft rekomendasi): timer
@@ -428,9 +488,10 @@ void updateHoming() {
 
   uint32_t now = micros();
   if ((uint32_t)(now - homingAxisStartMicros[homingAxis]) >= HOMING_TIMEOUT_US) {
-    faultCode = (uint16_t)FaultCode::HOMING_FAILED; state = LiftState::FAULT; currentState = NodeState::FAULT;
-    setStepperEnabled(false);
-    if (ackPending) ackPending = false;
+    // DIUBAH: lewat raiseFault() -- dulu di sini ackPending cuma di-CLEAR tanpa pernah
+    // dikirim, jadi master menunggu ack yang tidak akan pernah datang sampai timeout.
+    // setStepperEnabled(false) juga dihapus: lihat catatan keselamatan di haltMotion().
+    raiseFault((uint16_t)FaultCode::HOMING_FAILED, "Homing timeout 30s (limit switch tidak pernah kena)");
     return;
   }
 
@@ -465,9 +526,10 @@ void updateYRetract() {
     return;
   }
   if (millis() - yRetractStartMs > Y_RETRACT_TIMEOUT_MS) {
-    yRetracting = false;
-    faultCode = (uint16_t)FaultCode::PUSH_STUCK; state = LiftState::FAULT;
-    Serial.println("[STOCKER] !!! Y retract GAGAL !!!");
+    // DIUBAH: dulu cuma set faultCode + state(LiftState), currentState TETAP RUNNING --
+    // register STATE bohong (lapor RUNNING padahal fault) dan activityCode() tidak pernah
+    // balikin FAULT_AKTIF. raiseFault() menyetel ketiganya sekaligus.
+    raiseFault((uint16_t)FaultCode::PUSH_STUCK, "Y retract GAGAL (limit Y tidak kena dalam 5s)");
     return;
   }
   uint32_t now = micros();
@@ -483,7 +545,10 @@ void updateYRetract() {
 bool moveToRackXZ(uint8_t rackIdx) {
   bool idxValid = (rackIdx >= 1 && rackIdx <= 4);
   if (!idxValid || !homed[0] || !homed[1] || !homed[2]) {
-    faultCode = !idxValid ? (uint16_t)FaultCode::RACK_IDX_INVALID : (uint16_t)FaultCode::NOT_HOMED;
+    // DIUBAH: dulu cuma set faultCode dan return -- currentState tetap IDLE, jadi dari sisi
+    // master kelihatan "IDLE tapi semua command ditolak" (blockIfFaulted cek faultCode != 0).
+    raiseFault(!idxValid ? (uint16_t)FaultCode::RACK_IDX_INVALID : (uint16_t)FaultCode::NOT_HOMED,
+               !idxValid ? "rack_idx di luar 1-4" : "belum homing (X/Y/Z)");
     return false;
   }
   tgtPos[0] = RACK[rackIdx].x; tgtPos[2] = RACK[rackIdx].z;
@@ -562,6 +627,39 @@ void handleCycle() {
   }
 }
 
+// BARU (2026-09-20): pembatalan siklus yang SOPAN -- dipakai Cmd::STOP_MAIN.
+// Dulu STOP_MAIN cuma mematikan flag mainModeActive; siklus RUN_FULL_CYCLE yang sedang
+// berjalan TERUS sampai selesai, dan tidak ada satu pun command untuk menghentikan lift
+// selain E-stop. Sekarang STOP_MAIN benar-benar menghentikan.
+//
+// Kenapa tidak langsung berhenti total: kalau dibatalkan saat pusher Y sedang menjulur,
+// Y akan tertinggal di luar -- lift lalu bergerak di sumbu X/Z dengan pusher masih
+// menjulur dan bisa menabrak rak. Jadi X/Z dihentikan di tempat, lalu Y ditarik balik
+// dulu sampai limit sebelum node dinyatakan IDLE.
+void abortCycle() {
+  bool sedangGerak = (cycleStage != CycleStage::NONE) || yRetracting || (state == LiftState::MOVING);
+  if (!sedangGerak) return;
+
+  for (uint8_t i = 0; i < 3; i++) tgtPos[i] = curPos[i];   // hentikan semua axis di posisi sekarang
+  testRackGoingToLoad = false;
+  testRackTimingActive = false;
+  if (ackPending) { ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq); }
+
+  if (yRetracting) {
+    cycleStage = CycleStage::RETRACT_Y_STANDALONE;
+    Serial.println("[ABORT] Siklus dibatalkan -- retract Y yang sedang jalan dibiarkan selesai dulu");
+  } else if (curPos[1] != 0) {
+    startYRetract();
+    cycleStage = CycleStage::RETRACT_Y_STANDALONE;
+    Serial.println("[ABORT] Siklus dibatalkan -- pusher Y ditarik balik dulu sebelum berhenti");
+  } else {
+    cycleStage = CycleStage::NONE;
+    state = LiftState::IDLE;
+    currentState = NodeState::IDLE;
+    Serial.println("[ABORT] Siklus dibatalkan -- lift berhenti di tempat (pusher sudah tertarik)");
+  }
+}
+
 void handleSafety() {
   if (io.read(CH::ESTOP) == LOW) {   // DIUBAH dari HIGH ke LOW
     // SENGAJA unconditional (BUKAN lewat setStepperEnabled()/cache) -- ini jalur
@@ -570,6 +668,11 @@ void handleSafety() {
     io.write(CH::EN_STEPPERS, HIGH);
     steppersEnabled = false;   // tetap sinkronkan cache setelahnya
     currentState = NodeState::ESTOPPED; state = LiftState::ESTOPPED;
+    // DIPERBAIKI (2026-09-20): tgtPos TIDAK PERNAH direset di sini. Kalau E-stop ditekan saat
+    // PUSHING_Y, tgtPos[1] tetap berisi pushExtendSteps -- begitu E-stop dilepas dan command
+    // gerak berikutnya menyetel state=MOVING, updateSteppers() ikut melanjutkan dorongan Y
+    // yang tertinggal itu, padahal tidak ada yang memintanya. Samakan target = posisi sekarang.
+    for (uint8_t i = 0; i < 3; i++) { tgtPos[i] = curPos[i]; stepHigh[i] = false; }
     cycleStage = CycleStage::NONE; ackPending = false; yRetracting = false;
     testRackGoingToLoad = false;   // BARU -- cegah chain Test Rak resume aneh setelah E-stop dilepas
     testRackTimingActive = false;
@@ -595,6 +698,7 @@ bool otaBegun = false;   // ArduinoOTA.begin() sudah dipanggil sekali (callback 
 void otaSafeStop() {
   io.write(CH::EN_STEPPERS, HIGH);
   steppersEnabled = false;
+  for (uint8_t i = 0; i < 3; i++) { tgtPos[i] = curPos[i]; stepHigh[i] = false; }   // BARU -- sama alasannya dgn E-stop
   cycleStage = CycleStage::NONE; ackPending = false; yRetracting = false;
 }
 
@@ -711,7 +815,11 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       mb.Hreg(Reg::CMD_ACK_SEQ, seq); return;
     case Cmd::STOP_MAIN:
       mainModeActive = false;
-      Serial.println("[CMD] STOP_MAIN -- MAIN mati, MOVE_TO_RACK/PUSH_BOX boleh dipakai lagi");
+      // DIUBAH (2026-09-20): STOP_MAIN sekarang BENAR-BENAR menghentikan. Dulu cuma mematikan
+      // flag, siklus RUN_FULL_CYCLE yang sedang jalan tetap lanjut sampai habis -- padahal
+      // shutdown_sequence() Orange Pi mengirim STOP_MAIN justru untuk menghentikan node.
+      abortCycle();
+      Serial.println("[CMD] STOP_MAIN -- MAIN mati, siklus dibatalkan, MOVE_TO_RACK/PUSH_BOX boleh dipakai lagi");
       mb.Hreg(Reg::CMD_ACK_SEQ, seq); return;
     case Cmd::HOME_ALL:
       if (blockIfFaulted("HOME_ALL", seq)) return;
@@ -721,7 +829,7 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
     case Cmd::RUN_FULL_CYCLE:
       if (blockIfFaulted("RUN_FULL_CYCLE", seq)) return;
       if (!mainModeActive) { Serial.println("[CMD] RUN_FULL_CYCLE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
-      if (!homed[1] || curPos[1] != 0) { faultCode = (uint16_t)FaultCode::NOT_HOMED; mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
+      if (!homed[1] || curPos[1] != 0) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "RUN_FULL_CYCLE: axis Y belum homing / pusher belum di posisi 0"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       currentState = NodeState::RUNNING_OR_MOVING;
       cycleStage = CycleStage::MOVING_XZ;
@@ -744,7 +852,7 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       ackPending = true; pendingAckSeq = seq; return;
     case Cmd::GOTO_LOAD_POSITION:   // BARU -- manual, menuju titik standby terima package
       if (blockIfFaulted("GOTO_LOAD_POSITION", seq)) return;
-      if (!homed[0] || !homed[2]) { faultCode = (uint16_t)FaultCode::NOT_HOMED; mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
+      if (!homed[0] || !homed[2]) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "GOTO_LOAD_POSITION: axis X/Z belum homing"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
       tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z;
       state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
@@ -1018,7 +1126,7 @@ IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
   {"OPR",    CH::LED_OPERATION, true},
   {"RUN",    CH::LED_RUN,       true},
   {"MANUAL", CH::LED_MANUAL,    true},
-  {"FAULT",  CH::LED_FAULT,     false},
+  {"FAULT",  CH::LED_FAULT,     true},   // DIUBAH -- sekarang auto-controlled (lihat updateUniversalIndicators)
   {"BUZZER", CH::BUZZER,        false},
 };
 uint8_t outputTestCursor = 0;
@@ -1557,6 +1665,7 @@ void setup() {
   mb.addHreg(Reg::ACTIVITY_CODE, 0); mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
+  mb.addHreg(Reg::MENU_ACTIVE, 0);        // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
@@ -1626,6 +1735,9 @@ void loop() {
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
   mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
+  // BARU: master bisa bedain "node lagi dikalibrasi operator" vs "node mati/kabel putus" --
+  // dua-duanya sama-sama TIDAK membalas CMD_ACK_SEQ, jadi sebelumnya tidak bisa dibedakan.
+  mb.Hreg(Reg::MENU_ACTIVE, (menuState != MenuState::NONE) ? 1 : 0);
   bool pauseAutoIndicators = (menuState == MenuState::TEST_OUTPUT_ITEM && OUTPUT_TEST_ITEMS[outputTestCursor].autoControlled);
   if (!pauseAutoIndicators) updateUniversalIndicators();
 
@@ -1635,16 +1747,25 @@ void loop() {
     bool healthy = io.recheckHealth();
     if (!healthy) i2cErrorCount++;   // BARU -- catat SETIAP kegagalan
     if (!healthy && currentState != NodeState::FAULT && currentState != NodeState::ESTOPPED) {
-      faultCode = (uint16_t)FaultCode::IO_EXPANDER_MISSING;
-      currentState = NodeState::FAULT;
-      Serial.println("[SAFETY] !!! MCP23017 berhenti merespons I2C -- FAULT dipicu !!!");
+      // DIUBAH: lewat raiseFault() supaya gerakan benar-benar berhenti. Ini kasus paling
+      // berbahaya dari bug lama: limit switch dibaca lewat MCP yang SAMA, jadi kalau MCP mati
+      // sementara homing jalan, data limit tidak bisa dipercaya TAPI axis tetap melangkah.
+      raiseFault((uint16_t)FaultCode::IO_EXPANDER_MISSING, "MCP23017 berhenti merespons I2C (data sensor tidak bisa dipercaya)");
     }
   }
 
   checkLcdKeypadHotplug();
 
   handleSafety();
-  if (currentState != NodeState::ESTOPPED) {
+  // DIPERBAIKI (2026-09-20): buzzer dipindah KELUAR dari blok bersyarat di bawah. Dulu ikut
+  // di-skip saat ESTOPPED/FAULT -- kalau fault terjadi tepat di tengah bunyi, tidak ada lagi
+  // yang mematikannya dan buzzer nyala terus tanpa henti.
+  updateBuzzerBeep();
+
+  // DIPERBAIKI (2026-09-20): FAULT ikut dijaga, dulu hanya ESTOPPED. Lihat penjelasan lengkap
+  // di raiseFault()/haltMotion(). Tanpa ini, COMM_TIMEOUT atau MCP23017 mati di tengah siklus
+  // tidak menghentikan apa pun -- stepper jalan terus sambil register melaporkan FAULT.
+  if (currentState != NodeState::ESTOPPED && currentState != NodeState::FAULT) {
     switch (state) {
       case LiftState::HOMING: updateHoming(); break;
       case LiftState::MOVING: updateSteppers(); break;
@@ -1652,7 +1773,6 @@ void loop() {
     }
     updateYRetract();
     handleCycle();
-    updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking
     if (ackPending && cycleStage == CycleStage::NONE && state == LiftState::IDLE && !yRetracting) {
       ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq);
     }
@@ -1668,7 +1788,9 @@ void loop() {
           testRackCycleStartMs = millis();   // BARU -- mulai hitung 1 siklus (Rak->Push->Tarik->Load)
           Serial.printf("[TEST-RACK] Load Position tercapai, menuju Rak %u\n", testRackSequenceTarget);
         } else {
-          currentState = NodeState::IDLE;
+          // DIUBAH: JANGAN paksa currentState=IDLE di sini -- moveToRackXZ() yang gagal sudah
+          // memanggil raiseFault() (currentState=FAULT). Menimpanya dgn IDLE menghapus jejak
+          // fault dari register STATE, persis bug yang baru diperbaiki.
           Serial.println("[TEST-RACK] Gagal menuju rak dari Load Position (cek FaultCode)");
         }
       } else {
@@ -1729,7 +1851,8 @@ void loop() {
   // sbg pengaman kalau komunikasi BENAR-BENAR terputus total (kabel RS485 lepas, dst).
   constexpr uint32_t COMM_TIMEOUT_MS = 30000;
   if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > COMM_TIMEOUT_MS) {
-    currentState = NodeState::FAULT; faultCode = (uint16_t)FaultCode::COMM_TIMEOUT;
+    // DIUBAH: lewat raiseFault() -- dulu cuma set register, gerakan tetap lanjut sampai selesai
+    raiseFault((uint16_t)FaultCode::COMM_TIMEOUT, "tidak ada command Modbus baru selama 30 detik");
   }
 
   static uint32_t lastHeartbeat = 0;

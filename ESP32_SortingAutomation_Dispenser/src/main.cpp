@@ -892,6 +892,12 @@ void updateUniversalIndicators() {
   bool ledManualNow = (menuState != MenuState::NONE);
   if (ledRunNow != lastLedRun) { io.write(CH::LED_RUN, ledRunNow); lastLedRun = ledRunNow; }
   if (ledManualNow != lastLedManual) { io.write(CH::LED_MANUAL, ledManualNow); lastLedManual = ledManualNow; }
+  // BARU (2026-09-20): LED_FAULT. Channel ini di-pinMode OUTPUT di setup() dan terdaftar di
+  // menu Test Output, TAPI tidak pernah ditulis satu kali pun secara otomatis -- lampu fault
+  // praktis mati permanen selama produksi di KEEMPAT node. Sekarang ikut dikelola di sini.
+  static bool lastLedFault = false;
+  bool ledFaultNow = (currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED);
+  if (ledFaultNow != lastLedFault) { io.write(CH::LED_FAULT, ledFaultNow); lastLedFault = ledFaultNow; }
 }
 
 // DIPERBAIKI: guard FAULT/ESTOPPED -- REQUEST_REFILL sebelumnya TIDAK dicek sama sekali
@@ -1242,7 +1248,7 @@ IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
   {"OPR",    CH::LED_OPERATION, true},
   {"RUN",    CH::LED_RUN,       true},
   {"MANUAL", CH::LED_MANUAL,    true},
-  {"FAULT",  CH::LED_FAULT,     false},
+  {"FAULT",  CH::LED_FAULT,     true},   // DIUBAH -- sekarang auto-controlled (lihat updateUniversalIndicators)
   {"BUZZER", CH::BUZZER,        false},
   {"DISP_AIN1", CH::DISP_AIN1,  false},
   {"DISP_AIN2", CH::DISP_AIN2,  false},
@@ -1780,6 +1786,7 @@ void setup() {
   mb.addHreg(Reg::MIDDLE_PACKAGE_PRESENT, lastMiddlePresentReported ? 1 : 0);   // BARU -- status live PROX_2 utk cek startup (sinkron nilai awal, gak nunggu debounce 2s pertama)
   mb.addHreg(Reg::UJUNG_PACKAGE_PRESENT, lastUjungPresentReported ? 1 : 0);    // BARU -- status live PROX_1 (UJUNG), sinkron nilai awal
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);         // BARU -- status live MAIN vs TEST mode
+  mb.addHreg(Reg::MENU_ACTIVE, 0);              // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
   mb.addHreg(Reg::MIDDLE_ARRIVAL_COUNT, 0);     // BARU -- counter latch PROX_2, anti-kelewatan
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
@@ -1837,6 +1844,9 @@ void loop() {
   // sekarang lewat updateUjungPresentDebounced() (didebounce), bukan tulis mentah lagi.
   updateUjungPresentDebounced();
   mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
+  // BARU: master bisa bedain "node lagi dikalibrasi operator" vs "node mati/kabel putus" --
+  // dua-duanya sama-sama TIDAK membalas CMD_ACK_SEQ, jadi sebelumnya tidak bisa dibedakan.
+  mb.Hreg(Reg::MENU_ACTIVE, (menuState != MenuState::NONE) ? 1 : 0);
 
   static uint32_t lastMcpHealthCheck = 0;
   if (millis() - lastMcpHealthCheck > 2000) {

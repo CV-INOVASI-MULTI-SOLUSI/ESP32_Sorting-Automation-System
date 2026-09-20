@@ -376,6 +376,12 @@ void updateUniversalIndicators() {
   bool ledManualNow = (menuState != MenuState::NONE);
   if (ledRunNow != lastLedRun) { io.write(CH::LED_RUN, ledRunNow); lastLedRun = ledRunNow; }
   if (ledManualNow != lastLedManual) { io.write(CH::LED_MANUAL, ledManualNow); lastLedManual = ledManualNow; }
+  // BARU (2026-09-20): LED_FAULT. Channel ini di-pinMode OUTPUT di setup() dan terdaftar di
+  // menu Test Output, TAPI tidak pernah ditulis satu kali pun secara otomatis -- lampu fault
+  // praktis mati permanen selama produksi di KEEMPAT node. Sekarang ikut dikelola di sini.
+  static bool lastLedFault = false;
+  bool ledFaultNow = (currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED);
+  if (ledFaultNow != lastLedFault) { io.write(CH::LED_FAULT, ledFaultNow); lastLedFault = ledFaultNow; }
 }
 
 // DIPERBAIKI: guard FAULT/ESTOPPED -- sebelumnya opcode gerak (RUN_SEQUENCE dkk) TIDAK dicek sama
@@ -700,7 +706,7 @@ IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
   {"OPR",    CH::LED_OPERATION, true},
   {"RUN",    CH::LED_RUN,       true},
   {"MANUAL", CH::LED_MANUAL,    true},
-  {"FAULT",  CH::LED_FAULT,     false},
+  {"FAULT",  CH::LED_FAULT,     true},   // DIUBAH -- sekarang auto-controlled (lihat updateUniversalIndicators)
 };
 uint8_t outputTestCursor = 0;
 bool testOutputLastVal = false, testOutputFirstDraw = true;
@@ -1296,6 +1302,7 @@ void setup() {
   mb.addHreg(Reg::ACTIVITY_CODE, 0); mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
+  mb.addHreg(Reg::MENU_ACTIVE, 0);        // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
@@ -1353,6 +1360,9 @@ void loop() {
   mb.Hreg(Reg::LAST_FAULT_CODE, lastFaultCode);
   mb.Hreg(Reg::UPTIME_SEC, (uint16_t)(millis() / 1000));
   mb.Hreg(Reg::MAIN_MODE_ACTIVE, mainModeActive ? 1 : 0);
+  // BARU: master bisa bedain "node lagi dikalibrasi operator" vs "node mati/kabel putus" --
+  // dua-duanya sama-sama TIDAK membalas CMD_ACK_SEQ, jadi sebelumnya tidak bisa dibedakan.
+  mb.Hreg(Reg::MENU_ACTIVE, (menuState != MenuState::NONE) ? 1 : 0);
 
   static uint32_t lastMcpHealthCheck = 0;
   if (millis() - lastMcpHealthCheck > 2000) {
@@ -1399,11 +1409,14 @@ void loop() {
   // DIUBAH: logic fisik (safety, trajektori servo, antrian) SEKARANG SELALU JALAN, termasuk
   // saat menu kalibrasi aktif -- konsisten dgn pola SORTER. Hanya command EKSTERNAL yang dijeda.
   handleSafety();
+  // DIPERBAIKI (2026-09-20): buzzer dipindah KELUAR blok bersyarat. Dulu ikut ter-skip saat
+  // ESTOPPED -- kalau E-stop ditekan tepat di tengah bunyi, tidak ada lagi yang mematikannya
+  // dan buzzer meraung terus tanpa henti.
+  updateBuzzerBeep();
   if (currentState != NodeState::ESTOPPED) {
     updateTrajectory();
     processQueue();
     checkSequenceComplete();
-    updateBuzzerBeep();   // BARU -- proses siklus ON-OFF buzzer non-blocking
   }
 
   if (menuState != MenuState::NONE) return;   // command eksternal dijeda saat menu aktif (§12.6)

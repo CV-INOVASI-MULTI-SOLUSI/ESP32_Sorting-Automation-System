@@ -68,7 +68,6 @@ Urutan wajib tulis command: `CMD_ARG`(3) → `CMD_SEQ`(4) → `CMD`(2) TERAKHIR.
 | Set arah conveyor | `6` | `DIR <0\|1>` | `2` (A=Forward/B=Reverse) |
 | Reset counter | `7` | `RESET_COUNT` | — |
 | Simulasi trigger palang (uji TOF) | `98` | `TEST_PALANG` | — |
-| Simulasi fault | `99` | `TEST_FAULT` | — |
 | Kalibrasi durasi palang | — | — | `3` (jog) |
 | Kalibrasi jarak scan→palang | — | — | `4` (jog) |
 | Kalibrasi kecepatan conveyor aktual | — | — | `5` (jog) |

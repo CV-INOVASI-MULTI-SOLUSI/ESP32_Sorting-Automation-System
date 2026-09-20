@@ -15,7 +15,11 @@ namespace Reg {
 
   constexpr uint16_t CURRENT_RACK_IDX      = 10;  // R, 0xFF = none/in-transit
   constexpr uint16_t ALL_HOMED_FLAG        = 11;  // R
-  constexpr uint16_t RACK_OCCUPIED_BITMASK = 12;  // R, D21 -- bit0-5 = status fisik slot rack 0-5
+  // DIPERBAIKI (2026-09-20): bit N = RAK N (1-based, bit1..bit4 = Rak 1..4, bit0 SELALU 0).
+  // Dulu bit = index array RACK_LIM (bit0 = Rak 1), geser 1 dari yang dibaca Orange Pi
+  // find_free_rack() -- akibatnya Rak 1 gak pernah kelihatan penuh. Lihat komentar lengkap
+  // di readRackOccupiedBitmask() (src/main.cpp).
+  constexpr uint16_t RACK_OCCUPIED_BITMASK = 12;  // R, D21 -- bit1-4 = status fisik Rak 1-4
 
   // BARU: Lapis 2 (SubState) + Lapis 3 (diagnostik) -- sinkron pola SORTER
   constexpr uint16_t ACTIVITY_CODE   = 13;  // R
@@ -25,6 +29,10 @@ namespace Reg {
   // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi,
   // RUN_FULL_CYCLE boleh) atau TEST (manual, MOVE_TO_RACK/PUSH_BOX boleh).
   constexpr uint16_t MAIN_MODE_ACTIVE = 17;  // R, 1 = MAIN aktif, 0 = TEST mode
+  // BARU (2026-09-20): menu kalibrasi LCD meng-IGNORE semua command Modbus (§12.6) TANPA
+  // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
+  // Register ini bikin master bisa bedain dua kondisi itu.
+  constexpr uint16_t MENU_ACTIVE = 18;  // R, 1 = operator lagi di menu kalibrasi LCD
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik STOCKER (cycleStage yg sudah ada) ---

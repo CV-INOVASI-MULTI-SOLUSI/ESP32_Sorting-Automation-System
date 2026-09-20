@@ -23,6 +23,10 @@ namespace Reg {
   // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi) atau
   // TEST (manual, aman dipakai GOTO_HOME/GOTO_PASS/PICK/PLACE).
   constexpr uint16_t MAIN_MODE_ACTIVE = 15;  // R, 1 = MAIN aktif, 0 = TEST mode
+  // BARU (2026-09-20): menu kalibrasi LCD meng-IGNORE semua command Modbus (§12.6) TANPA
+  // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
+  // Register ini bikin master bisa bedain dua kondisi itu.
+  constexpr uint16_t MENU_ACTIVE = 16;  // R, 1 = operator lagi di menu kalibrasi LCD
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik PICKER ---
