@@ -198,25 +198,34 @@ def middle_triggered(instr):
         return False
 
 
-def conveyor_on_if_safe(instr, label="SET_CONVEYOR_ON_OFF(1)", wait_timeout_s=PROX_WAIT_TIMEOUT_S):
+def wait_package_full_placeholder(instr):
+    """BARU (2026-09-20) -- placeholder gabungan "package full", SAMA PERSIS isinya dgn poin
+    [8]+[9] (konfirmasi jumlah objek + terima target). Dipakai DUA tempat: alur normal poin
+    [8]/[9], DAN sebagai syarat resume di conveyor_on_if_safe()/wait_prox_with_middle_guard()
+    setelah guard PROX_2 mid-cycle nge-stop conveyor -- sesuai klarifikasi user: "apapun yang
+    terjadi jika PROX_2 terlewati, tunggu command package full untuk menjalankan lagi" --
+    resume-nya BUKAN nunggu PROX_2 balik clear (versi lama), tapi nunggu placeholder ini."""
+    timing_placeholder(instr, "konfirmasi jumlah objek", KONFIRMASI_JUMLAH_OBJEK_DELAY_S)
+    timing_placeholder(instr, "jumlah objek == target", TERIMA_TARGET_JUMLAH_DELAY_S)
+
+
+def conveyor_on_if_safe(instr, label="SET_CONVEYOR_ON_OFF(1)"):
     """Dipakai di poin [13] (BUKAN [9b], lihat catatan di situ). Kalau PROX_2 lagi trigger --
     artinya guard universal (stop_conveyor_if_middle_triggered, dipanggil selama servo watch
-    [10]/[12]) BARU AJA matiin conveyor gara-gara package baru dateng -- TUNGGU dulu sampai
-    PROX_2 CLEAR, baru nyalain lagi.
+    [10]/[12]) BARU AJA matiin conveyor gara-gara package baru kedeteksi -- tunggu placeholder
+    "package full" dulu (SAMA kayak [8]/[9]), baru nyalain lagi.
 
-    DIPERBAIKI (Celah A, ditemukan 2026-09-20): versi lama cuma CEK SEKALI, langsung nyerah
-    kalau masih trigger (conveyor dibiarkan mati selamanya, gak pernah dicoba nyalain lagi).
-    Akibatnya package 1 gak pernah kebawa maju, [14] nunggu PROX_1 yang GAK AKAN PERNAH trigger
-    (conveyor mati), sampai timeout 120 detik baru seluruh script ke-abort. Sekarang nunggu
-    PROX_2 clear dulu (self-healing begitu package berikutnya udah lewat/diisi), baru nyalain --
-    cuma gagal beneran (return False, caller break) kalau PROX_2 GENUINELY macet/gak pernah
-    clear sampai wait_timeout_s (indikasi hardware, bukan cuma dua package numpuk deket-deketan)."""
+    DIUBAH (2026-09-20, klarifikasi user): dulu nunggu PROX_2 CLEAR (sensor) sebelum resume --
+    SEKARANG nunggu command/placeholder "package full", bukan status sensor. Ini juga
+    memperbaiki Celah A asli (ditemukan 2026-09-20): versi PALING lama cuma cek PROX_2 sekali
+    lalu nyerah total kalau masih trigger -- conveyor dibiarkan mati selamanya, package gak
+    pernah maju, [14] nunggu PROX_1 yang gak akan pernah trigger sampai timeout 120 detik baru
+    seluruh script abort. Sekarang SELALU lanjut nyalain conveyor setelah placeholder selesai,
+    gak ada lagi jalur "menyerah"."""
     if middle_triggered(instr):
-        print("  !! PROX_2 masih/baru trigger -- tunggu CLEAR dulu sebelum nyalain conveyor lagi...")
-        if not wait_prox(instr, "PROX_2 (TENGAH) clear", REG_MIDDLE_PACKAGE_PRESENT, 0, timeout=wait_timeout_s):
-            print("  !! TIMEOUT nunggu PROX_2 clear -- conveyor TETAP mati, kemungkinan sensor macet/hardware.")
-            return False
-        print("  .. PROX_2 clear, lanjut nyalain conveyor")
+        print("  !! PROX_2 trigger (package baru kedeteksi) -- tunggu placeholder 'package full' dulu...")
+        wait_package_full_placeholder(instr)
+        print("  .. placeholder selesai, lanjut nyalain conveyor")
     return do_command(instr, label, CMD_SET_CONVEYOR_ON_OFF, arg=1)
 
 
@@ -292,12 +301,13 @@ def wait_prox_with_middle_guard(instr, label, reg_addr, want_value, timeout=PROX
     PROX_1) -- kalau PROX_2 kedeteksi trigger LAGI (package berikutnya udah sampai TENGAH
     selagi package SEBELUMNYA masih menuju UJUNG), conveyor di-stop SEMENTARA.
 
-    DIPERBAIKI (Celah A-2, kelas masalah SAMA dgn conveyor_on_if_safe -- ditemukan 2026-09-20):
-    dulu abis conveyor di-stop SEKALI, TIDAK PERNAH dinyalain lagi -- padahal kondisi UTAMA yang
-    ditunggu di sini (PROX_1 trigger) SENDIRI butuh conveyor jalan biar package sampai ke situ.
-    "Lanjut nunggu" versi lama tetap ujung-ujungnya timeout 120 detik, cuma nundur waktunya.
-    Sekarang: begitu PROX_2 clear lagi, conveyor otomatis DINYALAKAN ULANG, baru lanjut nunggu
-    kondisi utama seperti biasa -- self-healing, gak butuh intervensi manual."""
+    DIUBAH (2026-09-20, klarifikasi user): resume SEKARANG nunggu placeholder "package full"
+    (sama kayak [8]/[9], lewat wait_package_full_placeholder()), BUKAN nunggu PROX_2 balik
+    clear (versi sebelumnya). Ini juga menutup Celah A-2 asli (kelas masalah sama dgn
+    conveyor_on_if_safe -- ditemukan 2026-09-20): dulu abis conveyor di-stop SEKALI, TIDAK
+    PERNAH dinyalain lagi -- padahal kondisi UTAMA yang ditunggu di sini (PROX_1 trigger)
+    SENDIRI butuh conveyor jalan biar package sampai ke situ. Sekarang self-healing: stop ->
+    tunggu placeholder -> nyalain lagi -> lanjut nunggu kondisi utama seperti biasa."""
     kata = "trigger" if want_value == 1 else "CLEAR (gak ke-deteksi lagi)"
     print(f"  .. TUNGGU {label} {kata} (PARAREL: pantau PROX_2 juga, stop+resume conveyor otomatis kalau kepencet lagi)")
     if DRY_RUN:
@@ -314,15 +324,10 @@ def wait_prox_with_middle_guard(instr, label, reg_addr, want_value, timeout=PROX
             print(f"  !! DISPENSER: gagal baca {label} ({e}), retry...")
 
         if middle_triggered(instr):
-            print("  !! PROX_2 (TENGAH) kepencet LAGI -- package berikutnya udah sampai. Conveyor di-stop sementara.")
+            print("  !! PROX_2 (TENGAH) kepencet LAGI -- package baru kedeteksi. Conveyor di-stop, tunggu placeholder 'package full'.")
             do_command(instr, "SET_CONVEYOR_ON_OFF(0) [PROX_2 guard]", CMD_SET_CONVEYOR_ON_OFF, arg=0)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if not wait_prox(instr, "PROX_2 (TENGAH) clear", REG_MIDDLE_PACKAGE_PRESENT, 0, timeout=remaining):
-                print("  !! TIMEOUT nunggu PROX_2 clear -- kemungkinan sensor macet/hardware, bukan cuma dua package numpuk.")
-                break
-            print("  .. PROX_2 clear -- nyalain conveyor lagi, lanjut nunggu")
+            wait_package_full_placeholder(instr)
+            print("  .. placeholder selesai -- nyalain conveyor lagi, lanjut nunggu")
             do_command(instr, "SET_CONVEYOR_ON_OFF(1) [resume after guard]", CMD_SET_CONVEYOR_ON_OFF, arg=1)
 
         time.sleep(PROX_POLL_INTERVAL_S)
@@ -455,11 +460,8 @@ def main():
             if not do_command(dispenser, "SET_CONVEYOR_ON_OFF(0)", CMD_SET_CONVEYOR_ON_OFF, arg=0):
                 break
 
-            print("\n=== [8] Tunggu konfirmasi jumlah objek (TIMING placeholder) ===")
-            timing_placeholder(dispenser, "konfirmasi jumlah objek", KONFIRMASI_JUMLAH_OBJEK_DELAY_S)
-
-            print("\n=== [9] Terima jumlah objek == target (TIMING placeholder) ===")
-            timing_placeholder(dispenser, "jumlah objek == target", TERIMA_TARGET_JUMLAH_DELAY_S)
+            print("\n=== [8]-[9] Tunggu 'package full' (TIMING placeholder) ===")
+            wait_package_full_placeholder(dispenser)
 
             # BARU: conveyor WAJIB nyala DULU sebelum servo round-trip -- kalau conveyor
             # diam pas servo1/servo2 jatuhin objek, objeknya numpuk di bawah gerbang servo
