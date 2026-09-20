@@ -265,7 +265,27 @@ void motorWrite(uint8_t ain1, uint8_t ain2, bool forward) { io.write(ain1, forwa
 // BARU: jog manual conveyor ON/OFF (Cmd::SET_CONVEYOR_ON_OFF) -- TIDAK terikat sensor apapun,
 // murni nyala/mati sesuai perintah. Dipisah dari mekanisme REQUEST_REFILL/FORCE_MIDDLE_REFILL
 // yang otomatis berhenti sendiri di sensor tertentu.
+// BARU: status conveyor yang TERAKHIR DIPERINTAHKAN. Dicetak di baris [LOOP] supaya saat
+// menelusuri masalah "package tidak bergerak" kelihatan langsung apakah belt memang sedang
+// disuruh jalan atau tidak -- sebelumnya tidak ada cara tahu selain menebak dari gejala.
+bool conveyorManualOn = false;
+
+// BARU (2026-09-20): kapan terakhir kali keadaan motor conveyor BERUBAH. Saat motor mulai
+// atau berhenti ada hentakan arus, dan hentakan itu sanggup mengganggu pembacaan I2C --
+// gejalanya "conveyor sempat menyala sedikit lalu pembacaan jadi ngaco". Perubahan status
+// sensor karena itu tidak diakui selama jendela pendek sesudahnya. Ini TIDAK membuang
+// kedatangan yang nyata: package butuh waktu jauh lebih lama untuk menempuh jarak antar
+// sensor daripada jendela ini.
+uint32_t conveyorBerubahAt = 0;
+constexpr uint32_t MOTOR_SETTLE_MS = 250;
+
+inline bool motorBaruBerubah() {
+  return (millis() - conveyorBerubahAt) < MOTOR_SETTLE_MS;
+}
+
 void setConveyorManual(bool on) {
+  if (conveyorManualOn != on) conveyorBerubahAt = millis();
+  conveyorManualOn = on;
   if (on) {
     motorWrite(CH::CONV2_BIN1, CH::CONV2_BIN2, cfg.conveyorDir);
     io.write(CH::DISP_STBY, HIGH);
@@ -511,69 +531,336 @@ bool lastMiddleSensorState = HIGH;
 // BARU: counter latch buat MIDDLE_ARRIVAL_COUNT -- lihat komentar di registers.h. uint16_t
 // SAMA lebar dgn register Modbus, wrap alami, gak perlu penanganan khusus.
 uint16_t middleArrivalCount = 0;
-// BARU: debounce counter arrival -- HIGH->LOW dalam 2 detik dari arrival TERAKHIR yang
-// kehitung DIABAIKAN (gak nambah counter lagi). Tujuannya mastiin package BENERAN udah
-// lewat sensor sebelum dihitung sebagai kedatangan baru -- cegah 1 package kehitung 2x
-// gara-gara noise/bounce sensor pas tepi objek lewat (bisa toggle LOW/HIGH cepat).
-uint32_t lastMiddleArrivalMs = 0;
-constexpr uint32_t MIDDLE_ARRIVAL_DEBOUNCE_MS = 2000;
-// BARU (diperluas): register live MIDDLE_PACKAGE_PRESENT SEKARANG ikut didebounce, SAMA
-// window (2 detik) dgn counter di atas -- dulu register ini ditulis MENTAH tiap loop tanpa
-// filter sama sekali, jadi guard di script Python (yang baca live, bukan counter) TETAP bisa
-// kena noise/bounce sensor walau counter-nya udah aman. Sekarang SATU sumber kebenaran: baik
-// counter maupun live register sama-sama nolak perubahan <2 detik dari perubahan TERAKHIR
-// yang di-commit -- konsisten di seluruh sistem (firmware DAN semua guard script).
-bool lastMiddlePresentReported = false;
-uint32_t lastMiddlePresentChangeMs = 0;
+
+// ============================================================
+// DIPERBAIKI TOTAL (2026-09-20) — cara debounce-nya salah, bukan cuma angkanya.
+//
+// Gejala yang dilaporkan: "kalau servo masih cycle sedangkan package sudah melewati prox,
+// tidak dianggap trigger -- prox baru trigger setelah proses refill selesai, padahal
+// package-nya sudah lewat sensor."
+//
+// Versi lama BUKAN debounce, melainkan PEMBATAS LAJU: perubahan hanya boleh di-commit kalau
+// sudah lewat 2 detik dari perubahan yang di-commit sebelumnya. Akibatnya dua-duanya buruk:
+//
+//   a) TERLAMBAT. Package yang datang kurang dari 2 detik setelah package sebelumnya pergi
+//      baru dilaporkan setelah jatah 2 detik itu habis -- persis "baru trigger setelah
+//      refill selesai" yang dilihat di lapangan.
+//   b) HILANG SAMA SEKALI. Kalau package lewat cepat (hadir < 2 detik), kedatangan TIDAK
+//      pernah di-commit, lalu saat package pergi nilainya sudah sama dengan yang terakhir
+//      dilaporkan -- jadi tidak ada yang tertulis sama sekali. Satu package penuh lenyap
+//      dari register, bukan cuma telat.
+//
+// Versi baru = debounce yang sebenarnya: sebuah nilai baru dianggap SAH setelah bertahan
+// stabil selama MIDDLE_DEBOUNCE_MS. Tidak ada jendela buta. Setiap kedatangan yang benar-benar
+// terjadi pasti terlaporkan, cuma tertunda selama waktu stabilisasi itu saja.
+//
+// Kenapa 2 detik boleh turun jauh ke 200 ms tanpa memunculkan lagi masalah "package tidak
+// rata kebaca dua kali": jaminannya sekarang BUKAN dari lamanya waktu, tapi dari SYARAT
+// URUTAN -- sebuah kedatangan baru hanya dihitung kalau sensor sempat kembali KOSONG secara
+// stabil lebih dulu. Permukaan package yang tidak rata membuat sensor berkedip jauh lebih
+// singkat dari 200 ms, jadi tetap tersaring, sementara celah antar package yang nyata selalu
+// jauh lebih panjang. Ini justru lebih ketat daripada sekadar menunggu 2 detik.
+// ============================================================
+// DIUBAH (2026-09-20): debounce dibuat ASIMETRIS -- dua arah tepi punya tuntutan yang
+// berlawanan, jadi memakai satu angka untuk keduanya selalu merugikan salah satunya.
+//
+//   DATANG (HIGH->LOW) menentukan JARAK BERHENTI. Sejak conveyor dihentikan oleh firmware,
+//   angka ini praktis satu-satunya sisa keterlambatan. Package terus melaju selama firmware
+//   masih menunggu kepastian, jadi makin kecil makin dekat berhentinya. 100 ms.
+//
+//   PERGI (LOW->HIGH) tidak memengaruhi jarak berhenti sama sekali -- tidak ada yang perlu
+//   dihentikan saat package meninggalkan sensor. Justru DI SINILAH perlindungan terhadap
+//   "package tidak rata" berada: celah pada permukaan package bisa terbaca sesaat sebagai
+//   "package sudah pergi", dan kalau itu diterima, package yang sama akan terhitung DATANG
+//   dua kali. Jadi arah ini sengaja dibuat lambat//konservatif. 600 ms.
+//
+// Hasilnya berhenti lebih dekat DAN lebih tahan noise sekaligus -- bukan tukar-tambah.
+// Kalau masih terlalu jauh, turunkan DATANG dulu (50 ms masih wajar); kalau satu package
+// mulai terhitung dua kali, naikkan PERGI, bukan DATANG.
+constexpr uint32_t MIDDLE_DATANG_DEBOUNCE_MS = 100;
+constexpr uint32_t MIDDLE_PERGI_DEBOUNCE_MS  = 600;
+
+// ============================================================
+// BARU (2026-09-20) — pembacaan sensor yang tahan gangguan bus I2C.
+//
+// Dugaan yang sedang diuji: "kalau servo sedang bergerak, PROX_1/PROX_2 tidak dianggap."
+// Mekanisme yang mungkin: servo (PCA9685) dan kedua proximity (MCP23017 chip ke-2) memakai
+// SATU bus I2C yang sama, berjalan 400 kHz. Tiap langkah servo menulis ke PCA9685. Kalau
+// sebuah transaksi baca MCP terganggu di tengah keramaian itu, Adafruit_MCP23X17 tidak
+// melaporkan kegagalan -- ia mengembalikan nilai begitu saja, dan yang keluar cenderung HIGH.
+// Sensor ini aktif-LOW, jadi HIGH berarti "tidak ada package". Satu pembacaan meleset sudah
+// cukup untuk menghapus kedatangan yang sebenarnya terjadi.
+//
+// Penanganannya: pembacaan hanya dipercaya kalau KONSISTEN. Selama nilainya sama dengan
+// sampel sebelumnya, cukup satu kali baca (murah). Begitu nilainya BERUBAH -- justru saat
+// yang menentukan -- perubahan itu diverifikasi dengan pembacaan ulang. Kalau kedua
+// pembacaan tidak sepakat, perubahan itu dibuang dan dicatat sebagai anomali.
+//
+// Ini sekaligus alat ukur: kalau sensorAnomalyCount melonjak tepat ketika servo bergerak,
+// dugaan di atas terbukti. Kalau tetap nol sementara gejalanya masih ada, berarti bukan bus
+// I2C penyebabnya dan kita harus mencari ke arah lain.
+// ============================================================
+uint16_t sensorAnomalyCount = 0;
+
+bool bacaSensorAndal(uint8_t channel, bool sampelSebelumnya) {
+  bool v = io.read(channel);
+  if (v == sampelSebelumnya) return v;         // tidak berubah -- tidak perlu diverifikasi
+  bool v2 = io.read(channel);                   // berubah -- pastikan sekali lagi
+  if (v2 == v) return v;                        // dua-duanya sepakat, perubahan sah
+  sensorAnomalyCount++;
+  return sampelSebelumnya;                      // tidak sepakat -- abaikan, pertahankan nilai lama
+}
+
+// Ambang yang berlaku untuk pembacaan mentah `raw`: LOW = sedang menuju "package ada"
+// (kedatangan), HIGH = sedang menuju "package tidak ada" (kepergian).
+inline uint32_t debounceUntuk(bool raw) {
+  return (raw == LOW) ? MIDDLE_DATANG_DEBOUNCE_MS : MIDDLE_PERGI_DEBOUNCE_MS;
+}
+
+bool middleRawLast = HIGH;          // pembacaan mentah terakhir
+uint32_t middleRawChangedAt = 0;    // kapan pembacaan mentah terakhir berubah
+bool middleStable = HIGH;           // nilai yang sudah lolos uji kestabilan (inilah yang dipakai)
+uint16_t conveyorAutoStopCount = 0; // berapa kali firmware menghentikan conveyor sendiri karena PROX_2
+
+// BARU (2026-09-20): berapa package yang SUDAH meninggalkan PROX_2 tetapi BELUM sampai di
+// PROX_1. Ini "izin" bagi PROX_1 untuk mengakui sebuah kedatangan. Lihat alasannya di
+// updateUjungPresentDebounced(). Dibatasi 3 supaya tidak pernah lari liar kalau ada sesuatu
+// yang tidak terduga di lapangan.
+uint8_t paketMenujuUjung = 0;
+uint16_t ujungArrivalCount = 0;     // kedatangan SAH di UJUNG (yang lolos guard urutan)
+
 void handleMiddleSensor() {
-  bool cur = io.read(CH::PACKAGE_MIDDLE_SENSOR);
-  bool curPresent = (cur == LOW);
-  if (curPresent != lastMiddlePresentReported &&
-      millis() - lastMiddlePresentChangeMs > MIDDLE_ARRIVAL_DEBOUNCE_MS) {
-    mb.Hreg(Reg::MIDDLE_PACKAGE_PRESENT, curPresent ? 1 : 0);
-    lastMiddlePresentReported = curPresent;
-    lastMiddlePresentChangeMs = millis();
-  }
-  if (cur != lastMiddleSensorState) {
-    // BARU: package baru KEDETEKSI DATENG (HIGH->LOW, live 0->1) -- naikin counter latch,
-    // UNCONDITIONAL soal mainModeActive (gak digate, ini cuma tally pasif gak ada efek fisik
-    // apapun, aman kapan saja termasuk TEST mode) TAPI digate DEBOUNCE (lihat komentar var).
-    if (lastMiddleSensorState == HIGH && cur == LOW) {
-      if (millis() - lastMiddleArrivalMs > MIDDLE_ARRIVAL_DEBOUNCE_MS) {
-        middleArrivalCount++;
-        mb.Hreg(Reg::MIDDLE_ARRIVAL_COUNT, middleArrivalCount);
-        lastMiddleArrivalMs = millis();
-      } else {
-        Serial.println("[FEEDER] PROX_2 trigger diabaikan -- debounce (<2s dari arrival sebelumnya)");
-      }
+  bool raw = bacaSensorAndal(CH::PACKAGE_MIDDLE_SENSOR, middleRawLast);
+  if (raw != middleRawLast) { middleRawLast = raw; middleRawChangedAt = millis(); }
+  if (raw == middleStable || millis() - middleRawChangedAt < debounceUntuk(raw)) return;
+  if (motorBaruBerubah()) return;   // hentakan arus motor -- tunda pengakuan, jangan dibuang
+
+  bool sebelumnya = middleStable;
+  middleStable = raw;
+  lastMiddleSensorState = raw;   // dipertahankan: dibaca di tempat lain (mis. tampilan STATUS)
+
+  // Register live: SELALU ikut nilai stabil. Tidak ada lagi kondisi "tidak boleh commit".
+  mb.Hreg(Reg::MIDDLE_PACKAGE_PRESENT, (middleStable == LOW) ? 1 : 0);
+
+  if (sebelumnya == HIGH && middleStable == LOW) {
+    // Package DATANG. Counter latch naik -- tidak di-gate mainModeActive (ini cuma pencatatan
+    // pasif tanpa efek fisik) dan tidak lagi di-gate jendela waktu apa pun.
+    middleArrivalCount++;
+    mb.Hreg(Reg::MIDDLE_ARRIVAL_COUNT, middleArrivalCount);
+    Serial.printf("[FEEDER] PROX_2: package DATANG (count=%u)\n", middleArrivalCount);
+
+    // ============================================================
+    // BARU (2026-09-20) — CONVEYOR DIHENTIKAN DI SINI, OLEH FIRMWARE.
+    //
+    // Keluhan yang diperbaiki: "refill masih jadi blok untuk PROX_2. Apapun kondisinya, jika
+    // prox trigger maka stop sampai perintah berikutnya. Kalau harus menunggu cycle refill
+    // servo selesai dulu, package keburu jauh."
+    //
+    // Selama ini yang menghentikan conveyor adalah Orange Pi: ia menunggu counter naik, lalu
+    // mengirim perintah mati. Masalahnya master tidak selalu sedang memperhatikan -- pada
+    // langkah refill ia sibuk mengirim rangkaian perintah servo yang makan beberapa detik.
+    // Package yang menyentuh PROX_2 di tengah-tengah itu baru dihentikan setelah seluruh
+    // rangkaian selesai, dan saat itu package sudah terlanjur jauh.
+    //
+    // Tidak ada nilai polling yang bisa memperbaiki ini: selalu ada jeda master + waktu
+    // bolak-balik Modbus. Satu-satunya tempat yang bisa bereaksi seketika adalah firmware,
+    // karena di sinilah tepi sensor itu terdeteksi. Jadi penghentian dipindah ke sini --
+    // terjadi pada milidetik yang sama dengan terdeteksinya kedatangan.
+    //
+    // "Sampai perintah berikutnya": firmware TIDAK menyalakannya kembali sendiri. Conveyor
+    // tetap mati sampai ada SET_CONVEYOR_ON_OFF(1) berikutnya dari master.
+    //
+    // Dibatasi ke TEST mode (mainModeActive == false) DENGAN SENGAJA. Selama MAIN, alur
+    // produksi REQUEST_REFILL sendiri yang mengemudikan conveyor sampai package mencapai
+    // UJUNG; kalau firmware ikut mematikannya di tengah, dua pihak akan berebut satu aktuator
+    // yang sama -- persis kelas bug yang sudah kita temukan di Sorter (Motor A) dan sengaja
+    // kita hindari. Alur produksi belum diubah ke pola pipeline ini.
+    //
+    // TEST REFILL LOOP juga dikecualikan karena ia mengemudikan conveyor sendiri.
+    // ============================================================
+    // DIUBAH (2026-09-20): gate !mainModeActive DICABUT, sama seperti di PROX_1. Sempat
+    // tertinggal saat penyatuan jalur, dan akibatnya fatal: di produksi package TIDAK akan
+    // berhenti di TENGAH, melainkan terus melaju melewati titik pengisian.
+    if (testLoopStage == TestLoopStage::OFF) {
+      setConveyorManual(false);
+      conveyorAutoStopCount++;
+      mb.Hreg(Reg::CONVEYOR_AUTOSTOP_COUNT, conveyorAutoStopCount);
+      Serial.printf("[FEEDER] >>> CONVEYOR DIHENTIKAN OTOMATIS oleh PROX_2 (autostop=%u). "
+                    "Menunggu perintah SET_CONVEYOR_ON_OFF(1) berikutnya.\n", conveyorAutoStopCount);
     }
-    // BARU: trigger otomatis WAJIB mainModeActive -- sebelum Orange Pi START_MAIN, edge PROX_2
-    // TIDAK memicu apa-apa (biar aman dites manual pakai TEST_SERVOx_CYCLE/MOVE_SERVOx_TO tanpa
-    // rebutan servo sama logic otomatis ini).
-    if (mainModeActive && lastMiddleSensorState == LOW && cur == HIGH &&
-        currentState != NodeState::FAULT && servoRefillStage == ServoRefillStage::NONE) {
-      startServoMove(1, cfg.servo1StartUs);
-      servoRefillStage = ServoRefillStage::SERVO1_TO_END;
-      servoRefillStageAt = millis();
-      Serial.println("[FEEDER] Tengah terdeteksi kosong -- servo refill mulai (Servo1 gerbang bawah)");
-    }
-    lastMiddleSensorState = cur;
+  } else if (sebelumnya == LOW && middleStable == HIGH) {
+    // Package MENINGGALKAN tengah, artinya ia sedang dalam perjalanan menuju UJUNG.
+    // Inilah izin yang dipakai PROX_1 untuk mengakui kedatangan -- lihat penjelasan
+    // lengkap di updateUjungPresentDebounced().
+    if (paketMenujuUjung < 3) paketMenujuUjung++;
+    Serial.printf("[FEEDER] PROX_2: package PERGI (tengah kosong, menuju ujung=%u)\n", paketMenujuUjung);
+    // DIHAPUS (2026-09-20): dulu di sini ada pemicu otomatis servoRefillStage saat MAIN aktif.
+    // Sekarang waktu gerak servo ditentukan oleh pipeline produksi (lihat updatePipeline()),
+    // yang menjalankannya ketika conveyor BERHENTI -- bukan saat package sedang berjalan.
+    // Kalau pemicu lama dibiarkan, akan ada dua pihak yang memerintah servo yang sama.
   }
 }
 
-// BARU: register live UJUNG_PACKAGE_PRESENT (PROX_1) JUGA didebounce, SAMA pola & window
-// (MIDDLE_ARRIVAL_DEBOUNCE_MS) dgn MIDDLE_PACKAGE_PRESENT di atas -- package yang permukaannya
-// gak rata bisa bikin sensor kebaca ulang dalam waktu singkat padahal package yang SAMA masih
-// di situ, jangan dianggap perubahan baru.
-bool lastUjungPresentReported = false;
-uint32_t lastUjungPresentChangeMs = 0;
+// DIPERBAIKI (2026-09-20): PROX_1 punya cacat PERSIS SAMA dengan PROX_2 -- pembatas laju,
+// bukan debounce. Package yang sampai di UJUNG kurang dari 2 detik setelah perubahan terakhir
+// akan dilaporkan terlambat, atau hilang sama sekali kalau sempat pergi lebih dulu. Dipakaikan
+// mekanisme yang sama: sebuah nilai dianggap sah setelah stabil MIDDLE_DEBOUNCE_MS.
+bool ujungRawLast = HIGH;
+uint32_t ujungRawChangedAt = 0;
+bool ujungStable = HIGH;
+
 void updateUjungPresentDebounced() {
-  bool curPresent = (io.read(CH::PROX_BOX_ARRIVED) == LOW);
-  if (curPresent != lastUjungPresentReported &&
-      millis() - lastUjungPresentChangeMs > MIDDLE_ARRIVAL_DEBOUNCE_MS) {
-    mb.Hreg(Reg::UJUNG_PACKAGE_PRESENT, curPresent ? 1 : 0);
-    lastUjungPresentReported = curPresent;
-    lastUjungPresentChangeMs = millis();
+  // Ambang asimetris yang sama dipakai di sini: kedatangan di UJUNG juga menentukan jarak
+  // berhenti (langkah [14] mematikan conveyor begitu PROX_1 tersentuh), sedangkan kepergian
+  // tidak menghentikan apa pun tapi rawan salah baca karena permukaan package.
+  bool raw = bacaSensorAndal(CH::PROX_BOX_ARRIVED, ujungRawLast);
+  if (raw != ujungRawLast) { ujungRawLast = raw; ujungRawChangedAt = millis(); }
+  if (raw == ujungStable || millis() - ujungRawChangedAt < debounceUntuk(raw)) return;
+  if (motorBaruBerubah()) return;   // hentakan arus motor -- tunda pengakuan, jangan dibuang
+  bool sebelumnya = ujungStable;
+  ujungStable = raw;
+  mb.Hreg(Reg::UJUNG_PACKAGE_PRESENT, (ujungStable == LOW) ? 1 : 0);
+  Serial.printf("[FEEDER] PROX_1 (UJUNG): package %s\n", (ujungStable == LOW) ? "SAMPAI" : "PERGI");
+
+  // BARU (2026-09-20) — penghentian seketika di UJUNG, alasannya SAMA PERSIS dengan PROX_2.
+  //
+  // Keluhan: "saat package siap diambil arm robot, conveyor sempat menyala sedikit sehingga
+  // pembacaan jadi ngaco." Sebabnya: yang menghentikan conveyor di langkah [14] adalah Orange
+  // Pi. Package sudah menyentuh PROX_1, tetapi belt baru berhenti setelah perintah mati
+  // menempuh perjalanan bolak-balik Modbus. Selama jeda itu package terus bergeser melewati
+  // titik ambil, dan pembacaan berikutnya tidak lagi mencerminkan posisi sebenarnya.
+  //
+  // Waktu tempuh perintah itu tidak bisa dihilangkan dari sisi master, berapa pun rapatnya
+  // polling. Maka penghentian dipindah ke sini -- pada milidetik yang sama dengan sampainya
+  // package. Firmware tidak menyalakannya kembali; belt tetap mati sampai ada
+  // SET_CONVEYOR_ON_OFF(1) berikutnya, yaitu setelah arm selesai mengambil.
+  //
+  // Batasan mode sama dengan PROX_2: hanya berlaku di TEST mode. Selama MAIN, alur produksi
+  // REQUEST_REFILL sendiri yang mengemudikan conveyor sampai UJUNG dan menghentikannya di
+  // sana, jadi kalau firmware ikut campur akan ada dua pihak merebut satu aktuator.
+  if (sebelumnya == HIGH && ujungStable == LOW) {
+    // ============================================================
+    // GUARD URUTAN (permintaan user, 2026-09-20): kedatangan di PROX_1 hanya diakui kalau
+    // memang ada package yang sebelumnya meninggalkan PROX_2.
+    //
+    // Alasannya fisik: satu-satunya jalan menuju UJUNG adalah melewati TENGAH lebih dulu.
+    // Jadi PROX_1 yang menyala tanpa didahului kepergian dari PROX_2 pasti bukan package
+    // yang sedang kita ikuti -- bisa tangan operator, bisa benda tersenggol, bisa pantulan
+    // sensor. Kalau itu diakui, conveyor berhenti di saat yang salah dan seluruh urutan
+    // langkah bergeser.
+    //
+    // Yang TIDAK dilakukan di sini: register live UJUNG_PACKAGE_PRESENT tetap ditulis apa
+    // adanya di atas. Register itu memang laporan keadaan sensor, dan sebaiknya jujur --
+    // yang ditahan cuma PENGAKUAN-nya (counter kedatangan sah + autostop).
+    // ============================================================
+    if (paketMenujuUjung == 0) {
+      Serial.println("[FEEDER] PROX_1 DIABAIKAN -- tidak ada package yang tercatat "
+                     "meninggalkan PROX_2. Harus lewat TENGAH dulu sebelum diakui sampai UJUNG.");
+    } else {
+      paketMenujuUjung--;
+      ujungArrivalCount++;
+      mb.Hreg(Reg::UJUNG_ARRIVAL_COUNT, ujungArrivalCount);
+      Serial.printf("[FEEDER] PROX_1: kedatangan SAH (count=%u, sisa menuju ujung=%u)\n",
+                    ujungArrivalCount, paketMenujuUjung);
+      // DIUBAH (2026-09-20): gate !mainModeActive DICABUT. Penghentian seketika di sensor
+      // sekarang berlaku SAMA di TEST maupun produksi -- inilah inti penyatuan dua jalur itu.
+      // Dulu semua perbaikan (stop seketika, debounce, guard urutan) cuma hidup di TEST,
+      // sementara produksi memakai pembacaan sensor mentah di handleRefillFSM.
+      if (testLoopStage == TestLoopStage::OFF) {
+        setConveyorManual(false);
+        conveyorAutoStopCount++;
+        mb.Hreg(Reg::CONVEYOR_AUTOSTOP_COUNT, conveyorAutoStopCount);
+        Serial.printf("[FEEDER] >>> CONVEYOR DIHENTIKAN OTOMATIS oleh PROX_1 (autostop=%u). "
+                      "Package berhenti di titik ambil.\n", conveyorAutoStopCount);
+      }
+      // Sinyal ke Orange Pi: package siap diambil arm. Di produksi inilah pemicu MOVE_PACKAGE
+      // ke Picker. Dinaikkan DI SINI, pada kedatangan sah, bukan dari hasil polling master.
+      if (mainModeActive) {
+        mb.Hreg(Reg::PACKAGE_READY_FLAG, 1);
+        Serial.println("[FEEDER] PACKAGE_READY_FLAG=1 -- package siap diambil arm robot");
+      }
+    }
+  }
+}
+
+// ============================================================
+// BARU (2026-09-20): counter LATCH untuk dua tombol fisik yang selama ini menganggur.
+//
+// Kebutuhannya: pada alur test yang baru, dua konfirmasi TIDAK BOLEH lagi berupa delay/timing
+// tebakan -- harus dari kejadian nyata. Konfirmasi itu boleh datang dari Orange Pi (operator
+// menekan Enter) ATAU dari tombol fisik di panel:
+//   BUTTON_2 = "package sudah PENUH"
+//   BUTTON_3 = "package sudah DIAMBIL robot"
+//
+// Kenapa counter latch, bukan register status biasa: master mem-polling dengan jeda, dan di
+// sela-sela itu ada perintah lain yang makan waktu (servo bergerak beberapa detik). Status
+// sesaat gampang terlewat; counter tidak pernah kehilangan kejadian. Pola ini SAMA PERSIS
+// dengan MIDDLE_ARRIVAL_COUNT yang sudah terbukti untuk PROX_2 -- script cukup membandingkan
+// nilai SEBELUM dan SESUDAH menunggu.
+//
+// BUTTON_2 tetap dipakai juga oleh TEST REFILL LOOP (updateTestRefillLoop) -- keduanya hanya
+// MEMBACA pin dengan deteksi tepi masing-masing, jadi tidak saling mengganggu.
+//
+// Sengaja TIDAK di-gate mainModeActive: counter ini murni pelaporan, tidak menggerakkan
+// aktuator apa pun, jadi aman aktif kapan saja.
+// ============================================================
+// DIPERBAIKI (2026-09-20): versi pertama memakai pola "tepi + jendela waktu" yang PERSIS SAMA
+// cacatnya dengan sensor proximity sebelum diperbaiki -- sebuah tepi HIGH->LOW dihitung asal
+// sudah lewat 50 ms dari tepi TERAKHIR YANG DIHITUNG. Selama pantulan kontak (bouncing) pin
+// bergoyang naik-turun, dan setiap goyangan yang kebetulan jatuh lebih dari 50 ms sesudah
+// hitungan sebelumnya ikut terhitung sebagai penekanan BARU.
+//
+// Terbukti di lapangan: dalam 8 detik BUTTON_2 naik 12 kali dan BUTTON_3 naik 14 kali.
+// Akibatnya fatal untuk script: counter berubah terus dengan sendirinya, sehingga langkah
+// "tunggu konfirmasi package penuh" langsung lolos tanpa menunggu siapa pun -- persis keluhan
+// "package full tidak berfungsi walau sudah ditekan". Tombolnya justru TERLALU sensitif,
+// bukan tidak terbaca.
+//
+// Versi ini memakai debounce kestabilan yang sama dengan sensor: sebuah nilai baru diakui
+// setelah bertahan stabil, DAN penekanan berikutnya hanya dihitung kalau tombol sempat
+// benar-benar DILEPAS secara stabil lebih dulu. Pantulan tidak bisa lolos lagi, dan tombol
+// yang ditahan lama tetap terhitung satu kali.
+constexpr uint32_t BTN_TEKAN_DEBOUNCE_MS = 80;    // seberapa lama harus stabil tertekan
+constexpr uint32_t BTN_LEPAS_DEBOUNCE_MS = 150;   // seberapa lama harus stabil dilepas
+
+uint16_t btnPackageFullCount = 0, btnPackageTakenCount = 0;
+
+struct TombolDebounce {
+  uint8_t channel;
+  bool rawLast;
+  uint32_t rawChangedAt;
+  bool stabil;
+  // Konstruktor eksplisit, bukan default member initializer -- proyek ini dikompilasi sebagai
+  // C++11, dan di situ struct yang punya NSDMI berhenti menjadi aggregate sehingga tidak bisa
+  // diinisialisasi dengan kurung kurawal.
+  explicit TombolDebounce(uint8_t ch)
+      : channel(ch), rawLast(HIGH), rawChangedAt(0), stabil(HIGH) {}
+};
+
+// Mengembalikan true TEPAT SEKALI per penekanan yang sah (transisi stabil lepas -> tekan).
+bool tombolDitekan(TombolDebounce &t) {
+  bool raw = io.read(t.channel);
+  if (raw != t.rawLast) { t.rawLast = raw; t.rawChangedAt = millis(); }
+  uint32_t ambang = (raw == LOW) ? BTN_TEKAN_DEBOUNCE_MS : BTN_LEPAS_DEBOUNCE_MS;
+  if (raw == t.stabil || millis() - t.rawChangedAt < ambang) return false;
+  bool sebelumnya = t.stabil;
+  t.stabil = raw;
+  return (sebelumnya == HIGH && t.stabil == LOW);
+}
+
+TombolDebounce tombolFull(CH::BUTTON_2);
+TombolDebounce tombolTaken(CH::BUTTON_3);
+
+void updateKonfirmasiButtons() {
+  if (tombolDitekan(tombolFull)) {
+    btnPackageFullCount++;
+    mb.Hreg(Reg::BTN_PACKAGE_FULL_COUNT, btnPackageFullCount);
+    Serial.printf("[TOMBOL] BUTTON_2 ditekan -- 'package PENUH' (count=%u)\n", btnPackageFullCount);
+  }
+  if (tombolDitekan(tombolTaken)) {
+    btnPackageTakenCount++;
+    mb.Hreg(Reg::BTN_PACKAGE_TAKEN_COUNT, btnPackageTakenCount);
+    Serial.printf("[TOMBOL] BUTTON_3 ditekan -- 'package sudah DIAMBIL' (count=%u)\n", btnPackageTakenCount);
   }
 }
 
@@ -707,6 +994,217 @@ void updateServoRefillStage() {
 // BARU: gabungkan 2 cabang paralel (conveyor + servo) -- currentState baru balik IDLE kalau
 // KEDUANYA sudah tuntas, supaya REQUEST_REFILL berikutnya (atau Orange Pi yang polling STATE)
 // tidak menyangka node sudah bebas padahal servo masih jalan.
+// ============================================================
+// PIPELINE PRODUKSI (BARU 2026-09-20) — urutan yang sama persis dengan yang sudah diuji
+// lewat test-dispenser-pipeline, tapi dijalankan FIRMWARE, bukan script Orange Pi.
+//
+// Kenapa dipindah ke firmware: dua keputusan di alur ini harus terjadi seketika pada tepi
+// sensor -- menghentikan conveyor di TENGAH dan di UJUNG. Master tidak bisa melakukannya
+// tepat waktu; selalu ada jeda polling dan perjalanan Modbus, dan selama jeda itu package
+// terlanjur bergeser. Semua sudah dibuktikan di lapangan sepanjang pengujian hari ini.
+//
+// Pembagian tugas jadi tegas:
+//   FIRMWARE  : menghentikan conveyor di sensor, menggerakkan servo, menjaga urutan,
+//               melaporkan kapan dirinya SIAP dan kapan package siap diambil.
+//   ORANGE PI : memutuskan "package penuh" (REQUEST_REFILL) dan "package sudah diambil"
+//               (ACK_PACKAGE_TAKEN). Dua itu saja.
+//
+// Padanan dengan tombol saat pengujian:
+//   BUTTON_2 (package penuh)   -> Cmd::REQUEST_REFILL
+//   BUTTON_3 (sudah diambil)   -> Cmd::ACK_PACKAGE_TAKEN
+// ============================================================
+enum class PipelineStage : uint8_t {
+  MATI = 0,             // MAIN belum aktif
+  INIT_SERVO1_BUKA,     // urutan awal: jatuhkan package pertama
+  INIT_SERVO1_TAHAN,
+  INIT_SERVO1_TUTUP,
+  INIT_SERVO2_BUKA,
+  INIT_SERVO2_TAHAN,
+  INIT_SERVO2_TUTUP,
+  INIT_TUNGGU_PROX2,    // tunggu package pertama sampai di TENGAH
+  BUKA_GERBANG,         // servo1 dibuka supaya objek berikutnya bisa jatuh
+  SIAP_ISI,             // == READY. Package di TENGAH, menunggu REQUEST_REFILL
+  MAJU,                 // conveyor jalan menuju UJUNG
+  REFILL_SERVO1_TUTUP,  // package sudah di UJUNG & berhenti -- gerbang dibereskan di sini
+  REFILL_SERVO2_BUKA,
+  REFILL_SERVO2_TAHAN,
+  REFILL_SERVO2_TUTUP,
+  TUNGGU_DIAMBIL,       // PACKAGE_READY_FLAG=1, menunggu ACK_PACKAGE_TAKEN
+};
+PipelineStage pipelineStage = PipelineStage::MATI;
+uint32_t pipelineStageAt = 0;
+uint16_t pipelineUjungAcuan = 0;   // nilai ujungArrivalCount saat mulai MAJU
+constexpr uint32_t PIPELINE_MAJU_TIMEOUT_MS = 20000;
+
+const char* pipelineText(PipelineStage s) {
+  switch (s) {
+    case PipelineStage::MATI:                return "MATI";
+    case PipelineStage::INIT_SERVO1_BUKA:    return "INIT servo1 buka";
+    case PipelineStage::INIT_SERVO1_TAHAN:   return "INIT servo1 tahan";
+    case PipelineStage::INIT_SERVO1_TUTUP:   return "INIT servo1 tutup";
+    case PipelineStage::INIT_SERVO2_BUKA:    return "INIT servo2 buka";
+    case PipelineStage::INIT_SERVO2_TAHAN:   return "INIT servo2 tahan";
+    case PipelineStage::INIT_SERVO2_TUTUP:   return "INIT servo2 tutup";
+    case PipelineStage::INIT_TUNGGU_PROX2:   return "INIT tunggu PROX_2";
+    case PipelineStage::BUKA_GERBANG:        return "buka gerbang";
+    case PipelineStage::SIAP_ISI:            return "SIAP ISI (ready)";
+    case PipelineStage::MAJU:                return "maju ke ujung";
+    case PipelineStage::REFILL_SERVO1_TUTUP: return "refill servo1 tutup";
+    case PipelineStage::REFILL_SERVO2_BUKA:  return "refill servo2 buka";
+    case PipelineStage::REFILL_SERVO2_TAHAN: return "refill servo2 tahan";
+    case PipelineStage::REFILL_SERVO2_TUTUP: return "refill servo2 tutup";
+    case PipelineStage::TUNGGU_DIAMBIL:      return "tunggu diambil arm";
+  }
+  return "?";
+}
+
+void masukPipeline(PipelineStage s) {
+  pipelineStage = s;
+  pipelineStageAt = millis();
+  mb.Hreg(Reg::PIPELINE_STAGE, (uint16_t)s);
+  mb.Hreg(Reg::DISPENSER_READY, (s == PipelineStage::SIAP_ISI) ? 1 : 0);
+  Serial.printf("[PIPELINE] -> %s\n", pipelineText(s));
+}
+
+// Dipanggil Cmd::START_MAIN. Kalau TENGAH sudah terisi, urutan awal dilewati -- tidak perlu
+// menjatuhkan package baru ke tempat yang sudah ada isinya.
+void mulaiPipeline() {
+  paketMenujuUjung = 0;
+  mb.Hreg(Reg::PACKAGE_READY_FLAG, 0);
+  if (middleStable == LOW) {
+    Serial.println("[PIPELINE] TENGAH sudah terisi -- urutan awal dilewati");
+    startServoMove(1, cfg.servo1EndUs);
+    masukPipeline(PipelineStage::BUKA_GERBANG);
+  } else {
+    Serial.println("[PIPELINE] TENGAH kosong -- jalankan urutan awal sampai package siap di TENGAH");
+    setConveyorManual(true);
+    startServoMove(1, cfg.servo1EndUs);
+    masukPipeline(PipelineStage::INIT_SERVO1_BUKA);
+  }
+}
+
+void hentikanPipeline(const char* alasan) {
+  if (pipelineStage == PipelineStage::MATI) return;
+  setConveyorManual(false);
+  mb.Hreg(Reg::PACKAGE_READY_FLAG, 0);
+  masukPipeline(PipelineStage::MATI);
+  Serial.printf("[PIPELINE] dihentikan -- %s\n", alasan);
+}
+
+bool pipelineRefillDiminta = false;   // di-set Cmd::REQUEST_REFILL
+bool pipelineAckDiterima = false;     // di-set Cmd::ACK_PACKAGE_TAKEN
+
+void updatePipeline() {
+  if (pipelineStage == PipelineStage::MATI) return;
+  if (currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
+    hentikanPipeline("node FAULT/ESTOPPED");
+    return;
+  }
+  uint32_t elapsed = millis() - pipelineStageAt;
+
+  switch (pipelineStage) {
+    // --- urutan awal: isi package pertama sampai duduk di TENGAH ---
+    case PipelineStage::INIT_SERVO1_BUKA:
+      if (updateServoTrajectory(1, cfg.servo1EndUs)) masukPipeline(PipelineStage::INIT_SERVO1_TAHAN);
+      break;
+    case PipelineStage::INIT_SERVO1_TAHAN:
+      if (elapsed >= cfg.servo1HoldMs) { startServoMove(1, cfg.servo1StartUs); masukPipeline(PipelineStage::INIT_SERVO1_TUTUP); }
+      break;
+    case PipelineStage::INIT_SERVO1_TUTUP:
+      if (updateServoTrajectory(1, cfg.servo1StartUs)) { startServoMove(2, cfg.servo2EndUs); masukPipeline(PipelineStage::INIT_SERVO2_BUKA); }
+      break;
+    case PipelineStage::INIT_SERVO2_BUKA:
+      if (updateServoTrajectory(2, cfg.servo2EndUs)) masukPipeline(PipelineStage::INIT_SERVO2_TAHAN);
+      break;
+    case PipelineStage::INIT_SERVO2_TAHAN:
+      if (elapsed >= cfg.servo2HoldMs) { startServoMove(2, cfg.servo2StartUs); masukPipeline(PipelineStage::INIT_SERVO2_TUTUP); }
+      break;
+    case PipelineStage::INIT_SERVO2_TUTUP:
+      if (updateServoTrajectory(2, cfg.servo2StartUs)) masukPipeline(PipelineStage::INIT_TUNGGU_PROX2);
+      break;
+    case PipelineStage::INIT_TUNGGU_PROX2:
+      // Conveyor sudah dimatikan sendiri oleh autostop PROX_2 begitu package sampai.
+      if (middleStable == LOW) {
+        startServoMove(1, cfg.servo1EndUs);
+        masukPipeline(PipelineStage::BUKA_GERBANG);
+      }
+      else if (elapsed > 30000) {
+        faultCode = (uint16_t)FaultCode::MIDDLE_PACKAGE_MISSING;
+        currentState = NodeState::FAULT;
+        hentikanPipeline("package pertama tidak pernah sampai di TENGAH dalam 30 detik");
+      }
+      break;
+
+    // --- gerbang dibuka supaya objek berikutnya bisa jatuh, lalu menyatakan diri SIAP ---
+    case PipelineStage::BUKA_GERBANG:
+      if (updateServoTrajectory(1, cfg.servo1EndUs)) {
+        masukPipeline(PipelineStage::SIAP_ISI);
+        Serial.println("[PIPELINE] SIAP menampung objek -- menunggu REQUEST_REFILL dari Orange Pi");
+      }
+      break;
+
+    case PipelineStage::SIAP_ISI:
+      if (pipelineRefillDiminta) {
+        pipelineRefillDiminta = false;
+        pipelineUjungAcuan = ujungArrivalCount;
+        setConveyorManual(true);
+        masukPipeline(PipelineStage::MAJU);
+      }
+      break;
+
+    case PipelineStage::MAJU:
+      // Conveyor dihentikan oleh autostop PROX_1, dan PACKAGE_READY_FLAG ikut dinyalakan
+      // di sana. Di sini cukup menunggu kedatangan sah itu tercatat.
+      if (ujungArrivalCount != pipelineUjungAcuan) {
+        startServoMove(1, cfg.servo1StartUs);
+        masukPipeline(PipelineStage::REFILL_SERVO1_TUTUP);
+      } else if (elapsed > PIPELINE_MAJU_TIMEOUT_MS) {
+        // Sebab paling mungkin dibedakan di sini, supaya tidak berakhir sebagai fault umum
+        // yang tidak menjelaskan apa-apa. Kalau conveyor sudah mati padahal package belum
+        // sampai UJUNG, berarti autostop PROX_2 yang menghentikannya: package BERIKUTNYA
+        // sampai di TENGAH lebih dulu daripada package ini sampai di UJUNG. Itu persoalan
+        // JARAK FISIK antar sensor dibanding jarak antar package, bukan kesalahan program.
+        if (!conveyorManualOn && middleStable == LOW) {
+          Serial.println("[PIPELINE] !! Package berikutnya sampai di TENGAH sebelum package ini "
+                         "sampai di UJUNG, sehingga conveyor keburu berhenti.");
+          Serial.println("[PIPELINE] !! Jarak PROX_1-PROX_2 tidak cocok dengan jarak antar package. "
+                         "Urutan langkah perlu disesuaikan, bukan sekadar diulang.");
+        }
+        faultCode = (uint16_t)FaultCode::BOX_NOT_ARRIVED;
+        currentState = NodeState::FAULT;
+        hentikanPipeline("package tidak sampai UJUNG dalam batas waktu");
+      }
+      break;
+
+    // --- gerbang dibereskan SELAGI package menunggu diambil (conveyor diam) ---
+    case PipelineStage::REFILL_SERVO1_TUTUP:
+      if (updateServoTrajectory(1, cfg.servo1StartUs)) { startServoMove(2, cfg.servo2EndUs); masukPipeline(PipelineStage::REFILL_SERVO2_BUKA); }
+      break;
+    case PipelineStage::REFILL_SERVO2_BUKA:
+      if (updateServoTrajectory(2, cfg.servo2EndUs)) masukPipeline(PipelineStage::REFILL_SERVO2_TAHAN);
+      break;
+    case PipelineStage::REFILL_SERVO2_TAHAN:
+      if (elapsed >= cfg.servo2HoldMs) { startServoMove(2, cfg.servo2StartUs); masukPipeline(PipelineStage::REFILL_SERVO2_TUTUP); }
+      break;
+    case PipelineStage::REFILL_SERVO2_TUTUP:
+      if (updateServoTrajectory(2, cfg.servo2StartUs)) masukPipeline(PipelineStage::TUNGGU_DIAMBIL);
+      break;
+
+    case PipelineStage::TUNGGU_DIAMBIL:
+      if (pipelineAckDiterima) {
+        pipelineAckDiterima = false;
+        mb.Hreg(Reg::PACKAGE_READY_FLAG, 0);
+        setConveyorManual(true);
+        // Package berikutnya sedang menuju TENGAH; autostop PROX_2 yang akan
+        // menghentikannya. Dari sini kembali ke pola buka gerbang -> SIAP ISI.
+        masukPipeline(PipelineStage::INIT_TUNGGU_PROX2);
+      }
+      break;
+
+    default: break;
+  }
+}
+
 void updateRefillJoin() {
   if (currentState == NodeState::RUNNING_OR_MOVING &&
       refillState == RefillState::IDLE &&
@@ -923,9 +1421,13 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       }
       mainModeActive = true;
       Serial.println("[CMD] START_MAIN -- mode produksi otomatis AKTIF, command TEST diblokir sampai STOP_MAIN");
+      // BARU: langsung jalankan urutan awal sampai package duduk di TENGAH. Selesai itu
+      // DISPENSER_READY jadi 1, dan barulah node ini pantas disebut siap produksi.
+      mulaiPipeline();
       break;
     case Cmd::STOP_MAIN:
       mainModeActive = false;
+      hentikanPipeline("STOP_MAIN diterima");
       Serial.println("[CMD] STOP_MAIN -- mode produksi otomatis MATI, command TEST boleh dipakai lagi");
       break;
     case Cmd::REQUEST_REFILL:
@@ -945,8 +1447,17 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
         Serial.println("[CMD] REQUEST_REFILL ditolak -- package UJUNG belum di-ACK diambil (ACK_PACKAGE_TAKEN dulu)");
         return;
       }
-      refillRequested = true;
+      // DIUBAH (2026-09-20): REQUEST_REFILL tidak lagi menjalankan RefillState lama (yang
+      // membaca sensor mentah dan menghentikan conveyor sendiri). Sekarang ia hanya menjadi
+      // sinyal "package PENUH" bagi pipeline -- padanan langsung dari BUTTON_2 saat pengujian.
+      if (pipelineStage != PipelineStage::SIAP_ISI) {
+        Serial.printf("[CMD] REQUEST_REFILL ditolak -- Dispenser belum SIAP (tahap sekarang: %s)\n",
+                      pipelineText(pipelineStage));
+        return;
+      }
+      pipelineRefillDiminta = true;
       currentState = NodeState::RUNNING_OR_MOVING;
+      Serial.println("[CMD] REQUEST_REFILL -- package dinyatakan PENUH, conveyor maju ke UJUNG");
       break;
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb sebelum di-nol-kan
@@ -973,8 +1484,17 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // baru REQUEST_REFILL berikutnya diizinkan lanjut (lihat guard di handleRefillFSM IDLE).
     case Cmd::ACK_PACKAGE_TAKEN:
       if (!mainModeActive) { Serial.println("[CMD] ACK_PACKAGE_TAKEN ditolak -- MAIN belum aktif"); return; }
-      mb.Hreg(Reg::PACKAGE_READY_FLAG, 0);
-      Serial.println("[CMD] ACK_PACKAGE_TAKEN -- PACKAGE_READY_FLAG di-clear");
+      // DIUBAH: selain membersihkan flag, ini sekaligus izin melanjutkan siklus -- padanan
+      // langsung dari BUTTON_3 saat pengujian. Conveyor dinyalakan lagi oleh pipeline,
+      // bukan lewat perintah terpisah dari Orange Pi.
+      if (pipelineStage != PipelineStage::TUNGGU_DIAMBIL) {
+        Serial.printf("[CMD] ACK_PACKAGE_TAKEN -- tidak ada package yang menunggu diambil "
+                      "(tahap sekarang: %s). Flag tetap dibersihkan.\n", pipelineText(pipelineStage));
+        mb.Hreg(Reg::PACKAGE_READY_FLAG, 0);
+        break;
+      }
+      pipelineAckDiterima = true;
+      Serial.println("[CMD] ACK_PACKAGE_TAKEN -- arm sudah ambil, siklus dilanjutkan");
       break;
     case Cmd::FORCE_MIDDLE_REFILL:
       if (!mainModeActive) { Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- MAIN belum aktif"); return; }
@@ -1745,9 +2265,18 @@ void setup() {
   io.pinMode(CH::PROX_BOX_ARRIVED, INPUT_PULLUP);
   io.pinMode(CH::PACKAGE_MIDDLE_SENSOR, INPUT_PULLUP);   // mekanisme 2-proximity (UJUNG+TENGAH)
   io.pinMode(CH::BTN_TEST_BOX_FULL, INPUT_PULLUP);   // BARU -- tombol fisik TEST REFILL LOOP
-  lastMiddleSensorState = io.read(CH::PACKAGE_MIDDLE_SENSOR);   // BARU -- baca kondisi awal, cegah false-edge saat boot
-  lastMiddlePresentReported = (lastMiddleSensorState == LOW);   // BARU -- sinkron nilai awal register live-debounced
-  lastUjungPresentReported = (io.read(CH::PROX_BOX_ARRIVED) == LOW);   // BARU -- sinkron nilai awal PROX_1 live-debounced
+  // BARU (2026-09-20): BUTTON_3 sebelumnya TIDAK PERNAH di-pinMode di Dispenser -- terdaftar
+  // di menu Test Input tapi tidak pernah disiapkan, jadi pembacaannya tidak bermakna.
+  // (BUTTON_2 sudah disiapkan lewat alias BTN_TEST_BOX_FULL di baris atas -- channel sama.)
+  io.pinMode(CH::BUTTON_3, INPUT_PULLUP);
+  // DIUBAH (2026-09-20): sinkronkan kondisi AWAL kedua sensor ke keadaan fisik saat boot --
+  // supaya tidak ada tepi palsu yang terhitung sebagai "kedatangan" hanya karena firmware
+  // baru hidup sementara package memang sudah ada di sensor sejak sebelumnya.
+  lastMiddleSensorState = io.read(CH::PACKAGE_MIDDLE_SENSOR);
+  middleRawLast = middleStable = lastMiddleSensorState;
+  middleRawChangedAt = millis();
+  ujungRawLast = ujungStable = io.read(CH::PROX_BOX_ARRIVED);
+  ujungRawChangedAt = millis();
   Serial.printf("[BOOT] MCP23017: %s, pinMode selesai\n", ioOk ? "OK" : "GAGAL");
   lcdBootProgress("I/O Expander MCP23017");
 
@@ -1783,10 +2312,18 @@ void setup() {
   mb.addHreg(Reg::ACTIVITY_CODE, 0); mb.addHreg(Reg::I2C_ERROR_COUNT, 0);
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::PACKAGE_READY_FLAG, 0);   // BARU -- mekanisme 2-proximity
-  mb.addHreg(Reg::MIDDLE_PACKAGE_PRESENT, lastMiddlePresentReported ? 1 : 0);   // BARU -- status live PROX_2 utk cek startup (sinkron nilai awal, gak nunggu debounce 2s pertama)
-  mb.addHreg(Reg::UJUNG_PACKAGE_PRESENT, lastUjungPresentReported ? 1 : 0);    // BARU -- status live PROX_1 (UJUNG), sinkron nilai awal
+  // Nilai awal diambil dari kondisi stabil yang sudah disinkronkan di atas, jadi register
+  // sudah benar sejak detik pertama -- tidak perlu menunggu perubahan pertama dulu.
+  mb.addHreg(Reg::MIDDLE_PACKAGE_PRESENT, (middleStable == LOW) ? 1 : 0);   // status live PROX_2
+  mb.addHreg(Reg::UJUNG_PACKAGE_PRESENT, (ujungStable == LOW) ? 1 : 0);     // status live PROX_1 (UJUNG)
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);         // BARU -- status live MAIN vs TEST mode
   mb.addHreg(Reg::MENU_ACTIVE, 0);              // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
+  mb.addHreg(Reg::BTN_PACKAGE_FULL_COUNT, 0);   // BARU -- konfirmasi "package PENUH" dari tombol fisik
+  mb.addHreg(Reg::BTN_PACKAGE_TAKEN_COUNT, 0);  // BARU -- konfirmasi "package DIAMBIL" dari tombol fisik
+  mb.addHreg(Reg::CONVEYOR_AUTOSTOP_COUNT, 0);  // BARU -- berapa kali firmware stop conveyor sendiri krn PROX_2
+  mb.addHreg(Reg::UJUNG_ARRIVAL_COUNT, 0);      // BARU -- kedatangan SAH di UJUNG (lolos guard urutan)
+  mb.addHreg(Reg::DISPENSER_READY, 0);          // BARU -- 1 = siap menampung objek baru
+  mb.addHreg(Reg::PIPELINE_STAGE, 0);           // BARU -- tahap pipeline produksi
   mb.addHreg(Reg::MIDDLE_ARRIVAL_COUNT, 0);     // BARU -- counter latch PROX_2, anti-kelewatan
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
@@ -1800,7 +2337,30 @@ void setup() {
   Serial.println("[BOOT] setup SELESAI -- ketik HELP di serial monitor");
 }
 
+// BARU: apakah SALAH SATU jalur servo sedang bergerak sekarang -- dipakai di baris [LOOP]
+// supaya angka anomali dan waktu putaran bisa langsung dikaitkan dengan gerakan servo.
+bool servoSedangBergerak() {
+  return isServoRefillAutoActive()
+      || manualServo1Moving || manualServo2Moving
+      || testServoCycleStage != TestServoCycleStage::NONE
+      || forceMiddleRefillActive;
+}
+
+uint32_t loopMaksMs = 0;   // putaran TERLAMA sejak laporan [LOOP] terakhir
+
 void loop() {
+  // Ukur lama satu putaran penuh. Kalau sebuah putaran memakan waktu lebih lama daripada
+  // ambang debounce sensor, pulsa sensor yang pendek bisa terlewat sama sekali -- dan itu
+  // akan kelihatan di sini sebagai angka, bukan sebagai tebakan.
+  {
+    static uint32_t putaranSebelumnya = 0;
+    uint32_t sekarang = millis();
+    if (putaranSebelumnya != 0) {
+      uint32_t lama = sekarang - putaranSebelumnya;
+      if (lama > loopMaksMs) loopMaksMs = lama;
+    }
+    putaranSebelumnya = sekarang;
+  }
   mb.task();
   updateOTA();
 
@@ -1887,8 +2447,13 @@ void loop() {
     if (millis() - lastTestModRefresh2 > 150) { lastTestModRefresh2 = millis(); drawTestModRelay(); }
   }
   handleSafety();
+  // BARU -- counter tombol konfirmasi. Sengaja DI LUAR blok bersyarat: ini murni pelaporan,
+  // tidak menggerakkan aktuator, dan justru berguna saat node sedang FAULT/ESTOPPED (operator
+  // tetap bisa menandai "sudah diambil" tanpa harus mereset node dulu).
+  updateKonfirmasiButtons();
   if (currentState != NodeState::ESTOPPED) {
     handleRefillFSM();
+    updatePipeline();           // BARU -- pipeline produksi (urutan yang sama dgn pengujian)
     handleMiddleSensor();       // BARU -- trigger servo refill dari PACKAGE_MIDDLE_SENSOR, bukan delay lagi
     updateServoRefillStage();   // BARU -- siklus servo refill, PARALEL dgn conveyor (lihat komentar di atas)
     updateForceMiddleRefill();  // BARU -- utk startup/recovery, lihat komentar di definisinya
@@ -1916,7 +2481,26 @@ void loop() {
   if (millis() - lastHeartbeat > 2000) {
     lastHeartbeat = millis();
     mb.Hreg(Reg::HEARTBEAT, (uint16_t)(millis() / 1000));
-    Serial.printf("[LOOP] state=%s refillState=%d ESTOP=%d\n", stateText(currentState), (int)refillState, io.read(CH::ESTOP));
+    // DIPERLUAS: conveyor + kondisi kedua proximity ikut dicetak. Saat menelusuri "package
+    // tidak bergerak" atau "PROX_2 tidak trigger", tiga hal inilah yang perlu dilihat
+    // bersamaan, dan sebelumnya tidak satu pun tampil di sini.
+    // DIPERLUAS lagi: anomali pembacaan sensor + waktu putaran TERLAMA sejak laporan
+    // sebelumnya. Dua angka inilah yang membuktikan atau menggugurkan dugaan "servo bikin
+    // prox tidak terbaca": anomali naik = bus I2C terganggu; loopMax besar = firmware
+    // terlalu lama satu putaran sehingga pulsa sensor terlewat. Kalau dua-duanya tenang
+    // sementara gejalanya tetap ada, penyebabnya bukan di sini.
+    Serial.printf("[LOOP] state=%s refillState=%d ESTOP=%d conveyor=%s PROX_2=%s PROX_1=%s "
+                  "arrival=%u autostop=%u anomali=%u loopMax=%lums servo=%s "
+                  "ujungSah=%u menujuUjung=%u pipeline=%s\n",
+                  stateText(currentState), (int)refillState, io.read(CH::ESTOP),
+                  conveyorManualOn ? "ON" : "OFF",
+                  (middleStable == LOW) ? "TERTUTUP" : "terbuka",
+                  (ujungStable == LOW) ? "TERTUTUP" : "terbuka",
+                  middleArrivalCount, conveyorAutoStopCount,
+                  sensorAnomalyCount, (unsigned long)loopMaksMs,
+                  servoSedangBergerak() ? "BERGERAK" : "diam",
+                  ujungArrivalCount, paketMenujuUjung, pipelineText(pipelineStage));
+    loopMaksMs = 0;   // reset jendela pengukuran
   }
 
   if (lcdPresent) {

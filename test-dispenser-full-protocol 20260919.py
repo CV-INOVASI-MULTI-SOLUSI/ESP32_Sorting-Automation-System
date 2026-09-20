@@ -95,6 +95,28 @@ KONFIRMASI_JUMLAH_OBJEK_DELAY_S = 2.0   # poin 8: "menunggu konfirmasi jumlah ob
 TERIMA_TARGET_JUMLAH_DELAY_S = 1.0      # poin 9: "menerima command jumlah objek == target"
 KIRIM_AMBIL_PACKAGE_DELAY_S = 1.0       # poin 15: "mengirim command untuk ambil package"
 
+# --- BARU (2026-09-20) -- jendela ABAIKAN PROX_2 sesudah conveyor dinyalakan ---
+# Gejala yang diperbaiki: "conveyor baru jalan langsung mati lagi".
+#
+# Sebabnya: package yang bikin PROX_2 trigger itu MASIH BERADA DI ATAS SENSOR pada detik
+# conveyor dinyalakan -- memang harus begitu, conveyor dinyalakan justru UNTUK menggeser
+# package itu pergi. Tapi guard PROX_2 (stop_conveyor_if_middle_triggered dan guard inline
+# di wait_prox_with_middle_guard) langsung membaca "PROX_2 masih trigger" pada polling
+# berikutnya (0.2 detik kemudian) lalu mematikan conveyor yang baru saja dinyalakan itu.
+# Jadinya nyala-mati-nyala-mati tanpa package pernah sempat bergerak.
+#
+# Perbaikan: sesudah SETIAP kali conveyor dinyalakan, PROX_2 diabaikan selama jendela ini --
+# kasih waktu package menggeser diri keluar dari sensor dulu. Ini "prosedur delay 2 detik"
+# yang selama ini memang belum pernah ada di sisi script.
+#
+# Kenapa 3 detik, bukan 2: firmware hanya boleh meng-commit perubahan register
+# MIDDLE_PACKAGE_PRESENT sekali per 2 detik (MIDDLE_ARRIVAL_DEBOUNCE_MS). Artinya sesudah
+# package BENAR-BENAR lepas dari sensor, register itu masih bisa melaporkan "1" yang basi
+# sampai 2 detik lamanya. Jendela 2.0 detik persis bisa habis tepat saat nilai basi itu
+# masih terbaca, dan gejalanya kambuh. 3 detik memberi margin di atas batas firmware.
+# Kalau package fisik butuh lebih lama lagi untuk lepas dari PROX_2, besarkan angka ini.
+MIDDLE_GUARD_RESUME_IGNORE_S = 3.0
+
 DRY_RUN = False  # BARU default False (minta user) -- langsung kirim command ke hardware asli.
                   # Balikin ke True kalau mau simulasi doang (cuma PRINT rencana aksi + anggap
                   # prox trigger instan, gak kirim apapun ke bus).
@@ -185,11 +207,39 @@ def print_status(instr, label):
         print(f"     [status] gagal baca ({e})")
 
 
+_middle_ignore_until = 0.0      # BARU -- lihat MIDDLE_GUARD_RESUME_IGNORE_S
+_middle_ignore_logged = False   # biar pesan "lagi diabaikan" cuma tercetak sekali per jendela
+
+
+def arm_middle_ignore(alasan):
+    """BARU (2026-09-20) -- mulai jendela abaikan PROX_2. WAJIB dipanggil setiap kali conveyor
+    dinyalakan, supaya guard tidak langsung mematikannya lagi gara-gara package yang memang
+    masih menempel di sensor. Lihat komentar panjang di MIDDLE_GUARD_RESUME_IGNORE_S."""
+    global _middle_ignore_until, _middle_ignore_logged
+    _middle_ignore_until = time.monotonic() + MIDDLE_GUARD_RESUME_IGNORE_S
+    _middle_ignore_logged = False
+    print(f"  .. PROX_2 diabaikan {MIDDLE_GUARD_RESUME_IGNORE_S:.1f} detik ({alasan}) "
+          f"-- kasih waktu package geser keluar dari sensor")
+
+
 def middle_triggered(instr):
     """BARU -- baca live PROX_2 (TENGAH). True = lagi trigger = ADA package sedang diisi
     objek di situ SEKARANG. Dasar buat aturan UNIVERSAL: conveyor GAK BOLEH gerak selama
-    ini True, di step MANAPUN (bukan cuma poin 14/16 kayak sebelumnya)."""
+    ini True, di step MANAPUN (bukan cuma poin 14/16 kayak sebelumnya).
+
+    DIUBAH (2026-09-20): selama jendela abaikan (arm_middle_ignore) fungsi ini SELALU
+    mengembalikan False. Tanpa itu, conveyor yang baru dinyalakan langsung dimatikan lagi
+    0.2 detik kemudian oleh guard -- package-nya sendiri belum sempat bergerak keluar dari
+    sensor. Jendela ini TIDAK memengaruhi wait_middle_arrival(), yang memakai counter latch
+    MIDDLE_ARRIVAL_COUNT di firmware, bukan register live ini -- jadi kedatangan package baru
+    tetap tidak akan terlewat walau kebetulan jatuh di dalam jendela."""
+    global _middle_ignore_logged
     if DRY_RUN:
+        return False
+    if time.monotonic() < _middle_ignore_until:
+        if not _middle_ignore_logged:
+            print("     [guard] PROX_2 lagi dalam jendela abaikan -- tidak dijadikan alasan stop")
+            _middle_ignore_logged = True
         return False
     try:
         return instr.read_register(REG_MIDDLE_PACKAGE_PRESENT, functioncode=3) == 1
@@ -209,6 +259,17 @@ def wait_package_full_placeholder(instr):
     timing_placeholder(instr, "jumlah objek == target", TERIMA_TARGET_JUMLAH_DELAY_S)
 
 
+def conveyor_on(instr, label="SET_CONVEYOR_ON_OFF(1)"):
+    """BARU (2026-09-20) -- SATU-SATUNYA jalan menyalakan conveyor di script ini. Selain
+    mengirim command, fungsi ini juga memasang jendela abaikan PROX_2. Dulu perintah nyala
+    ditulis langsung lewat do_command() di 4 tempat berbeda dan tidak satu pun memasang
+    jendela itu, jadi guard selalu bisa langsung mematikannya lagi."""
+    ok = do_command(instr, label, CMD_SET_CONVEYOR_ON_OFF, arg=1)
+    if ok:
+        arm_middle_ignore(f"sesudah {label}")
+    return ok
+
+
 def conveyor_on_if_safe(instr, label="SET_CONVEYOR_ON_OFF(1)"):
     """Dipakai di poin [13] (BUKAN [9b], lihat catatan di situ). Kalau PROX_2 lagi trigger --
     artinya guard universal (stop_conveyor_if_middle_triggered, dipanggil selama servo watch
@@ -226,7 +287,7 @@ def conveyor_on_if_safe(instr, label="SET_CONVEYOR_ON_OFF(1)"):
         print("  !! PROX_2 trigger (package baru kedeteksi) -- tunggu placeholder 'package full' dulu...")
         wait_package_full_placeholder(instr)
         print("  .. placeholder selesai, lanjut nyalain conveyor")
-    return do_command(instr, label, CMD_SET_CONVEYOR_ON_OFF, arg=1)
+    return conveyor_on(instr, label)
 
 
 _middle_guard_already_stopped = False   # BARU -- lihat catatan Celah B di stop_conveyor_if_middle_triggered()
@@ -328,7 +389,11 @@ def wait_prox_with_middle_guard(instr, label, reg_addr, want_value, timeout=PROX
             do_command(instr, "SET_CONVEYOR_ON_OFF(0) [PROX_2 guard]", CMD_SET_CONVEYOR_ON_OFF, arg=0)
             wait_package_full_placeholder(instr)
             print("  .. placeholder selesai -- nyalain conveyor lagi, lanjut nunggu")
-            do_command(instr, "SET_CONVEYOR_ON_OFF(1) [resume after guard]", CMD_SET_CONVEYOR_ON_OFF, arg=1)
+            # DIUBAH: lewat conveyor_on() supaya jendela abaikan PROX_2 ikut terpasang.
+            # Tanpa itu, iterasi loop berikutnya (0.2 detik kemudian) membaca PROX_2 yang
+            # MASIH trigger -- package-nya belum sempat bergerak -- lalu mematikan conveyor
+            # lagi, berulang terus. Ini persis gejala "baru jalan langsung mati lagi".
+            conveyor_on(instr, "SET_CONVEYOR_ON_OFF(1) [resume after guard]")
 
         time.sleep(PROX_POLL_INTERVAL_S)
     print(f"  !! TIMEOUT: {label} tidak {kata} dalam {timeout}s")
@@ -422,7 +487,7 @@ def main():
     # manual_load_servo(dispenser, 1, to_end=False)  # tutup lagi
 
     print("\n=== SETUP [1] Conveyor MENYALA (DIUBAH -- dulu MATI, sekarang langsung HIDUP dari awal) ===")
-    if not do_command(dispenser, "SET_CONVEYOR_ON_OFF(1)", CMD_SET_CONVEYOR_ON_OFF, arg=1):
+    if not conveyor_on(dispenser, "SET_CONVEYOR_ON_OFF(1)"):
         sys.exit(1)
 
     print("\n=== SETUP [2] Servo1 round-trip (titik awal->akhir->tahan->awal) ===")
@@ -434,7 +499,7 @@ def main():
         sys.exit(1)
 
     print("\n=== SETUP [5] Pastikan conveyor tetap MENYALA (sudah nyala dari [1], idempotent) ===")
-    if not do_command(dispenser, "SET_CONVEYOR_ON_OFF(1)", CMD_SET_CONVEYOR_ON_OFF, arg=1):
+    if not conveyor_on(dispenser, "SET_CONVEYOR_ON_OFF(1)"):
         sys.exit(1)
 
     # BARU -- baseline counter MIDDLE_ARRIVAL_COUNT SEBELUM masuk loop, dioper+diupdate
@@ -471,8 +536,16 @@ def main():
             # sempat kegeser), jadi kalau di-gate PROX_2 di sini bakal DEADLOCK (gak pernah
             # nyala sama sekali). Guard universal PROX_2 buat package BERIKUTNYA dipantau
             # reaktif selama servo watch [10]/[12] (lihat stop_conveyor_if_middle_triggered).
+            #
+            # DIUBAH (2026-09-20): lewat conveyor_on(), yang memasang jendela abaikan PROX_2.
+            # DI SINILAH gejala "baru jalan langsung mati lagi" paling sering muncul: package
+            # yang baru terdeteksi di [6] masih menempel di PROX_2 pada detik ini, lalu guard
+            # di dalam servo watch [10] langsung membacanya dan mematikan conveyor yang baru
+            # saja dinyalakan di baris ini. Komentar di atas sudah menyadari package-nya masih
+            # di sensor -- tapi penanganannya berhenti di "jangan di-gate", belum sampai ke
+            # "guard sesudahnya juga harus menahan diri sebentar".
             print("\n=== [9b] Conveyor MENYALA (sebelum round-trip, biar objek jatuh gak numpuk) ===")
-            if not do_command(dispenser, "SET_CONVEYOR_ON_OFF(1)", CMD_SET_CONVEYOR_ON_OFF, arg=1):
+            if not conveyor_on(dispenser, "SET_CONVEYOR_ON_OFF(1)"):
                 break
 
             print("\n=== [10] Servo1 round-trip -- PROX_2 dipantau reaktif selama gerak ===")

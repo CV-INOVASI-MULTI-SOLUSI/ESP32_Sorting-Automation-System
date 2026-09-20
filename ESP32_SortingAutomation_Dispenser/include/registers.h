@@ -48,6 +48,33 @@ namespace Reg {
   // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
   // Register ini bikin master bisa bedain dua kondisi itu.
   constexpr uint16_t MENU_ACTIVE = 20;  // R, 1 = operator lagi di menu kalibrasi LCD
+  // BARU (2026-09-20): counter LATCH dua tombol fisik yang selama ini menganggur, dipakai
+  // sebagai KONFIRMASI NYATA menggantikan delay/timing tebakan di script test:
+  //   BUTTON_2 -> "package sudah PENUH"        (dulu placeholder timing)
+  //   BUTTON_3 -> "package sudah DIAMBIL robot" (dulu tidak ada sama sekali)
+  // Naik +1 tiap penekanan (debounce 50 ms). Sama pola dgn MIDDLE_ARRIVAL_COUNT: master cukup
+  // membandingkan nilai SEBELUM vs SESUDAH menunggu, jadi tidak pernah kehilangan kejadian
+  // walau polling-nya sempat tertunda. Wrap 65535 -> 0 wajar dan tetap valid dibandingkan !=.
+  constexpr uint16_t BTN_PACKAGE_FULL_COUNT  = 21;  // R
+  constexpr uint16_t BTN_PACKAGE_TAKEN_COUNT = 22;  // R
+  // BARU (2026-09-20): berapa kali FIRMWARE menghentikan conveyor sendiri begitu PROX_2
+  // mendeteksi package datang -- tanpa menunggu perintah dari master. Master tidak selalu
+  // sedang memperhatikan (saat mengirim rangkaian perintah servo, misalnya), dan package
+  // keburu lewat kalau penghentiannya menunggu giliran polling. Counter ini murni untuk
+  // memastikan penghentian itu benar-benar terjadi dan menghitung berapa kali.
+  constexpr uint16_t CONVEYOR_AUTOSTOP_COUNT = 23;  // R
+  // BARU (2026-09-20): kedatangan SAH di PROX_1 (UJUNG). Hanya naik kalau sebelumnya memang
+  // ada package yang tercatat meninggalkan PROX_2 -- satu-satunya jalan menuju UJUNG adalah
+  // lewat TENGAH. PROX_1 yang menyala tanpa itu (tangan operator, benda tersenggol, pantulan
+  // sensor) DIABAIKAN, tidak menaikkan counter ini dan tidak menghentikan conveyor.
+  // Register live UJUNG_PACKAGE_PRESENT (17) tetap melaporkan keadaan sensor apa adanya.
+  constexpr uint16_t UJUNG_ARRIVAL_COUNT = 24;  // R
+  // BARU (2026-09-20): Dispenser menyatakan dirinya SIAP. 1 = package sudah duduk di TENGAH
+  // dengan gerbang terbuka, jadi benar-benar siap menampung objek baru. Orange Pi memakai ini
+  // sebagai syarat sebelum mulai menghitung batch -- bukan sekadar "node hidup".
+  constexpr uint16_t DISPENSER_READY = 25;  // R
+  // Tahap pipeline produksi, untuk diagnosa jarak jauh (lihat PipelineStage di main.cpp).
+  constexpr uint16_t PIPELINE_STAGE  = 26;  // R
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik FEEDER (refillState yg sudah ada) ---
