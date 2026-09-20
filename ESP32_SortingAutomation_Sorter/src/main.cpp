@@ -583,6 +583,15 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // apa-apa sendiri, sengaja tetap boleh live selama produksi jalan).
     case Cmd::SET_MOTOR_A:
       if (mainModeActive) { Serial.println("[CMD] SET_MOTOR_A ditolak -- MAIN aktif, STOP dulu"); break; }
+      // BARU (ditemukan 2026-09-20, kelas bug sama dgn servoRefillStage Dispenser): Motor A
+      // JUGA dipakai handlePalangQueue() (produksi asli, reject objek) -- itu jalan TANPA
+      // gate mainModeActive karena CLASSIFY_IS_REJECT (input HuskyLens) sengaja ungated.
+      // Kalau Orange Pi masih ngirim klasifikasi pas Sorter TEST mode, handlePalangQueue()
+      // bisa nyerobot Motor A di tengah jog manual ini tanpa peringatan. Guard di sini.
+      if (palangPending || palangState != PalangState::IDLE) {
+        Serial.println("[CMD] SET_MOTOR_A ditolak -- palang (reject) lagi pakai Motor A");
+        break;
+      }
       setMotorA((uint8_t)constrain(arg, 0, 2));
       break;
     // BARU -- biar Orange Pi bisa tuning kecepatan langsung. Sama pola dgn SET_CONVEYOR_SPEED/
