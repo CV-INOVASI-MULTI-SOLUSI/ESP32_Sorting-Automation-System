@@ -11,7 +11,9 @@ Ini versi MINIMAL untuk belajar konsep dasarnya (cuma SORTER, START/STOP +
 tulis CLASSIFY_IS_REJECT). Untuk skrip PRODUKSI ASLI (4 node, MAIN/TEST mode,
 batch penuh Sorter->Dispenser->Picker->Stocker), pakai orangepi-orchestrator-batch.py.
 Untuk uji manual per-node, pakai test-stocker-rack-sequence*.py atau
-test-dispenser-full-protocol*.py.
+test-dispenser-pipeline*.py. Untuk contoh khusus palang SORTER (4 cara
+menggerakkannya + jebakan MAIN/TEST dan menu LCD), lihat
+contoh-kirim-command-palang 20260921.py.
 """
 
 import minimalmodbus
