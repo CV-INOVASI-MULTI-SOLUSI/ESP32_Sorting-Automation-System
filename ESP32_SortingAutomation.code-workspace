@@ -14,6 +14,10 @@
 		{
 			"name": "ESP32_SortingAutomation_Sorter",
 			"path": "ESP32_SortingAutomation_Sorter"
+		},
+		{
+			"name": "ESP32_PCA9685",
+			"path": "../ESP32_Test Program/ESP32_PCA9685"
 		}
 	],
 	"settings": {}
