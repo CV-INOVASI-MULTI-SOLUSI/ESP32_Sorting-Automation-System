@@ -39,6 +39,16 @@ namespace Reg {
   // lewat (basi) pas antrian akhirnya sempat diproses. Sebelumnya dua-duanya hilang diam-diam
   // tanpa jejak apa pun -- objek reject lolos ke jalur pass dan tidak ada yang tahu.
   constexpr uint16_t REJECT_MISSED_COUNT = 19;  // R
+  // BARU (2026-09-21): uji kecepatan objek di conveyor. PROX_1 = garis start,
+  // PROX_2 = garis finish, jaraknya diatur lewat menu kalibrasi "Jarak Uji Kec.(mm)".
+  // Murni pengukuran pasif -- tidak menggerakkan apa pun dan tidak mengganggu jalur
+  // produksi PROX_2 (passCount) yang tetap berjalan seperti biasa.
+  constexpr uint16_t SPEED_LAST_MM_S        = 20;  // R, kecepatan hasil ukur terakhir (mm/detik)
+  constexpr uint16_t SPEED_LAST_MS          = 21;  // R, waktu tempuh terakhir (ms)
+  constexpr uint16_t SPEED_SAMPLE_COUNT     = 22;  // R, berapa kali pengukuran berhasil
+  // Kecepatan yang disetarakan ke PWM penuh (255). Ini SARAN nilai untuk parameter
+  // kalibrasi "Mm/s Max", yang dipakai menghitung waktu tempuh objek scan->palang.
+  constexpr uint16_t SPEED_MM_S_AT_MAX_PWM  = 23;  // R
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik (bukan cuma IDLE/RUNNING generik) ---

@@ -131,6 +131,10 @@ struct SorterConfig {
   // dorong-tarik nonstop, tidak ada kendali laju umpan objek ke conveyor sama sekali.
   // 0 = perilaku lama (nonstop). DITARUH DI AKHIR struct supaya blob NVS lama tetap kebaca.
   uint16_t hopperCycleGapMs = 1000;
+  // BARU (2026-09-21): jarak fisik PROX_1 (start) ke PROX_2 (finish), dipakai uji kecepatan
+  // objek di conveyor. Ukur sendiri dengan penggaris lalu isikan di sini lewat menu
+  // kalibrasi. DITARUH DI AKHIR struct supaya blob NVS lama tetap terbaca.
+  uint16_t speedTestDistMm = 200;
 } cfg;
 
 uint32_t passCount = 0, rejectCount = 0;
@@ -522,6 +526,102 @@ void handleSensors() {
   }
 }
 
+// ============================================================
+// UJI KECEPATAN OBJEK (BARU 2026-09-21)
+//
+// PROX_1 (ch19, selama ini menganggur) = garis START.
+// PROX_2 (ch18, sensor pass produksi)  = garis FINISH.
+// Kecepatan = cfg.speedTestDistMm dibagi selisih waktu kedua tepi.
+//
+// Sepenuhnya PASIF terhadap logika lain: fungsi ini hanya MEMBACA sensor, tidak
+// pernah menyentuh conveyor, palang, hopper, maupun antrian klasifikasi. Jalur
+// produksi PROX_2 (handleSensors -> passCount) tidak diubah sama sekali dan tetap
+// memakai deteksi tepinya sendiri. Jadi uji ini boleh menyala terus, termasuk
+// selama produksi berjalan, tanpa mengganggu apa pun.
+//
+// Soal ketelitian: waktu yang dicatat adalah saat TEPI MENTAH terjadi, bukan saat
+// debounce selesai. Jadi jeda debounce tidak ikut terhitung. Dan karena ambang
+// kedua sensor sama persis, sisa kesalahan sistematis apa pun akan saling
+// meniadakan di selisih waktunya.
+// ============================================================
+constexpr uint32_t SPEED_DEBOUNCE_MS = 15;      // cukup untuk menyaring pantulan, ringan untuk timing
+constexpr uint32_t SPEED_TIMEOUT_MS  = 15000;   // objek dianggap tidak sampai finish
+
+struct TepiSensor {
+  uint8_t channel;
+  bool rawLast;
+  uint32_t rawChangedAt;   // kapan tepi MENTAH terjadi -- inilah stempel waktu yang dipakai
+  bool stabil;
+  TepiSensor(uint8_t ch) : channel(ch), rawLast(HIGH), rawChangedAt(0), stabil(HIGH) {}
+};
+
+// true TEPAT SEKALI saat sensor benar-benar tertutup (HIGH->LOW yang stabil).
+// `saatTepi` diisi waktu tepi mentahnya, bukan waktu pemanggilan.
+bool objekLewat(TepiSensor &s, uint32_t &saatTepi) {
+  bool raw = io.read(s.channel);
+  if (raw != s.rawLast) { s.rawLast = raw; s.rawChangedAt = millis(); }
+  if (raw == s.stabil || millis() - s.rawChangedAt < SPEED_DEBOUNCE_MS) return false;
+  bool sebelumnya = s.stabil;
+  s.stabil = raw;
+  if (sebelumnya == HIGH && s.stabil == LOW) { saatTepi = s.rawChangedAt; return true; }
+  return false;
+}
+
+TepiSensor sensorStart(CH::PROX_1);
+TepiSensor sensorFinish(CH::PROX_2);
+
+bool speedSedangMengukur = false;
+uint32_t speedMulaiMs = 0;
+uint16_t speedLastMmS = 0, speedLastMs = 0, speedSampleCount = 0, speedMmSAtMaxPwm = 0;
+
+void handleSpeedTest() {
+  uint32_t saatTepi = 0;
+
+  if (objekLewat(sensorStart, saatTepi)) {
+    // Tepi START baru selalu menggantikan yang lama. Kalau objek sebelumnya tidak
+    // pernah sampai finish, lebih baik mulai ulang dari objek terbaru daripada
+    // menahan pengukuran yang sudah pasti gagal.
+    speedSedangMengukur = true;
+    speedMulaiMs = saatTepi;
+    Serial.println("[KECEPATAN] START -- objek melewati PROX_1");
+  }
+
+  if (objekLewat(sensorFinish, saatTepi)) {
+    if (speedSedangMengukur) {
+      uint32_t selisih = saatTepi - speedMulaiMs;
+      speedSedangMengukur = false;
+      if (selisih == 0) {
+        Serial.println("[KECEPATAN] Diabaikan -- selisih waktu 0 ms, dua sensor kemungkinan terpicu bersamaan");
+      } else {
+        uint32_t mmS = ((uint32_t)cfg.speedTestDistMm * 1000UL) / selisih;
+        speedLastMs = (uint16_t)min(selisih, (uint32_t)65535);
+        speedLastMmS = (uint16_t)min(mmS, (uint32_t)65535);
+        speedSampleCount++;
+        // Saran nilai kalibrasi TOF: mmPerSecAtMaxPwm adalah kecepatan pada PWM penuh,
+        // sedangkan pengukuran ini dilakukan pada cfg.conveyorSpeed. Diskalakan balik.
+        speedMmSAtMaxPwm = (cfg.conveyorSpeed > 0)
+            ? (uint16_t)min((uint32_t)(mmS * 255UL / cfg.conveyorSpeed), (uint32_t)65535) : 0;
+        mb.Hreg(Reg::SPEED_LAST_MM_S, speedLastMmS);
+        mb.Hreg(Reg::SPEED_LAST_MS, speedLastMs);
+        mb.Hreg(Reg::SPEED_SAMPLE_COUNT, speedSampleCount);
+        mb.Hreg(Reg::SPEED_MM_S_AT_MAX_PWM, speedMmSAtMaxPwm);
+        Serial.printf("[KECEPATAN] FINISH -- %u mm dalam %lu ms = %u mm/s "
+                      "(pada PWM %u). Saran 'Mm/s Max' = %u\n",
+                      cfg.speedTestDistMm, (unsigned long)selisih, speedLastMmS,
+                      cfg.conveyorSpeed, speedMmSAtMaxPwm);
+      }
+    }
+    // Kalau tidak sedang mengukur, tepi PROX_2 ini memang bukan bagian dari uji --
+    // biarkan saja, jalur produksi (handleSensors) yang menanganinya.
+  }
+
+  if (speedSedangMengukur && millis() - speedMulaiMs > SPEED_TIMEOUT_MS) {
+    speedSedangMengukur = false;
+    Serial.printf("[KECEPATAN] BATAL -- objek tidak sampai PROX_2 dalam %lu detik\n",
+                  (unsigned long)(SPEED_TIMEOUT_MS / 1000));
+  }
+}
+
 void handleSafety() {
   if (io.read(CH::ESTOP) == LOW) {   // DIUBAH ke aktif-LOW sesuai instruksi terbaru
     currentState = NodeState::ESTOPPED;
@@ -766,14 +866,18 @@ void drawTopMenuSorter() {
 // DIUBAH (2026-09-20): +1 item "Hopper Gap Siklus(ms)" (index 16) -- jeda antar siklus hopper,
 // satu-satunya kendali laju umpan yang dimiliki Sorter. Disisipkan SEBELUM "Reset ke Default"
 // supaya index 0-15 tidak bergeser sama sekali (selParam memakai angka yang sama).
-constexpr uint8_t CAL_COUNT = 18;
+// DIUBAH (2026-09-21): +1 item "Jarak Uji Kec.(mm)" (index 17) -- jarak PROX_1 ke PROX_2
+// untuk uji kecepatan objek. Disisipkan SEBELUM "Reset ke Default" supaya index 0-16
+// tidak bergeser sama sekali.
+constexpr uint8_t CAL_COUNT = 19;
 const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault",
                                         "Conveyor Speed", "Conveyor Dir", "Palang Speed", "Palang Dir",
                                         "Palang Push (ms)", "Palang Retract (ms)", "Dist (TOF mm)", "Mm/s Max",
                                         "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Step (us)", "Hopper Step Interval(ms)",
                                         "Hopper Push Hold(ms)",
                                         "Buzzer On (ms)", "Buzzer Off (ms)",
-                                        "Hopper Gap Siklus(ms)", "Reset ke Default" };
+                                        "Hopper Gap Siklus(ms)", "Jarak Uji Kec.(mm)",
+                                        "Reset ke Default" };
 uint8_t calCursor = 0;
 uint8_t selParam = 0;
 
@@ -812,7 +916,7 @@ void handleCalListKey(char key) {
       applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
       lcdPrint(0, 3, "Fault direset!      ");
       Serial.println("[CAL] Reset Fault dari menu LCD");
-    } else if (calCursor == 17) {   // DIUBAH 16 -> 17 (item "Hopper Gap Siklus" disisipkan sebelumnya)
+    } else if (calCursor == 18) {   // DIUBAH 17 -> 18 (item "Jarak Uji Kec." disisipkan sebelumnya)
                                      // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
       menuState = MenuState::CONFIRM_RESET;
       drawConfirmReset();
@@ -846,6 +950,7 @@ void drawParamMenu() {
     case 14: lcdPrint(0, 0, "BUZZER ON (ms)"); break;
     case 15: lcdPrint(0, 0, "BUZZER OFF (ms)"); break;
     case 16: lcdPrint(0, 0, "HOPPER GAP SIKLUS"); break;
+    case 17: lcdPrint(0, 0, "JARAK UJI KEC.(mm)"); break;
   }
   String line1;
   switch (selParam) {
@@ -865,6 +970,7 @@ void drawParamMenu() {
     case 14: line1 = "ms:" + String(cfg.buzzerOnMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 15: line1 = "ms:" + String(cfg.buzzerOffMs) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
     case 16: line1 = "ms:" + String(cfg.hopperCycleGapMs) + (cfg.hopperCycleGapMs == 0 ? " (NONSTOP)" : "") + " S:" + String(JOG_STEPS[jogStepIdx]); break;
+    case 17: line1 = "mm:" + String(cfg.speedTestDistMm) + "  Step:" + String(JOG_STEPS[jogStepIdx]); break;
   }
   lcdPrint(0, 1, line1);
   lcdPrint(0, 2, (selParam == 2 || selParam == 4) ? "A=Forward B=Reverse" : "A+ B- C:step");
@@ -963,6 +1069,13 @@ void handleParamKey(char key) {
       // BARU: jeda diam antar siklus hopper = kendali laju umpan. 0 = nonstop (perilaku lama).
       if (key == 'A') cfg.hopperCycleGapMs = (uint16_t)constrain((int)cfg.hopperCycleGapMs + step * 10, 0, 10000);
       else if (key == 'B') cfg.hopperCycleGapMs = (uint16_t)constrain((int)cfg.hopperCycleGapMs - step * 10, 0, 10000);
+      else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
+      break;
+    case 17:
+      // Jarak PROX_1 ke PROX_2. Ukur fisiknya dengan penggaris; ketelitian uji
+      // kecepatan bergantung langsung pada ketelitian angka ini.
+      if (key == 'A') cfg.speedTestDistMm = (uint16_t)constrain((int)cfg.speedTestDistMm + step, 10, 5000);
+      else if (key == 'B') cfg.speedTestDistMm = (uint16_t)constrain((int)cfg.speedTestDistMm - step, 10, 5000);
       else if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
       break;
   }
@@ -1467,6 +1580,10 @@ void handleSerialCommand() {
                   io.read(CH::ESTOP), cfg.conveyorSpeed, cfg.conveyorDir, cfg.distMm, cfg.mmPerSecAtMaxPwm);
     Serial.printf("[STATUS] rejectMissed=%lu (antrian penuh / dorongan basi) menuAktif=%d\n",
                   (unsigned long)rejectMissedCount, menuIsActive() ? 1 : 0);
+    Serial.printf("[STATUS] kecepatan: %u mm/s (%u mm dalam %u ms, sampel ke-%u) "
+                  "saran Mm/s Max=%u, sedang mengukur=%d\n",
+                  speedLastMmS, cfg.speedTestDistMm, speedLastMs, speedSampleCount,
+                  speedMmSAtMaxPwm, speedSedangMengukur ? 1 : 0);
     Serial.printf("[STATUS] activity=%u i2cErrCount=%u lastFault=%u uptime=%lus motorA=%u palangState=%d\n",
                   (uint16_t)activityCode(), i2cErrorCount, lastFaultCode, (unsigned long)(millis() / 1000), motorAState, (int)palangState);
     Serial.printf("[STATUS] FW=%s build=%s freeHeap=%u\n", FW_VERSION, FW_BUILD, ESP.getFreeHeap());
@@ -1638,6 +1755,10 @@ void setup() {
   // Motor A (AIN1/AIN2) -- SEKARANG dipakai produksi utk actuator palang, BUKAN lagi spare.
   io.pinMode(CH::CONV1_AIN1, OUTPUT); io.pinMode(CH::CONV1_AIN2, OUTPUT);
   io.pinMode(CH::PROX_PASS, INPUT_PULLUP);
+  // BARU (2026-09-21): PROX_1 sebelumnya TIDAK PERNAH di-pinMode di Sorter -- ia terdaftar
+  // di menu Test Input tapi tidak pernah disiapkan, jadi pembacaannya tidak bermakna.
+  // Sekarang dipakai sebagai garis START uji kecepatan objek.
+  io.pinMode(CH::PROX_1, INPUT_PULLUP);
   io.pinMode(CH::BTN_TEST_HOPPER, INPUT_PULLUP);
   io.pinMode(CH::BTN_TEST_PALANG, INPUT_PULLUP);
   // DIPERBAIKI (bug ditemukan): channel Test Modul berikut TIDAK PERNAH di-pinMode OUTPUT --
@@ -1712,6 +1833,10 @@ void setup() {
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
   mb.addHreg(Reg::MENU_ACTIVE, 0);           // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
   mb.addHreg(Reg::REJECT_MISSED_COUNT, 0);   // BARU -- REJECT yang gagal jadi dorongan palang
+  mb.addHreg(Reg::SPEED_LAST_MM_S, 0);       // BARU -- uji kecepatan objek PROX_1 -> PROX_2
+  mb.addHreg(Reg::SPEED_LAST_MS, 0);
+  mb.addHreg(Reg::SPEED_SAMPLE_COUNT, 0);
+  mb.addHreg(Reg::SPEED_MM_S_AT_MAX_PWM, 0);
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   mb.onSetHreg(Reg::CLASSIFY_IS_REJECT, onClassifyWrite);
   Serial.println("[BOOT] Modbus + register lengkap OK");
@@ -1829,6 +1954,7 @@ void loop() {
     handleConveyor();
     handlePalangQueue();
     handleSensors();
+    handleSpeedTest();     // BARU -- uji kecepatan objek, PASIF (cuma membaca sensor)
     handleTestButtons();   // BARU -- push button uji manual PASS/REJECT
   }
 
@@ -1892,6 +2018,14 @@ void loop() {
     if (millis() - lastLcdRefresh > 500) {
       lastLcdRefresh = millis();
       lcdPrint(0, 0, "[AUTO] " + activityText());
+      // BARU: baris 1 selama ini kosong -- dipakai menampilkan hasil uji kecepatan,
+      // supaya bisa dibaca langsung di panel tanpa perlu PC.
+      if (speedSampleCount > 0) {
+        lcdPrint(0, 1, String(speedLastMmS) + "mm/s " + String(speedLastMs) + "ms #"
+                        + String(speedSampleCount));
+      } else if (speedSedangMengukur) {
+        lcdPrint(0, 1, "Ukur: menuju PROX_2..");
+      }
       lcdPrint(0, 2, "State:" + String(stateText(currentState)));
       lcdPrint(0, 3, "P:" + String(passCount) + " R:" + String(rejectCount));
     }
