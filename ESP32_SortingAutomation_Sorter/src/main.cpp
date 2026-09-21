@@ -413,8 +413,17 @@ uint8_t motorAState = 0;   // 0=stop, 1=maju, 2=mundur
 // I2C write (~650-700us per panggilan, dikonfirmasi dari source Adafruit_BusIO).
 // Sekarang di-cache, cuma tulis saat benar-benar berubah.
 bool lastConv1StbyState = false;
+// BARU (2026-09-21): conveyor boleh dinyalakan dari layar kalibrasi "Uji Kecepatan"
+// walaupun node tidak RUNNING. Pola yang sama dengan hopperIntervalTestMode, yang sudah
+// lebih dulu memutar hopper selagi operator berada di layar kalibrasinya.
+bool speedTestConveyorOn = false;
+
+bool conveyorHarusJalan() {
+  return (currentState == NodeState::RUNNING_OR_MOVING) || speedTestConveyorOn;
+}
+
 void updateConv1Stby() {
-  bool conveyorRunning = (currentState == NodeState::RUNNING_OR_MOVING);
+  bool conveyorRunning = conveyorHarusJalan();
   bool stbyNow = conveyorRunning || motorAState != 0;
   if (stbyNow != lastConv1StbyState) { io.write(CH::CONV1_STBY, stbyNow); lastConv1StbyState = stbyNow; }
 }
@@ -423,7 +432,7 @@ bool lastConveyorDirWritten = false;
 bool conveyorDirCacheValid = false;   // dirWritten belum pernah diisi -- paksa tulis pertama kali
 void handleConveyor() {
   updateConv1Stby();
-  if (currentState != NodeState::RUNNING_OR_MOVING) { ledcWrite(LEDC_CH_CONV1, 0); conveyorDirCacheValid = false; return; }
+  if (!conveyorHarusJalan()) { ledcWrite(LEDC_CH_CONV1, 0); conveyorDirCacheValid = false; return; }
   if (!conveyorDirCacheValid || cfg.conveyorDir != lastConveyorDirWritten) {
     motorWrite(CH::CONV1_BIN1, CH::CONV1_BIN2, cfg.conveyorDir);
     lastConveyorDirWritten = cfg.conveyorDir;
@@ -634,6 +643,9 @@ void handleSafety() {
     // siklus itu DIBATALKAN, bukan dilanjut otomatis setelah E-stop dilepas.
     ledcWrite(LEDC_CH_MOTORA, 0); motorAState = 0;
     palangState = PalangState::IDLE; palangActive = false; palangPending = false;
+    // BARU: uji kecepatan ikut dibatalkan. Tanpa ini, sabuk akan berputar lagi
+    // begitu E-stop dilepas, padahal operator tidak memerintahkan apa pun.
+    speedTestConveyorOn = false;
     return;
   }
   if (currentState == NodeState::ESTOPPED) currentState = NodeState::IDLE;   // diam, TIDAK auto-RUNNING (D11)
@@ -656,6 +668,7 @@ bool otaBegun = false;   // ArduinoOTA.begin() sudah dipanggil sekali (callback 
 // tanpa reboot -> conveyor mati senyap (PWM tetap keluar, STBY-nya yang mati) sampai ada
 // perubahan state yang kebetulan memaksa penulisan ulang. Cache disinkronkan di sini.
 void otaSafeStop() {
+  speedTestConveyorOn = false;   // BARU -- jangan sampai sabuk nyala lagi di tengah tulis flash
   ledcWrite(LEDC_CH_CONV1, 0);
   io.write(CH::CONV1_STBY, LOW);
   lastConv1StbyState = false;
@@ -823,7 +836,8 @@ constexpr const char* FW_BUILD = __DATE__ " " __TIME__;
 enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_PARAM,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
                         TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
-                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET };
+                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET,
+                        TEST_KECEPATAN };
 MenuState menuState = MenuState::NONE;
 bool menuIsActive() { return menuState != MenuState::NONE; }   // BARU -- dipakai onClassifyWrite() di atas
 uint8_t jogStepIdx = 0;
@@ -866,17 +880,18 @@ void drawTopMenuSorter() {
 // DIUBAH (2026-09-20): +1 item "Hopper Gap Siklus(ms)" (index 16) -- jeda antar siklus hopper,
 // satu-satunya kendali laju umpan yang dimiliki Sorter. Disisipkan SEBELUM "Reset ke Default"
 // supaya index 0-15 tidak bergeser sama sekali (selParam memakai angka yang sama).
-// DIUBAH (2026-09-21): +1 item "Jarak Uji Kec.(mm)" (index 17) -- jarak PROX_1 ke PROX_2
-// untuk uji kecepatan objek. Disisipkan SEBELUM "Reset ke Default" supaya index 0-16
-// tidak bergeser sama sekali.
-constexpr uint8_t CAL_COUNT = 19;
+// DIUBAH (2026-09-21): +2 item untuk uji kecepatan objek -- "Jarak Uji Kec.(mm)" (index 17,
+// jarak PROX_1 ke PROX_2) dan "Uji Kecepatan" (index 18, layar ujinya sendiri lengkap dengan
+// kendali conveyor). Keduanya disisipkan SEBELUM "Reset ke Default" supaya index 0-16 tidak
+// bergeser sama sekali terhadap selParam.
+constexpr uint8_t CAL_COUNT = 20;
 const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault",
                                         "Conveyor Speed", "Conveyor Dir", "Palang Speed", "Palang Dir",
                                         "Palang Push (ms)", "Palang Retract (ms)", "Dist (TOF mm)", "Mm/s Max",
                                         "Hopper Titik Awal", "Hopper Titik Dorong", "Hopper Step (us)", "Hopper Step Interval(ms)",
                                         "Hopper Push Hold(ms)",
                                         "Buzzer On (ms)", "Buzzer Off (ms)",
-                                        "Hopper Gap Siklus(ms)", "Jarak Uji Kec.(mm)",
+                                        "Hopper Gap Siklus(ms)", "Jarak Uji Kec.(mm)", "Uji Kecepatan",
                                         "Reset ke Default" };
 uint8_t calCursor = 0;
 uint8_t selParam = 0;
@@ -884,6 +899,64 @@ uint8_t selParam = 0;
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
 
 // --- BARU: konfirmasi Reset ke Default -- aksi merusak (hapus NVS), wajib konfirmasi 2 langkah ---
+// ============================================================
+// LAYAR KALIBRASI: UJI KECEPATAN (BARU 2026-09-21)
+//
+// Conveyor dinyalakan langsung dari sini, tanpa perlu START/MAIN. Dengan begitu
+// hopper tidak ikut bersiklus dan tidak ada objek yang dijatuhkan sendiri --
+// operator cukup meletakkan objek di sabuk lalu mengamati hasilnya.
+//
+// Tombol:
+//   A / B  kecepatan conveyor naik / turun (berlaku live, sabuk langsung berubah)
+//   C      conveyor ON / OFF
+//   D      kembali (conveyor DIMATIKAN otomatis)
+//   #      simpan: kecepatan conveyor + terapkan saran 'Mm/s Max' ke kalibrasi TOF
+// ============================================================
+void drawTestKecepatan() {
+  lcdPrint(0, 0, "UJI KEC. " + String(cfg.speedTestDistMm) + "mm");
+
+  if (speedSampleCount > 0) {
+    lcdPrint(0, 1, String(speedLastMmS) + "mm/s " + String(speedLastMs) + "ms #" + String(speedSampleCount));
+  } else if (speedSedangMengukur) {
+    lcdPrint(0, 1, "Jalan.. tunggu PROX_2");
+  } else {
+    lcdPrint(0, 1, "Lewatkan objek..");
+  }
+
+  lcdPrint(0, 2, "PWM" + String(cfg.conveyorSpeed) + " Max:" + String(speedMmSAtMaxPwm)
+                 + (speedTestConveyorOn ? " ON" : " off"));
+  lcdPrint(0, 3, "A+B-C:on/off #simpan");
+}
+
+void handleTestKecepatanKey(char key) {
+  if (key == 'A') {
+    cfg.conveyorSpeed = (uint8_t)constrain((int)cfg.conveyorSpeed + 5, 0, 255);
+  } else if (key == 'B') {
+    cfg.conveyorSpeed = (uint8_t)constrain((int)cfg.conveyorSpeed - 5, 0, 255);
+  } else if (key == 'C') {
+    speedTestConveyorOn = !speedTestConveyorOn;
+    Serial.printf("[KECEPATAN] Conveyor %s dari menu kalibrasi\n", speedTestConveyorOn ? "ON" : "OFF");
+  } else if (key == '#') {
+    // Saran 'Mm/s Max' hanya ada artinya kalau sudah pernah ada pengukuran berhasil.
+    if (speedMmSAtMaxPwm > 0) {
+      cfg.mmPerSecAtMaxPwm = (float)speedMmSAtMaxPwm;
+      Serial.printf("[KECEPATAN] Mm/s Max diterapkan dari hasil ukur = %u\n", speedMmSAtMaxPwm);
+    }
+    saveConfigToNvs();
+    lcdPrint(0, 3, "TERSIMPAN ke NVS!   ");
+    return;   // jangan gambar ulang, biar pesan tersimpan sempat terbaca
+  } else if (key == 'D') {
+    // Meninggalkan layar ini WAJIB mematikan sabuk. Kalau tidak, conveyor akan
+    // terus berputar tanpa ada layar yang menunjukkan kenapa.
+    speedTestConveyorOn = false;
+    menuState = MenuState::CAL_LIST;
+    Serial.println("[KECEPATAN] Keluar -- conveyor dimatikan");
+    drawCalList();
+    return;
+  }
+  drawTestKecepatan();
+}
+
 void drawConfirmReset() {
   lcd.clear();
   lcdPrint(0, 0, "RESET KE DEFAULT?");
@@ -916,7 +989,11 @@ void handleCalListKey(char key) {
       applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
       lcdPrint(0, 3, "Fault direset!      ");
       Serial.println("[CAL] Reset Fault dari menu LCD");
-    } else if (calCursor == 18) {   // DIUBAH 17 -> 18 (item "Jarak Uji Kec." disisipkan sebelumnya)
+    } else if (calCursor == 18) {   // BARU -- layar "Uji Kecepatan", punya kendali conveyor sendiri
+      menuState = MenuState::TEST_KECEPATAN;
+      lcd.clear();
+      drawTestKecepatan();
+    } else if (calCursor == 19) {   // DIUBAH 18 -> 19 (item "Uji Kecepatan" disisipkan sebelumnya)
                                      // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
       menuState = MenuState::CONFIRM_RESET;
       drawConfirmReset();
@@ -1712,6 +1789,7 @@ void checkLcdKeypadHotplug() {
     if (menuState != MenuState::NONE) {
       menuState = MenuState::NONE;
       hopperIntervalTestMode = false;   // BARU -- cegah hopper terus bersiklus tanpa henti kalau keypad hilang saat test aktif
+      speedTestConveyorOn = false;      // BARU -- alasan sama: tanpa keypad tidak ada cara mematikan sabuk dari layar itu
       Serial.println("[HOTPLUG] Keluar OTOMATIS dari mode kalibrasi -- keypad hilang, command eksternal diaktifkan lagi (cegah node terjebak)");
     }
   }
@@ -1899,6 +1977,8 @@ void loop() {
         handleTestCmdListKey(key);
       } else if (menuState == MenuState::CONFIRM_RESET) {
         handleConfirmResetKey(key);
+      } else if (menuState == MenuState::TEST_KECEPATAN) {
+        handleTestKecepatanKey(key);
       }
     }
   }
@@ -1971,6 +2051,12 @@ void loop() {
   if (menuState == MenuState::TEST_RS485 && lcdPresent) {
     static uint32_t lastTestRs485Refresh = 0;
     if (millis() - lastTestRs485Refresh > 500) { lastTestRs485Refresh = millis(); drawTestRs485(); }
+  }
+  // BARU: hasil uji kecepatan harus tampil LIVE -- objek lewat kapan saja, bukan
+  // sebagai reaksi atas penekanan tombol.
+  if (menuState == MenuState::TEST_KECEPATAN && lcdPresent) {
+    static uint32_t lastKecRefresh = 0;
+    if (millis() - lastKecRefresh > 200) { lastKecRefresh = millis(); drawTestKecepatan(); }
   }
   if (menuState == MenuState::TEST_MOD_MOTORDC && lcdPresent) {
     static uint32_t lastTestModRefresh = 0;
