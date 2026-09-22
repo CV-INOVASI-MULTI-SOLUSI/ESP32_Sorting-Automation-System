@@ -209,6 +209,15 @@ uint32_t testServoCycleStateAt = 0;
 // (bukan berhenti sekali), supaya perubahan Interval langsung kelihatan efeknya.
 bool servoIntervalTestMode = false;
 uint8_t servoIntervalTestWhich = 0;   // 1 atau 2, servo mana yang lagi di-loop
+
+// BARU (2026-09-22): hal yang sama untuk CONVEYOR. Layar "Conveyor Speed" dan "Conveyor Dir"
+// selama ini cuma mengubah angka -- sabuknya diam, jadi operator menyetel kecepatan tanpa
+// pernah melihat akibatnya. Satu-satunya cara menjalankan sabuk adalah lewat command Modbus
+// dari Orange Pi, yang berarti harus meninggalkan panel.
+//
+// Sekarang selama operator berada di salah satu dari dua layar itu, sabuk berjalan live dan
+// langsung berubah saat angkanya diubah. Berhenti otomatis begitu keluar dari layar.
+bool conveyorLiveTestMode = false;
 void startTestServoCycle(uint8_t which) {
   if (currentState != NodeState::IDLE) { Serial.println("[TEST] Servo cycle ditolak -- node sedang tidak IDLE"); return; }
   if (isServoRefillAutoActive()) { Serial.println("[TEST] Servo cycle ditolak -- refill otomatis (PROX_2) lagi pegang servo"); return; }
@@ -1236,6 +1245,9 @@ void updateRefillJoin() {
 void handleSafety() {
   if (io.read(CH::ESTOP) == LOW) {   // DIUBAH dari HIGH ke LOW
     currentState = NodeState::ESTOPPED;
+    // BARU (2026-09-22): uji conveyor dari menu ikut dibatalkan. Tanpa ini sabuk akan
+    // menyala lagi begitu E-stop dilepas, padahal operator tidak memerintahkan apa pun.
+    conveyorLiveTestMode = false;
     enterRefillState(RefillState::ESTOPPED);
     // BARU: reset tracking servo refill juga -- cegah siklus lama "nyangkut" nge-resume aneh
     // begitu E-stop dilepas (servo diam di posisi terakhir, TIDAK otomatis lanjut).
@@ -1262,6 +1274,7 @@ bool otaBegun = false;   // ArduinoOTA.begin() sudah dipanggil sekali (callback 
 // Servo PCA9685 aman (chip I2C eksternal, tahan posisi sendiri walau ESP32 sibuk), tapi
 // conveyor (LEDC hardware PWM native) tetap jalan otonom kalau tidak dipaksa berhenti dulu.
 void otaSafeStop() {
+  conveyorLiveTestMode = false;   // BARU -- jangan sampai sabuk menyala lagi di tengah tulis flash
   ledcWrite(LEDC_CH_CONV2, 0);
 }
 
@@ -1641,8 +1654,10 @@ void handleConfirmResetKey(char key) {
 
 void drawParamMenuFeeder() {
   switch (selParam) {
-    case 1: lcdPrint(0, 0, "CONVEYOR SPEED"); break;
-    case 2: lcdPrint(0, 0, "CONVEYOR DIR"); break;
+    // Tanda "LIVE" supaya jelas sabuk memang sedang berjalan -- dan supaya ketahuan kalau
+    // ternyata ditolak karena ada siklus lain yang sedang memakainya.
+    case 1: lcdPrint(0, 0, String("CONVEYOR SPEED") + (conveyorLiveTestMode ? " LIVE" : "")); break;
+    case 2: lcdPrint(0, 0, String("CONVEYOR DIR") + (conveyorLiveTestMode ? " LIVE" : "")); break;
     case 3: lcdPrint(0, 0, "MID CONFIRM TIMEOUT"); break;
     case 4: lcdPrint(0, 0, "PUSH TIMEOUT (ms)"); break;
     case 5: lcdPrint(0, 0, "SERVO1 TITIK AWAL"); break;
@@ -1688,9 +1703,12 @@ void handleParamKeyFeeder(char key) {
   if (selParam == 1) {
     if (key == 'A') cfg.conveyorSpeed = (uint8_t)constrain((int)cfg.conveyorSpeed + step, 0, 255);
     else if (key == 'B') cfg.conveyorSpeed = (uint8_t)constrain((int)cfg.conveyorSpeed - step, 0, 255);
+    // Terapkan seketika supaya perubahannya terasa di sabuk, bukan baru berlaku nanti.
+    if (conveyorLiveTestMode) setConveyorManual(true);
   } else if (selParam == 2) {
     if (key == 'A') cfg.conveyorDir = true;
     else if (key == 'B') cfg.conveyorDir = false;
+    if (conveyorLiveTestMode) setConveyorManual(true);
   } else if (selParam == 3) {
     if (key == 'A') cfg.middleConfirmTimeoutMs = (uint16_t)constrain((int)cfg.middleConfirmTimeoutMs + step * 10, 500, 20000);
     else if (key == 'B') cfg.middleConfirmTimeoutMs = (uint16_t)constrain((int)cfg.middleConfirmTimeoutMs - step * 10, 500, 20000);
@@ -1751,7 +1769,13 @@ void handleParamKeyFeeder(char key) {
   }
   if (key == 'C') jogStepIdx = (jogStepIdx + 1) % 4;
   else if (key == '#') { saveConfigToNvs(); lcdPrint(0, 3, "TERSIMPAN ke NVS!"); Serial.println("[CAL] FeederConfig disimpan ke NVS"); return; }
-  else if (key == 'D') { servoIntervalTestMode = false; menuState = MenuState::CAL_LIST; drawCalList(); return; }
+  else if (key == 'D') {
+    servoIntervalTestMode = false;
+    // Sabuk WAJIB berhenti saat meninggalkan layar. Kalau tidak, ia terus berjalan tanpa ada
+    // layar mana pun yang menunjukkan kenapa.
+    if (conveyorLiveTestMode) { conveyorLiveTestMode = false; setConveyorManual(false); }
+    menuState = MenuState::CAL_LIST; drawCalList(); return;
+  }
   drawParamMenuFeeder();
 }
 
@@ -1772,6 +1796,21 @@ void handleCalListKey(char key) {
       servoIntervalTestMode = (selParam == 8 || selParam == 9 || selParam == 13 || selParam == 14);
       servoIntervalTestWhich = (selParam == 8 || selParam == 9) ? 1 : 2;
       if (servoIntervalTestMode && testServoCycleStage == TestServoCycleStage::NONE) startTestServoCycle(servoIntervalTestWhich);
+      // BARU: sabuk berjalan live selama di layar Conveyor Speed / Conveyor Dir.
+      // Ditolak kalau ada mekanisme lain yang sedang memegang sabuk -- dua pihak menulis
+      // satu aktuator yang sama itu kelas bug yang sudah berkali-kali menggigit di proyek ini.
+      conveyorLiveTestMode = false;
+      if (selParam == 1 || selParam == 2) {
+        if (mainModeActive || pipelineStage != PipelineStage::MATI ||
+            refillState != RefillState::IDLE || testLoopStage != TestLoopStage::OFF ||
+            forceMiddleRefillActive) {
+          Serial.println("[CAL] Conveyor live ditolak -- ada siklus lain sedang memakai sabuk");
+        } else {
+          conveyorLiveTestMode = true;
+          setConveyorManual(true);
+          Serial.println("[CAL] Conveyor JALAN live -- berhenti otomatis saat keluar layar ini");
+        }
+      }
       menuState = MenuState::JOG_PARAM; lcdClear(); drawParamMenuFeeder();
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuFeeder(); }
@@ -2235,7 +2274,9 @@ void checkLcdKeypadHotplug() {
   else if (keypadPresent && !kpPing) {
     keypadPresent = false;
     Serial.println("[HOTPLUG] !!! Keypad TIDAK TERDETEKSI LAGI !!!");
-    if (menuState != MenuState::NONE) { menuState = MenuState::NONE; servoIntervalTestMode = false; Serial.println("[HOTPLUG] Keluar OTOMATIS dari mode kalibrasi -- cegah node terjebak"); }
+    if (menuState != MenuState::NONE) { menuState = MenuState::NONE; servoIntervalTestMode = false;
+      if (conveyorLiveTestMode) { conveyorLiveTestMode = false; setConveyorManual(false); }   // tanpa keypad tidak ada cara mematikan sabuk dari layar itu
+      Serial.println("[HOTPLUG] Keluar OTOMATIS dari mode kalibrasi -- cegah node terjebak"); }
   }
 }
 
