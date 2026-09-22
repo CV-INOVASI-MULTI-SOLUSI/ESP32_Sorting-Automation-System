@@ -391,6 +391,18 @@ def main():
 
         print("\n" + "=" * 70)
         print("TAHAP A SELESAI -- ketiga pose dan gerakan ambil/taruh sudah terverifikasi.")
+        print()
+        print("PERIKSA DULU SEBELUM LANJUT -- mekanisme SENDOK:")
+        print("  Package hanya DUDUK di atas sendok, tidak dijepit apa pun. Karena itu:")
+        print("  1. POST_PLACE_OFFSET tidak boleh nol. Itulah langkah menarik sendok keluar")
+        print("     dari bawah package setelah diletakkan. Kalau masih nol, siklus akan")
+        print("     meletakkan package lalu langsung menyeretnya pergi saat pulang ke Home.")
+        print("     Setel lewat menu: Setting Kalibrasi -> Post-Place Offset.")
+        print("  2. Pose 1 harus dikalibrasi dengan sendok SUDAH berada di bawah package --")
+        print("     PICK hanya mengangkat, tidak menyelipkan sendok terlebih dahulu.")
+        print("  3. Gerakan mendadak bisa menggeser package dari sendok. Kalau tergelincir,")
+        print("     perbesar RampSteps di menu Speed, bukan memperlambat Jelajah.")
+        print()
         print("Lanjut ke siklus produksi. MAIN akan diaktifkan.")
         print("=" * 70)
 

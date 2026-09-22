@@ -126,8 +126,18 @@ Pose POSES[NUM_POSES] = {
 int16_t PICK_OFFSET[ServoCfg::NUM_JOINTS]      = {0,0,-200,0,0,600};
 int16_t PLACE_OFFSET[ServoCfg::NUM_JOINTS]     = {0,0,-200,0,0,1000};
 int16_t CLEARANCE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,300,0,0,0};
-// BARU: gerakan tambahan setelah Place, sebelum kembali Home -- default 0 (TIDAK bergerak)
-// sampai dikalibrasi manual via menu Jog, supaya tidak ada asumsi arah gerakan yang salah.
+// Gerakan tambahan setelah Place, sebelum kembali Home. Default 0 (TIDAK bergerak) supaya
+// tidak ada asumsi arah gerakan yang salah sebelum dikalibrasi lewat menu Jog.
+//
+// PENTING untuk mekanisme SENDOK (dikonfirmasi user 2026-09-22): package diangkat dengan
+// disendok dari bawah, jadi ia hanya DUDUK di atas sendok tanpa dijepit apa pun. Setelah
+// Place menurunkan package ke tempatnya, sendok masih berada DI BAWAH package. Kalau lengan
+// langsung pulang ke Home dari situ, sendok tertarik sambil menyeret atau menjatuhkan
+// package yang baru saja diletakkan.
+//
+// Jadi di mekanisme ini POST_PLACE bukan gerakan opsional -- inilah langkah menarik sendok
+// keluar dari bawah package. Selama masih berisi nol, siklus MOVE_PACKAGE akan meletakkan
+// package lalu langsung menyeretnya pergi.
 int16_t POST_PLACE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,0,0,0,0};
 
 uint16_t currentUs[ServoCfg::NUM_JOINTS];
