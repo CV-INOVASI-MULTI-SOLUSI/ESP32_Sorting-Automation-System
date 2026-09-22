@@ -41,13 +41,32 @@ bool lcdPresent = false, keypadPresent = false;   // BARU -- LCD/Keypad opsional
 // BARU: helper LCD -- SELALU isi penuh sampai ujung baris (20 kolom), supaya sisa karakter
 // dari teks sebelumnya yang lebih panjang tidak pernah nempel/menumpuk. Dipakai menggantikan
 // lcd.print() manual + spasi tebakan di menu kalibrasi & status live.
+String lcdCacheTeks[LcdCfg::ROWS];
+uint8_t lcdCacheCol[LcdCfg::ROWS] = {0};
+bool lcdCacheValid[LcdCfg::ROWS] = {false};
+
 void lcdPrint(uint8_t col, uint8_t row, String text) {
   if (!lcdPresent) return;
   uint8_t avail = (col < LcdCfg::COLS) ? (LcdCfg::COLS - col) : 0;
   if (text.length() > avail) text = text.substring(0, avail);
   while (text.length() < avail) text += " ";
+  // BARU (2026-09-22): lewati penulisan kalau isi baris ini memang tidak berubah.
+  //
+  // Menulis 20 karakter ke LCD lewat I2C memakan beberapa milidetik, dan selama itu loop()
+  // tertahan. Layar-layar test menggambar ulang seluruh baris tiap 100-250 ms walau isinya
+  // sama persis, sehingga gerakan yang timing-nya diatur per-tick (servo/stepper) kehilangan
+  // tick dan terasa tersendat -- padahal justru layar itulah yang dipakai mengamatinya.
+  // Tick yang hilang tidak pernah dibayar belakangan, jadi dampaknya langsung terlihat.
+  if (row < LcdCfg::ROWS && lcdCacheValid[row] && lcdCacheCol[row] == col && lcdCacheTeks[row] == text) return;
+  if (row < LcdCfg::ROWS) { lcdCacheValid[row] = true; lcdCacheCol[row] = col; lcdCacheTeks[row] = text; }
   lcd.setCursor(col, row);
   lcd.print(text);
+}
+
+// Wajib dipakai menggantikan lcdClear() -- layar kosong membuat seluruh cache basi.
+void lcdClear() {
+  if (lcdPresent) lcd.clear();
+  for (uint8_t i = 0; i < LcdCfg::ROWS; i++) lcdCacheValid[i] = false;
 }
 
 // BARU: animasi LOADING singkat saat boot -- kasih feedback visual operator + waktu settle
@@ -844,7 +863,7 @@ uint8_t jogStepIdx = 0;
 constexpr int16_t JOG_STEPS[4] = {5, 10, 20, 50};
 
 void drawListMenu(const char* title, const char* labels[], uint8_t count, uint8_t cursor) {
-  lcd.clear();
+  lcdClear();
   lcdPrint(0, 0, title);
   uint8_t viewStart = 0;
   if (cursor >= 2) viewStart = cursor - 1;
@@ -958,7 +977,7 @@ void handleTestKecepatanKey(char key) {
 }
 
 void drawConfirmReset() {
-  lcd.clear();
+  lcdClear();
   lcdPrint(0, 0, "RESET KE DEFAULT?");
   lcdPrint(0, 1, "Semua kalibrasi akan");
   lcdPrint(0, 2, "HILANG, TAK BS BATAL");
@@ -991,7 +1010,7 @@ void handleCalListKey(char key) {
       Serial.println("[CAL] Reset Fault dari menu LCD");
     } else if (calCursor == 18) {   // BARU -- layar "Uji Kecepatan", punya kendali conveyor sendiri
       menuState = MenuState::TEST_KECEPATAN;
-      lcd.clear();
+      lcdClear();
       drawTestKecepatan();
     } else if (calCursor == 19) {   // DIUBAH 18 -> 19 (item "Uji Kecepatan" disisipkan sebelumnya)
                                      // "Reset ke Default" -- minta konfirmasi dulu, bukan langsung eksekusi
@@ -1003,7 +1022,7 @@ void handleCalListKey(char key) {
       // perlu liat efeknya live pas ngatur salah satu dari dua parameter ini.
       hopperIntervalTestMode = (selParam == 11 || selParam == 12);
       menuState = MenuState::JOG_PARAM;
-      lcd.clear(); drawParamMenu();
+      lcdClear(); drawParamMenu();
     }
   }
   else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuSorter(); }
@@ -1198,7 +1217,7 @@ void drawTestOutputItem() {
   IOTestItem &item = OUTPUT_TEST_ITEMS[outputTestCursor];
   bool val = io.read(item.ch);
   if (testOutputFirstDraw) {
-    lcd.clear();
+    lcdClear();
     lcdPrint(0, 0, "TEST OUT: " + String(item.label));
     lcdPrint(0, 2, "C=toggle" + String(item.autoControlled ? " (auto)" : ""));
     lcdPrint(0, 3, "D=kembali");
@@ -1272,7 +1291,7 @@ uint8_t testInputLastScrollTop = 255;         // beda dari nilai valid manapun -
 
 void drawTestInputList() {
   bool scrollChanged = (inputTestScrollTop != testInputLastScrollTop);
-  if (scrollChanged) { lcd.clear(); testInputLastScrollTop = inputTestScrollTop; }
+  if (scrollChanged) { lcdClear(); testInputLastScrollTop = inputTestScrollTop; }
   for (uint8_t row = 0; row < 4; row++) {
     uint8_t idx = inputTestScrollTop + row;
     if (idx >= activeInputCount) continue;
@@ -1306,7 +1325,7 @@ void handleInputCategoryKey(char key) {
 
 // --- Kategori: I2C Scan ---
 void runI2CScanFromMenu() {
-  lcd.clear(); lcdPrint(0, 0, "I2C SCAN...");
+  lcdClear(); lcdPrint(0, 0, "I2C SCAN...");
   Serial.println("[TEST-IO] I2C Scan dari menu:");
   String found = ""; uint8_t count = 0;
   for (uint8_t addr = 1; addr < 127; addr++) {
@@ -1335,7 +1354,7 @@ String lcdVersionShort() {
   return v;
 }
 void drawTestRs485() {
-  lcd.clear();
+  lcdClear();
   lcdPrint(0, 0, "TEST RS485");
   lcdPrint(0, 1, "Slave:" + String(Rs485Cfg::SLAVE_ID) + " Baud:" + String(Rs485Cfg::BAUD));
   if (modbusEverUsed) lcdPrint(0, 2, "RX terakhir:" + String((millis() - lastRs485Rx) / 1000) + "s lalu");
@@ -1387,7 +1406,7 @@ void testStepperPulse(uint8_t axisIdx, bool forward) {
 }
 void drawTestModStepper() {
   if (testModFirstDraw) {
-    lcd.clear(); lcdPrint(0, 0, "MODUL: STEPPER");
+    lcdClear(); lcdPrint(0, 0, "MODUL: STEPPER");
     lcdPrint(0, 1, "(cek fisik manual)");
     lcdPrint(0, 3, "C=ax A/B=puls D=kmb");
     testModFirstDraw = false;
@@ -1436,7 +1455,7 @@ void testModSetMotor(bool channelA, uint8_t dirState) {
 const char* motorDirName(uint8_t s) { return s == 0 ? "STOP" : (s == 1 ? "FWD" : "REV"); }
 void drawTestModMotorDC() {
   if (testModFirstDraw) {
-    lcd.clear(); lcdPrint(0, 0, "MODUL: MOTOR DC");
+    lcdClear(); lcdPrint(0, 0, "MODUL: MOTOR DC");
     lcdPrint(0, 3, "A=chA B=chB D=kmb");
     testModFirstDraw = false; testModLine1 = "\x01";
   }
@@ -1458,7 +1477,7 @@ void handleTestModMotorDCKey(char key) {
 uint8_t testModRelaySel = 0;
 void drawTestModRelay() {
   if (testModFirstDraw) {
-    lcd.clear(); lcdPrint(0, 0, "MODUL: RELAY");
+    lcdClear(); lcdPrint(0, 0, "MODUL: RELAY");
     lcdPrint(0, 3, "C=pilih A=tgl D=kmb");
     testModFirstDraw = false; testModLine1 = "\x01";
   }
@@ -1485,7 +1504,7 @@ uint8_t testModServoCh = 0;
 bool testModServoDetected = false;
 void drawTestModServo() {
   if (testModFirstDraw) {
-    lcd.clear(); lcdPrint(0, 0, "MODUL: SERVO");
+    lcdClear(); lcdPrint(0, 0, "MODUL: SERVO");
     Wire.beginTransmission(I2CAddr::PCA9685);
     testModServoDetected = (Wire.endTransmission() == 0);
     testModFirstDraw = false; testModLine1 = "\x01";
@@ -1586,7 +1605,7 @@ void handleTopMenuKeySorter(char key) {
     }
   } else if (key == 'D') {
     menuState = MenuState::NONE;
-    lcd.clear();
+    lcdClear();
     Serial.println("[CAL] Keluar mode kalibrasi");
   }
 }
@@ -1767,7 +1786,7 @@ void checkLcdKeypadHotplug() {
   bool lcdPing = (Wire.endTransmission() == 0);
   if (!lcdPresent && lcdPing) {
     lcdPresent = true;
-    lcd.init(); lcd.backlight();
+    lcd.init(); lcd.backlight(); for (uint8_t i = 0; i < LcdCfg::ROWS; i++) lcdCacheValid[i] = false;
     Serial.println("[HOTPLUG] LCD baru terdeteksi -- diinisialisasi live, mulai dipakai sekarang");
   } else if (lcdPresent && !lcdPing) {
     lcdPresent = false;
@@ -1804,7 +1823,7 @@ void setup() {
   scanI2CAndDetectOptional();
 
   if (lcdPresent) {
-    lcd.init(); lcd.backlight();
+    lcd.init(); lcd.backlight(); for (uint8_t i = 0; i < LcdCfg::ROWS; i++) lcdCacheValid[i] = false;
     lcdPrint(0, 0, "SORTER");
     lcdPrint(0, 1, "Conv1+Palang+Prox");
     Serial.println("[BOOT] LCD OK");
