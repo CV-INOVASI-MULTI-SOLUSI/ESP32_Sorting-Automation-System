@@ -114,6 +114,11 @@ int16_t POST_PLACE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,0,0,0,0};
 uint16_t currentUs[ServoCfg::NUM_JOINTS];
 uint16_t targetUs[ServoCfg::NUM_JOINTS];
 bool moving = false;
+// BARU (2026-09-22): pose yang sedang dituju, -1 kalau gerakan sekarang bukan GOTO_POSE.
+// Dipakai updateTrajectory() untuk menulis register CURRENT_POSE tepat saat gerakan selesai.
+// Disimpan sebagai angka biasa (bukan QCmd) supaya tidak bergantung pada enum yang baru
+// dideklarasikan jauh di bawah fungsi trajektori.
+int8_t poseSedangDituju = -1;
 uint16_t trajStepUs = 20;          // kecepatan JELAJAH (setelah "pemanasan") -- BISA DIATUR
 uint16_t trajStepIntervalMs = 20;  // jeda antar update -- BISA DIATUR
 uint32_t lastTrajStepMs = 0;
@@ -155,7 +160,8 @@ bool ackPending = false; uint16_t pendingAckSeq = 0;
 enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_JOINT, WAIT_SAVE_SLOT, JOG_OFFSET, JOG_SPEED,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
                         TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
-                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET };
+                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET,
+                        TEST_GERAKAN };
 MenuState menuState = MenuState::NONE;
 
 void usToDuty(uint8_t ch, uint16_t us) {
@@ -218,6 +224,12 @@ void updateTrajectory() {
   }
   if (!anyMoving) {
     moving = false;
+    // DIPERBAIKI (2026-09-22): register CURRENT_POSE selama ini di-addHreg di setup() tapi
+    // TIDAK PERNAH ditulis sekali pun -- nilainya selamanya 0. Script uji membacanya dan
+    // selalu melaporkan pose 0, yang menyesatkan justru saat memverifikasi kalibrasi.
+    // Ditulis di sini, saat gerakan benar-benar selesai, sesuai arti register-nya:
+    // "pose TERAKHIR TERCAPAI", bukan "pose yang sedang dituju".
+    if (poseSedangDituju >= 0) { mb.Hreg(Reg::CURRENT_POSE, (uint16_t)poseSedangDituju); poseSedangDituju = -1; }
     if (currentState == NodeState::RUNNING_OR_MOVING) currentState = NodeState::IDLE;
   }
   static uint32_t moveTimingStartMs = 0;
@@ -241,7 +253,7 @@ void processQueue() {
   QItem item = cmdQueue[qHead]; qHead = (qHead + 1) % 8;
   currentAction = item.cmd; currentActionPoseIdx = item.poseIdx;   // BARU
   switch (item.cmd) {
-    case QCmd::GOTO_POSE: startMoveAbs(POSES[item.poseIdx].us, 800); break;
+    case QCmd::GOTO_POSE: poseSedangDituju = (int8_t)item.poseIdx; startMoveAbs(POSES[item.poseIdx].us, 800); break;
     case QCmd::PICK:  startMoveDelta(PICK_OFFSET, 400); break;
     case QCmd::PLACE: startMoveDelta(PLACE_OFFSET, 400); triggerBuzzerBeep(); break;   // BARU -- notifikasi: package diletakkan
     case QCmd::CLEARANCE: startMoveDelta(CLEARANCE_OFFSET, 400); break;
@@ -557,11 +569,92 @@ void drawTopMenu() {
 // --- LEVEL 1a: SETTING KALIBRASI ---
 // BARU: "Reset Fault" jadi item pertama -- dulu cuma bisa dipicu lewat menu "Test Command"
 // yang terkubur, gak gampang ditemukan operator pas node FAULT.
-constexpr uint8_t CAL_COUNT = 8;
-const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault", "Pose (Home/Pass/dll)", "Pick Offset", "Place Offset", "Clearance Offset", "Post-Place Offset", "Speed (Step/Interval)", "Reset ke Default" };
+constexpr uint8_t CAL_COUNT = 9;   // DIUBAH 8 -> 9, item "Test Gerakan" ditambahkan
+const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault", "Pose (Home/Pickup/Lift)", "Pick Offset", "Place Offset", "Clearance Offset", "Post-Place Offset", "Speed (Step/Interval)", "Test Gerakan", "Reset ke Default" };
 uint8_t calCursor = 0;
 
 void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
+
+// ============================================================
+// LAYAR TEST GERAKAN (BARU 2026-09-22)
+//
+// Seluruh urutan uji bisa dijalankan dari keypad, tanpa Orange Pi dan tanpa serial.
+// Setelah mengkalibrasi pose, operator biasanya berdiri di depan panel -- menyuruhnya
+// pindah ke komputer hanya untuk menyuruh lengan bergerak ke pose yang baru disetel
+// memutus alur kerja yang paling sering diulang.
+//
+// Nomor tombol sengaja SAMA dengan nomor slot pose, jadi tidak ada yang perlu dihafal:
+//   0 / 1 / 2  menuju HOME / PACKAGE_PICKUP / LIFT_LOAD
+//   A          PICK   (gripper menutup, di posisi sekarang)
+//   B          PLACE  (gripper membuka, di posisi sekarang)
+//   #          siklus penuh -- WAJIB ditekan dua kali, lihat alasannya di bawah
+//   D          kembali
+// ============================================================
+uint32_t testCycleArmedAt = 0;   // kapan '#' pertama ditekan; 0 = belum bersiap
+
+void drawTestGerakan() {
+  lcdPrint(0, 0, "TEST GERAKAN");
+  lcdPrint(0, 1, activityText());
+  if (testCycleArmedAt != 0) {
+    lcdPrint(0, 2, "# lagi = SIKLUS PENUH");
+    lcdPrint(0, 3, "D=batal");
+  } else {
+    lcdPrint(0, 2, "0hom 1pick 2lift");
+    lcdPrint(0, 3, "A=pick B=place #=sikl");
+  }
+}
+
+void handleTestGerakanKey(char key) {
+  // Selama MAIN aktif, lengan sedang di bawah kendali Orange Pi. Gerakan uji dari sini
+  // akan berebut antrian dengan siklus produksi yang sedang berjalan.
+  if (mainModeActive && key != 'D') {
+    lcdPrint(0, 3, "MAIN aktif! STOP dulu");
+    Serial.println("[TEST-MENU] Ditolak -- MAIN aktif, kirim STOP_MAIN dulu");
+    return;
+  }
+  if (key == 'D') {
+    testCycleArmedAt = 0;
+    menuState = MenuState::CAL_LIST;
+    drawCalList();
+    return;
+  }
+
+  // Siklus penuh menggerakkan seluruh lengan dari home sampai kembali home tanpa jeda.
+  // Kalau tersenggol sekali tekan, lengan langsung berayun penuh -- karena itu ditahan
+  // di balik konfirmasi tekan-dua-kali, beda dari perintah tunggal di atas.
+  if (key == '#') {
+    if (testCycleArmedAt != 0 && millis() - testCycleArmedAt < 5000) {
+      testCycleArmedAt = 0;
+      enqueue(QCmd::GOTO_POSE, 0);
+      enqueue(QCmd::CLEARANCE);
+      enqueue(QCmd::GOTO_POSE, 1);
+      enqueue(QCmd::PICK);
+      enqueue(QCmd::GOTO_POSE, 2);
+      enqueue(QCmd::PLACE);
+      enqueue(QCmd::POST_PLACE);
+      enqueue(QCmd::GOTO_POSE, 0);
+      Serial.println("[TEST-MENU] Siklus penuh dimulai (setara MOVE_PACKAGE)");
+    } else {
+      testCycleArmedAt = millis();
+    }
+    drawTestGerakan();
+    return;
+  }
+
+  testCycleArmedAt = 0;   // tombol lain membatalkan kesiapan siklus
+  if (key >= '0' && key < '0' + NUM_POSES) {
+    uint8_t slot = key - '0';
+    enqueue(QCmd::GOTO_POSE, slot);
+    Serial.printf("[TEST-MENU] Menuju pose %u (%s)\n", slot, POSE_NAMES[slot]);
+  } else if (key == 'A') {
+    enqueue(QCmd::PICK);
+    Serial.println("[TEST-MENU] PICK");
+  } else if (key == 'B') {
+    enqueue(QCmd::PLACE);
+    Serial.println("[TEST-MENU] PLACE");
+  }
+  drawTestGerakan();
+}
 
 void drawConfirmReset() {
   lcd.clear();
@@ -698,7 +791,8 @@ void handleCalListKey(char key) {
       case 4: editingOffset = CLEARANCE_OFFSET; editingOffsetName = "CLEARANCE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
       case 5: editingOffset = POST_PLACE_OFFSET; editingOffsetName = "POSTPLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
       case 6: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenu(); break;
-      case 7: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
+      case 7: menuState = MenuState::TEST_GERAKAN; testCycleArmedAt = 0; lcd.clear(); drawTestGerakan(); break;
+      case 8: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
 }
@@ -1350,6 +1444,7 @@ void loop() {
       else if (menuState == MenuState::TEST_MOD_SERVO) handleTestModServoKey(key);
       else if (menuState == MenuState::TEST_CMD_LIST) handleTestCmdListKey(key);
       else if (menuState == MenuState::CONFIRM_RESET) handleConfirmResetKey(key);
+      else if (menuState == MenuState::TEST_GERAKAN) handleTestGerakanKey(key);
     }
   }
 
@@ -1390,6 +1485,12 @@ void loop() {
   if (menuState == MenuState::TEST_INPUT_LIST && lcdPresent) {
     static uint32_t lastTestInRefresh = 0;
     if (millis() - lastTestInRefresh > 100) { lastTestInRefresh = millis(); drawTestInputList(); }
+  }
+  // BARU: layar Test Gerakan harus hidup -- baris aktivitasnya berubah selama lengan
+  // bergerak, bukan sebagai reaksi atas penekanan tombol.
+  if (menuState == MenuState::TEST_GERAKAN && lcdPresent) {
+    static uint32_t lastTestGerakRefresh = 0;
+    if (millis() - lastTestGerakRefresh > 250) { lastTestGerakRefresh = millis(); drawTestGerakan(); }
   }
   if (menuState == MenuState::TEST_RS485 && lcdPresent) {
     static uint32_t lastTestRs485Refresh = 0;
