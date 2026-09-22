@@ -65,7 +65,7 @@ void lcdBootProgress(const char* stepLabel) {
 NodeState currentState = NodeState::INIT;
 uint16_t faultCode = 0;
 // BARU: pemisah MAIN/TEST -- default FALSE (fail-safe, boot-IDLE). Cmd::START_MAIN/STOP_MAIN
-// (Orange Pi/master) nentuin RUN_SEQUENCE/MOVE_PACKAGE (produksi) vs GOTO_HOME/GOTO_PASS/
+// (Orange Pi/master) nentuin MOVE_PACKAGE (produksi) vs GOTO_HOME/
 // PICK/PLACE (manual override/test) -- dua kelompok ini saling eksklusif.
 bool mainModeActive = false;
 // BARU: Lapis 3 diagnostik -- sinkron pola SORTER
@@ -75,7 +75,16 @@ uint32_t lastRs485Rx = 0;
 bool modbusEverUsed = false;
 
 struct Pose { uint16_t us[ServoCfg::NUM_JOINTS]; };
-// Slot 0=home, 1=pass, 3=lift(clearance per-objek). BARU slot 4=PACKAGE_PICKUP
+// DIPERBARUI (2026-09-22): arm robot HANYA memindahkan package penuh dari ujung Dispenser.
+// Jalur objek satuan dihapus, sehingga yang benar-benar dipakai tinggal TIGA slot:
+//   0 = HOME            titik istirahat, awal & akhir MOVE_PACKAGE
+//   4 = PACKAGE_PICKUP  titik ambil package penuh di ujung conveyor Dispenser
+//   5 = LIFT_LOAD       titik taruh package di Load Position Stocker
+// Slot 1 (pass), 2 (bekas reject) dan 3 (bekas titik jatuh objek satuan) TIDAK ADA yang
+// membacanya lagi. Array tetap 6 slot supaya nomor 4 dan 5 tidak bergeser -- menggeser slot
+// yang sudah dipakai produksi jauh lebih berisiko daripada membiarkan lubang di tengah.
+//
+// Komentar lama (sudah tidak berlaku): Slot 0=home, 1=pass, 3=lift(clearance per-objek). BARU slot 4=PACKAGE_PICKUP
 // (posisi ambil package berisi batch objek di ujung conveyor), 5=LIFT_LOAD (posisi taruh
 // package ke Lift Load Position STOCKER) -- dipakai Cmd::MOVE_PACKAGE. Default slot 4/5
 // SENGAJA disamakan dgn home (aman, tidak akan gerak ekstrem) sampai dikalibrasi manual
@@ -346,9 +355,11 @@ ActivityCode activityCode() {
     case QCmd::GOTO_POSE:
       switch (currentActionPoseIdx) {
         case 0: return ActivityCode::MENUJU_HOME;
-        case 1: return ActivityCode::MENUJU_PASS;
-        // DIHAPUS: case 2 (MENUJU_REJECT) -- pose 2 gak pernah dituju lagi (reject dihapus)
-        case 3: return ActivityCode::MENUJU_LIFT;
+        // DIHAPUS (2026-09-22): case 1 (MENUJU_PASS) & case 3 (MENUJU_LIFT) -- dua pose itu
+        // hanya dipakai jalur objek satuan, yang sudah dihapus. case 2 (MENUJU_REJECT) sudah
+        // lebih dulu hilang bersama jalur reject.
+        case 4: return ActivityCode::MENUJU_PACKAGE_PICKUP;
+        case 5: return ActivityCode::MENUJU_LIFT_LOAD;
       }
       return ActivityCode::BERGERAK;
     case QCmd::PICK: return ActivityCode::MENGAMBIL;
@@ -384,7 +395,7 @@ void updateUniversalIndicators() {
   if (ledFaultNow != lastLedFault) { io.write(CH::LED_FAULT, ledFaultNow); lastLedFault = ledFaultNow; }
 }
 
-// DIPERBAIKI: guard FAULT/ESTOPPED -- sebelumnya opcode gerak (RUN_SEQUENCE dkk) TIDAK dicek sama
+// DIPERBAIKI: guard FAULT/ESTOPPED -- sebelumnya opcode gerak (MOVE_PACKAGE dkk) TIDAK dicek sama
 // sekali, sama seperti bug START di SORTER yang baru ditemukan. Sekarang seragam diproteksi.
 bool blockIfFaulted(const char* opName) {
   if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
@@ -394,26 +405,28 @@ bool blockIfFaulted(const char* opName) {
   return false;
 }
 
-// BARU (celah #1): tombol fisik trigger GOTO_PASS test, TEST-mode gated -- sama pola dgn
-// tombol SORTER (Hopper/Palang) & DISPENSER (BTN_TEST_BOX_FULL).
-// DIHAPUS: tombol BTN3/GOTO_REJECT -- Picker fisik cuma ambil dari PASS, gak pernah reject
-// (reject sudah ditangani hopper SORTER sebelum objek sampai ke Picker).
+// Tombol fisik uji, TEST-mode gated -- sama pola dgn tombol SORTER (Hopper/Palang) &
+// DISPENSER (BTN_TEST_BOX_FULL).
+// DIUBAH (2026-09-22): dulu tombol ini menuju pose 1 (PASS). Pose itu sudah tidak dipakai
+// sejak jalur objek satuan dihapus, jadi tombolnya akan menggerakkan lengan ke tempat yang
+// tidak punya arti. Sekarang diarahkan ke pose 4 (PACKAGE_PICKUP) -- titik ambil package di
+// ujung Dispenser, yang justru paling sering perlu didatangi saat mengkalibrasi.
 void handleTestButtons() {
-  static bool lastPass = HIGH;
-  static uint32_t lastPassEdge = 0;
+  static bool lastBtn = HIGH;
+  static uint32_t lastBtnEdge = 0;
   constexpr uint32_t DEBOUNCE_MS = 50;
 
-  bool curPass = io.read(CH::BTN_TEST_GOTO_PASS);
-  if (curPass == LOW && lastPass == HIGH && millis() - lastPassEdge > DEBOUNCE_MS) {
-    lastPassEdge = millis();
+  bool cur = io.read(CH::BTN_TEST_GOTO_PICKUP);
+  if (cur == LOW && lastBtn == HIGH && millis() - lastBtnEdge > DEBOUNCE_MS) {
+    lastBtnEdge = millis();
     if (mainModeActive) {
-      Serial.println("[TEST-BTN] Tombol GOTO_PASS ditolak -- MAIN aktif, STOP_MAIN dulu");
-    } else if (!blockIfFaulted("GOTO_PASS")) {
-      enqueue(QCmd::GOTO_POSE, 1);
-      Serial.println("[TEST-BTN] Tombol GOTO_PASS ditekan");
+      Serial.println("[TEST-BTN] Tombol ditolak -- MAIN aktif, STOP_MAIN dulu");
+    } else if (!blockIfFaulted("GOTO PACKAGE_PICKUP")) {
+      enqueue(QCmd::GOTO_POSE, 4);
+      Serial.println("[TEST-BTN] Tombol ditekan -- menuju pose 4 (PACKAGE_PICKUP)");
     }
   }
-  lastPass = curPass;
+  lastBtn = cur;
 }
 
 void applyCommand(uint16_t opcode, uint16_t arg) {
@@ -427,34 +440,19 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       mainModeActive = false;
       Serial.println("[CMD] STOP_MAIN -- MAIN mati, command manual override boleh dipakai lagi");
       break;
-    case Cmd::RUN_SEQUENCE:
-      if (!mainModeActive) { Serial.println("[CMD] RUN_SEQUENCE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); return; }
-      if (blockIfFaulted("RUN_SEQUENCE")) return;
-      enqueue(QCmd::GOTO_POSE, 0);
-      enqueue(QCmd::CLEARANCE);
-      triggerBuzzerBeep();   // BARU -- notifikasi: arm mulai menuju objek untuk diambil
-      // DIUBAH: dulu arg 1=pass/2=reject -- Picker fisik cuma ambil dari PASS (reject sudah
-      // ditangani hopper SORTER sebelum objek sampai ke Picker), jadi sekarang SELALU ke pose
-      // 1 (pass) apapun arg-nya. arg dibiarkan di signature demi kompatibilitas Modbus.
-      enqueue(QCmd::GOTO_POSE, 1);
-      enqueue(QCmd::PICK);
-      enqueue(QCmd::GOTO_POSE, 3);
-      enqueue(QCmd::PLACE);
-      enqueue(QCmd::POST_PLACE);   // BARU -- gerakan tambahan sebelum kembali Home
-      enqueue(QCmd::GOTO_POSE, 0);
-      break;
-    // BARU: 5 command di bawah ("manual override") DITOLAK TOTAL selama mainModeActive --
+    // DIHAPUS (2026-09-22): Cmd::RUN_SEQUENCE (opcode 1) -- urutan objek SATUAN
+    // (home->PASS->pick->pose3->place->home). Arm robot hanya memindahkan package PENUH dari
+    // ujung Dispenser; objek satuan tidak pernah disentuhnya. Orchestrator produksi pun hanya
+    // mengirim MOVE_PACKAGE. Opcode 1 sengaja dibiarkan kosong, lihat registers.h.
+    // BARU: command "manual override" di bawah DITOLAK TOTAL selama mainModeActive --
     // Orange Pi wajib STOP_MAIN dulu.
     case Cmd::GOTO_HOME:
       if (mainModeActive) { Serial.println("[CMD] GOTO_HOME ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
       if (blockIfFaulted("GOTO_HOME")) return;
       enqueue(QCmd::GOTO_POSE, 0);
       break;
-    case Cmd::GOTO_PASS:
-      if (mainModeActive) { Serial.println("[CMD] GOTO_PASS ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
-      if (blockIfFaulted("GOTO_PASS")) return;
-      enqueue(QCmd::GOTO_POSE, 1);
-      break;
+    // DIHAPUS (2026-09-22): Cmd::GOTO_PASS (opcode 3) -- pose 1 (PASS) hanya dituju jalur
+    // objek satuan yang sudah dihapus. Opcode 3 sengaja dibiarkan kosong.
     // DIHAPUS: Cmd::GOTO_REJECT (opcode 4) -- Picker fisik cuma ambil dari PASS, gak pernah
     // reject. Opcode 4 SENGAJA gak dipakai ulang (lihat registers.h), biar nomor command lain
     // (PICK=5 dst) gak geser/pecah kompatibilitas Modbus yang sudah ada.
@@ -510,7 +508,9 @@ uint16_t onCmdWrite(TRegister* reg, uint16_t val) {
   if (seq == lastAcked) { Serial.printf("[PICKER] CMD seq=%u sudah diproses -- diabaikan\n", seq); return val; }
   Serial.printf("[PICKER] CMD (Modbus) opcode=%u arg=%u seq=%u\n", opcode, arg, seq);
   applyCommand(opcode, arg);
-  if ((Cmd)opcode == Cmd::RUN_SEQUENCE || (Cmd)opcode == Cmd::MOVE_PACKAGE) { ackPending = true; pendingAckSeq = seq; }
+  // DIUBAH (2026-09-22): hanya MOVE_PACKAGE yang ack-nya ditunda sampai seluruh urutan
+  // tuntas -- RUN_SEQUENCE sudah dihapus.
+  if ((Cmd)opcode == Cmd::MOVE_PACKAGE) { ackPending = true; pendingAckSeq = seq; }
   else mb.Hreg(Reg::CMD_ACK_SEQ, seq);
   return val;
 }
@@ -1023,11 +1023,9 @@ void handleTestIoCategoryKey(char key) {
 // --- LEVEL 1c: TEST COMMAND ---
 struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
 // DIHAPUS: "RUN_SEQUENCE(reject)" & "GOTO_REJECT" -- Picker fisik cuma ambil dari PASS.
-constexpr uint8_t CMD_TEST_COUNT = 7;
+constexpr uint8_t CMD_TEST_COUNT = 5;   // DIUBAH 7 -> 5, RUN_SEQUENCE & GOTO_PASS dihapus
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
-  {"RUN_SEQUENCE(pass)",   Cmd::RUN_SEQUENCE, 1},
   {"GOTO_HOME",            Cmd::GOTO_HOME,    0},
-  {"GOTO_PASS",            Cmd::GOTO_PASS,    0},
   {"PICK",                 Cmd::PICK,         0},
   {"PLACE",                Cmd::PLACE,        0},
   {"MOVE_PACKAGE",         Cmd::MOVE_PACKAGE, 0},
@@ -1095,11 +1093,7 @@ void handleSerialCommand() {
     if (slot < 6) { enqueue(QCmd::GOTO_POSE, slot); Serial.printf("[GOTO] Pindah ke pose %u\n", slot); }
     else Serial.println("[GOTO] Slot harus 0-5");
   }
-  else if (cmd == "SEQ") {
-    uint16_t arg = line.substring(sp1 + 1).toInt();
-    applyCommand((uint16_t)Cmd::RUN_SEQUENCE, arg);
-    Serial.printf("[SEQ] RUN_SEQUENCE arg=%u dimulai\n", arg);
-  }
+  // DIHAPUS (2026-09-22): command Serial "SEQ" -- opcode RUN_SEQUENCE-nya sudah tidak ada.
   else if (cmd == "MOVEPKG") {
     applyCommand((uint16_t)Cmd::MOVE_PACKAGE, 0);
     Serial.println("[MOVEPKG] MOVE_PACKAGE dimulai");
@@ -1120,7 +1114,7 @@ void handleSerialCommand() {
     Serial.println();
   }
   else if (cmd == "HELP") {
-    Serial.println("[HELP] JOG <0-5> <us> | SAVEPOSE <0-5> | GOTO <0-5> | SEQ <1> | MOVEPKG | STEP <us> | INTERVAL <ms>");
+    Serial.println("[HELP] JOG <0-5> <us> | SAVEPOSE <0-5> | GOTO <0-5> | MOVEPKG | STEP <us> | INTERVAL <ms>");
     Serial.println("[HELP] RAMPMIN <us> | RAMPSTEPS <n> | RESET | STATUS | HELP");
   }
   else Serial.printf("[SERIAL] '%s' tidak dikenal -- ketik HELP\n", cmd.c_str());

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ============================================================
- TEST PICKER -- urutan manual GOTO_HOME -> GOTO_PASS -> PICK -> GOTO_HOME -> PLACE
+ TEST PICKER -- urutan manual GOTO_HOME -> PICK -> PLACE -> GOTO_HOME
 ============================================================
 Skrip test MANUAL (bukan orchestrator produksi) -- cuma nyentuh node PICKER
 (slave 2). Nyoba SATU-SATU command "manual override" (TEST mode) yang ada di
-firmware sekarang -- GOTO_HOME/GOTO_PASS/PICK/PLACE -- biar tiap gerakan bisa
+firmware sekarang -- GOTO_HOME/PICK/PLACE -- biar tiap gerakan bisa
 diamati terpisah, bukan langsung full-cycle otomatis.
 
 SETUP (1x):
@@ -15,19 +15,24 @@ SETUP (1x):
 URUTAN MANUAL (jalan sekali, bukan loop -- edit MANUAL_STEPS di bawah kalau
 mau ubah urutan/tambah langkah):
   1. GOTO_HOME      -- arm ke posisi Home
-  2. GOTO_PASS      -- arm ke posisi Pass (titik ambil objek)
-  3. PICK           -- gripper ambil (di posisi SEKARANG, GOTO_PASS dulu di atas)
-  4. GOTO_HOME      -- arm balik ke Home (bawa objek yang barusan diambil)
-  5. PLACE          -- gripper lepas (di posisi SEKARANG, Home)
+  2. PICK           -- gripper menutup (di posisi SEKARANG)
+  3. PLACE          -- gripper melepas (di posisi SEKARANG)
+  4. GOTO_HOME      -- arm balik ke Home
 
 CATATAN:
-  - GOTO_HOME/GOTO_PASS/PICK/PLACE ini SEMUA "manual override" -- cuma diterima
+  - GOTO_HOME/PICK/PLACE ini SEMUA "manual override" -- cuma diterima
     firmware selama TEST mode (mainModeActive == FALSE). Kalau Orange Pi lagi
     START_MAIN Picker (mis. orchestrator produksi jalan), semua command ini
     DITOLAK DIAM-DIAM (ack tetap "sukses", gak ada efek fisik). ensure_test_mode()
     di bawah otomatis cek & kirim STOP_MAIN kalau perlu.
-  - GOTO_REJECT SENGAJA TIDAK ADA di sini -- sudah dihapus dari firmware (Picker
-    fisik cuma ambil dari jalur PASS, reject ditangani hopper SORTER).
+  - GOTO_PASS dan RUN_SEQUENCE SENGAJA TIDAK ADA di sini -- sudah dihapus dari
+    firmware (2026-09-22). Arm robot HANYA memindahkan package penuh dari ujung
+    Dispenser; objek satuan tidak pernah disentuhnya, jadi seluruh jalur "ambil
+    satu objek dari jalur PASS" tidak punya pemakai. GOTO_REJECT sudah lebih dulu
+    dihapus karena reject ditangani palang SORTER.
+  - Tidak ada opcode untuk mendatangi pose 4 (PACKAGE_PICKUP) atau 5 (LIFT_LOAD).
+    Saat mengkalibrasi, pakai tombol BUTTON_2 di panel (menuju pose 4) atau
+    perintah Serial `GOTO 4` / `GOTO 5`.
   - MOVE_PACKAGE (produksi asli, full cycle home->pickup->place->home otomatis)
     BUTUH MAIN mode -- disediakan lewat run_move_package(), TAPI TIDAK dipanggil
     otomatis di main(). Uncomment manggilnya sendiri kalau mau test itu (lihat
@@ -66,15 +71,18 @@ REG_MAIN_MODE_ACTIVE = 15
 
 STATE_NAMES = {0: "INIT", 1: "IDLE", 2: "RUNNING_OR_MOVING", 3: "FAULT", 4: "ESTOPPED"}
 ACTIVITY_NAMES = {
-    0: "DIAM", 1: "MENUJU_HOME", 2: "MENUJU_PASS", 4: "MENUJU_LIFT",
+    # DIPERBARUI (2026-09-22): MENUJU_PASS (2) dan MENUJU_LIFT (4) dihapus bersama jalur
+    # objek satuan. Dua pose produksi yang tersisa kini punya kodenya sendiri, memakai
+    # nomor BARU (10, 11) supaya tidak tertukar dengan arti lama.
+    0: "DIAM", 1: "MENUJU_HOME",
     5: "MENGAMBIL", 6: "MELETAKKAN", 7: "NAIK_CLEARANCE", 8: "BERGERAK",
-    9: "POST_PLACE_GERAK", 90: "FAULT_AKTIF", 91: "ESTOP_AKTIF",
+    9: "POST_PLACE_GERAK", 10: "MENUJU_PACKAGE_PICKUP", 11: "MENUJU_LIFT_LOAD",
+    90: "FAULT_AKTIF", 91: "ESTOP_AKTIF",
 }
 
 # --- Opcode PICKER ---
-CMD_RUN_SEQUENCE = 1
+# DIHAPUS: CMD_RUN_SEQUENCE (1) & CMD_GOTO_PASS (3) -- opcode-nya sudah tidak ada di firmware
 CMD_GOTO_HOME = 2
-CMD_GOTO_PASS = 3
 CMD_PICK = 5
 CMD_PLACE = 6
 CMD_RESET_FAULT = 7
@@ -169,7 +177,7 @@ def do_command(instr, label, opcode, arg=0, timeout=ACK_TIMEOUT_S, watch_activit
 
 
 def ensure_test_mode(instr):
-    """Sama pola dgn test-dispenser-full-protocol.py -- GOTO_HOME/GOTO_PASS/PICK/PLACE
+    """GOTO_HOME/PICK/PLACE
     cuma diterima firmware selama TEST mode. Cek MAIN_MODE_ACTIVE, kirim STOP_MAIN
     kalau kesangkut MAIN dari sesi produksi/orchestrator sebelumnya."""
     if DRY_RUN:
@@ -216,12 +224,17 @@ def main():
 
     # Urutan manual -- (label, opcode, watch_activity_s). Edit di sini kalau mau
     # ubah urutan/tambah langkah.
+    # DIUBAH (2026-09-22): GOTO_PASS dihapus -- arm robot hanya memindahkan package penuh
+    # dari ujung Dispenser, tidak pernah menangani objek satuan, sehingga pose PASS tidak
+    # punya pemakai lagi dan opcode-nya sudah tidak ada di firmware.
+    #
+    # Untuk mendatangi titik ambil package (pose 4) saat kalibrasi, tidak ada opcode khusus:
+    # pakai tombol fisik BUTTON_2 di panel, atau perintah Serial `GOTO 4`.
     MANUAL_STEPS = [
         ("GOTO_HOME",  CMD_GOTO_HOME, 6.0),
-        ("GOTO_PASS",  CMD_GOTO_PASS, 6.0),
         ("PICK",       CMD_PICK,      4.0),
-        ("GOTO_HOME",  CMD_GOTO_HOME, 6.0),
         ("PLACE",      CMD_PLACE,     4.0),
+        ("GOTO_HOME",  CMD_GOTO_HOME, 6.0),
     ]
 
     for i, (label, opcode, watch_s) in enumerate(MANUAL_STEPS, start=1):
@@ -230,7 +243,7 @@ def main():
             print(f"!! Gagal di langkah {label} -- cek fault Picker manual. Berhenti.")
             sys.exit(1)
 
-    print("\n=== SELESAI -- 5 langkah manual dijalankan ===")
+    print("\n=== SELESAI -- 4 langkah manual dijalankan ===")
 
     # Uncomment kalau mau LANJUT test produksi asli (MOVE_PACKAGE) setelah manual
     # sequence di atas -- PASTIKAN area gerak arm aman dulu:

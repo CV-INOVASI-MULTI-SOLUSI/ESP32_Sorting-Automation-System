@@ -13,7 +13,9 @@ namespace Reg {
   constexpr uint16_t CMD_ACK_SEQ = 5;
   constexpr uint16_t HEARTBEAT   = 6;
 
-  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home,1=pass,3=lift,4=pickup,5=lift_load)
+  // DIPERBARUI (2026-09-22): pose yang masih dipakai tinggal 0, 4, dan 5. Slot 1, 2, 3
+  // sudah tidak punya pembaca sejak jalur objek satuan dihapus.
+  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home, 4=package_pickup, 5=lift_load)
 
   // BARU: Lapis 2 (SubState) + Lapis 3 (diagnostik) -- sinkron pola SORTER
   constexpr uint16_t ACTIVITY_CODE   = 11;  // R
@@ -21,7 +23,7 @@ namespace Reg {
   constexpr uint16_t LAST_FAULT_CODE = 13;  // R
   constexpr uint16_t UPTIME_SEC      = 14;  // R
   // BARU: status live mainModeActive -- Orange Pi bisa cek node lagi MAIN (produksi) atau
-  // TEST (manual, aman dipakai GOTO_HOME/GOTO_PASS/PICK/PLACE).
+  // TEST (manual, aman dipakai GOTO_HOME/PICK/PLACE).
   constexpr uint16_t MAIN_MODE_ACTIVE = 15;  // R, 1 = MAIN aktif, 0 = TEST mode
   // BARU (2026-09-20): menu kalibrasi LCD meng-IGNORE semua command Modbus (§12.6) TANPA
   // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
@@ -32,7 +34,14 @@ namespace Reg {
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik PICKER ---
 enum class ActivityCode : uint16_t {
   // DIHAPUS: MENUJU_REJECT (value 3) -- Picker gak pernah reject, pose 2 gak pernah dituju lagi.
-  DIAM = 0, MENUJU_HOME = 1, MENUJU_PASS = 2, MENUJU_LIFT = 4,
+  // DIHAPUS: MENUJU_PASS (value 2) dan MENUJU_LIFT (value 4) -- pose 1 dan 3 hanya dipakai
+  // jalur objek satuan, yang sudah dihapus. Nilainya dibiarkan kosong agar kode lain tidak geser.
+  // BARU: pose 4 dan 5 sekarang punya kode sendiri. Selama ini keduanya jatuh ke BERGERAK
+  // yang generik, padahal justru dua pose inilah satu-satunya tujuan produksi yang tersisa --
+  // operator tidak bisa membedakan "menuju package" dari "menuju lift" lewat register.
+  // Sengaja memakai nomor BARU (10, 11), bukan mendaur ulang 2/3/4 yang baru dikosongkan --
+  // master atau catatan lama yang masih memegang arti lama tidak boleh salah membaca.
+  DIAM = 0, MENUJU_HOME = 1, MENUJU_PACKAGE_PICKUP = 10, MENUJU_LIFT_LOAD = 11,
   MENGAMBIL = 5, MELETAKKAN = 6, NAIK_CLEARANCE = 7, BERGERAK = 8, POST_PLACE_GERAK = 9,
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
 };
@@ -48,8 +57,13 @@ enum class FaultCode : uint16_t {
 // --- Opcode CMD (§7.4) ---
 enum class Cmd : uint16_t {
   NONE = 0,
-  RUN_SEQUENCE = 1,   // urutan penuh home->PASS->pick->lift->place->home (arg diabaikan, cuma pass)
-  GOTO_HOME = 2, GOTO_PASS = 3,   // manual override
+  // DIHAPUS (2026-09-22): RUN_SEQUENCE (opcode 1) dan GOTO_PASS (opcode 3).
+  // Arm robot HANYA memindahkan package penuh dari ujung Dispenser -- tidak pernah
+  // menangani objek satuan. Seluruh jalur "ambil satu objek dari jalur PASS" karena itu
+  // tidak punya pemakai: orchestrator produksi pun hanya mengirim MOVE_PACKAGE.
+  // Opcode 1 dan 3 SENGAJA dibiarkan kosong, jangan dipakai ulang untuk hal lain, supaya
+  // master/script lama yang masih mengirimnya tidak memicu perintah yang berbeda arti.
+  GOTO_HOME = 2,   // manual override
   // DIHAPUS: GOTO_REJECT (opcode 4) -- Picker fisik cuma ambil dari PASS, gak pernah reject
   // (reject ditangani hopper SORTER sebelum objek sampai ke Picker). Opcode 4 SENGAJA
   // TIDAK dipakai ulang -- PICK/PLACE dkk tetap nomor eksplisit di bawah biar gak geser.
@@ -63,8 +77,8 @@ enum class Cmd : uint16_t {
   SET_TRAJ_STEP_INTERVAL = 10, // arg: trajStepIntervalMs, 5-200
   // BARU -- pemisah MAIN/TEST eksplisit (sama konsep dgn SORTER/DISPENSER/STOCKER). Default
   // boot = mainModeActive FALSE. Selama MAIN aktif, command "manual override" (GOTO_HOME/
-  // GOTO_PASS/PICK/PLACE) DITOLAK TOTAL -- cuma RUN_SEQUENCE/MOVE_PACKAGE (produksi
-  // asli) yang jalan. Sebaliknya, RUN_SEQUENCE/MOVE_PACKAGE ditolak selama masih TEST mode.
+  // PICK/PLACE) DITOLAK TOTAL -- cuma MOVE_PACKAGE (produksi
+  // asli) yang jalan. Sebaliknya, MOVE_PACKAGE ditolak selama masih TEST mode.
   START_MAIN = 11,
   STOP_MAIN = 12
 };

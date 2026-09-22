@@ -51,7 +51,7 @@ namespace CH {
   // di GPA3(ch19), PROX_2 di GPA2(ch18). Harus SAMA di keempat config.h (board universal).
   constexpr uint8_t PROX_1    = 19;
   constexpr uint8_t PROX_2    = 18;
-  constexpr uint8_t BUTTON_2  = 20;   // PICKER -- test GOTO_PASS
+  constexpr uint8_t BUTTON_2  = 20;   // PICKER -- test menuju PACKAGE_PICKUP (pose 4)
   constexpr uint8_t BUTTON_3  = 21;   // nganggur -- Picker fisik cuma ambil dari PASS, gak ada reject
   constexpr uint8_t LIM_1     = 23;
   constexpr uint8_t LIM_2     = 22;
@@ -64,10 +64,10 @@ namespace CH {
   constexpr uint8_t LIM_9     = 30;
   constexpr uint8_t LIM_10    = 31;
 
-  // BARU (celah #1 -- konsisten sama tombol node lain): trigger test GOTO_PASS, TEST-mode
+  // BARU (celah #1 -- konsisten sama tombol node lain): trigger test menuju PACKAGE_PICKUP, TEST-mode
   // gated (ditolak kalau mainModeActive), lihat handleTestButtons() di main.cpp. BUTTON_3
   // SENGAJA gak dipetakan -- Picker gak punya fungsi reject.
-  constexpr uint8_t BTN_TEST_GOTO_PASS = BUTTON_2;
+  constexpr uint8_t BTN_TEST_GOTO_PICKUP = BUTTON_2;
 }
 
 // --- Native GPIO -- UNIVERSAL, SAMA PERSIS DI SEMUA 4 NODE (tidak dipakai PICKER) ---
