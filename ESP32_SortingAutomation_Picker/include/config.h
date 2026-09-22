@@ -79,7 +79,10 @@ namespace GP {
   constexpr uint8_t PWMA_TB6612 = 26, PWMB_TB6612 = 25;   // DITUKAR dari sebelumnya
 }
 
-// --- Servo (5 joint lengan + 1 gripper = 6) ---
+// --- Servo lengan: 6 joint ---
+// DIKOREKSI (2026-09-22): dulu tertulis "5 joint lengan + 1 gripper". Picker TIDAK punya
+// gripper. Keenamnya joint lengan; gerakan mengambil dan meletakkan dilakukan lewat
+// PICK_OFFSET/PLACE_OFFSET, yaitu pergeseran sejumlah joint dari posisi saat itu.
 namespace ServoCfg {
   constexpr uint8_t NUM_JOINTS = 6;
   constexpr uint16_t MIN_US = 500, MAX_US = 2500;   // MG996R

@@ -622,8 +622,8 @@ void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, ca
 //
 // Nomor tombol sengaja SAMA dengan nomor slot pose, jadi tidak ada yang perlu dihafal:
 //   0 / 1 / 2  menuju HOME / PACKAGE_PICKUP / LIFT_LOAD
-//   A          PICK   (gripper menutup, di posisi sekarang)
-//   B          PLACE  (gripper membuka, di posisi sekarang)
+//   A          PICK   (gerakan MENGAMBIL, dari posisi sekarang)
+//   B          PLACE  (gerakan MELETAKKAN, dari posisi sekarang)
 //   #          siklus penuh -- WAJIB ditekan dua kali, lihat alasannya di bawah
 //   D          kembali
 // ============================================================

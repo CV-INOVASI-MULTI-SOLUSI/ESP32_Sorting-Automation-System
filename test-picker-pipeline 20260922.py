@@ -17,8 +17,8 @@ ALUR
     [1] Pastikan TEST mode
     [2] Pose 0 HOME
     [3] Pose 1 PACKAGE_PICKUP
-    [4] PICK   gripper menutup di titik ambil
-    [5] PLACE  gripper membuka lagi
+    [4] PICK   gerakan MENGAMBIL di titik ambil
+    [5] PLACE  gerakan MELETAKKAN
     [6] Pose 2 LIFT_LOAD
     [7] Pose 0 HOME
 
@@ -267,7 +267,7 @@ def ke_pose(instr, slot):
 
 
 # ============================================================
-# TAHAP A -- verifikasi pose & gripper
+# TAHAP A -- verifikasi pose & gerakan ambil/taruh
 # ============================================================
 def tahap_verifikasi(picker):
     print("\n=== [2] Pose 0 HOME ===")
@@ -278,11 +278,13 @@ def tahap_verifikasi(picker):
     if not ke_pose(picker, 1):
         return False
 
-    print("\n=== [4] PICK -- gripper menutup di titik ambil ===")
+    print("\n=== [4] PICK -- gerakan MENGAMBIL di titik ambil ===")
+    print("     menerapkan PICK_OFFSET: pergeseran tiap joint dari posisi sekarang")
     if not kirim(picker, "PICK", CMD_PICK) or not tunggu_diam(picker, "PICK"):
         return False
 
-    print("\n=== [5] PLACE -- gripper membuka lagi ===")
+    print("\n=== [5] PLACE -- gerakan MELETAKKAN ===")
+    print("     menerapkan PLACE_OFFSET")
     if not kirim(picker, "PLACE", CMD_PLACE) or not tunggu_diam(picker, "PLACE"):
         return False
 
@@ -384,11 +386,11 @@ def main():
         status(picker, "kondisi awal")
 
         if not tahap_verifikasi(picker):
-            print("\n!! Verifikasi pose/gripper gagal. Perbaiki kalibrasi dulu sebelum siklus penuh.")
+            print("\n!! Verifikasi pose/gerakan gagal. Perbaiki kalibrasi dulu sebelum siklus penuh.")
             return 1
 
         print("\n" + "=" * 70)
-        print("TAHAP A SELESAI -- ketiga pose dan gripper sudah terverifikasi.")
+        print("TAHAP A SELESAI -- ketiga pose dan gerakan ambil/taruh sudah terverifikasi.")
         print("Lanjut ke siklus produksi. MAIN akan diaktifkan.")
         print("=" * 70)
 
@@ -406,7 +408,7 @@ def main():
         print("\n\n>> Dihentikan operator.")
         return 130
     finally:
-        # Sengaja TIDAK menggerakkan lengan saat keluar. Kalau gripper sedang memegang
+        # Sengaja TIDAK menggerakkan lengan saat keluar. Kalau lengan sedang membawa
         # package, memulangkannya ke home justru menjatuhkan muatan di jalan. Yang
         # dilakukan hanya mengembalikan node ke TEST mode supaya command produksi tidak
         # tertinggal aktif.
@@ -415,7 +417,7 @@ def main():
             kirim(picker, "STOP_MAIN", CMD_STOP_MAIN, timeout=5.0)
         except Exception as e:
             print(f"  !! gagal kirim STOP_MAIN ({e})")
-        print(">> Lengan DIBIARKAN di posisinya. Periksa apakah gripper masih memegang package.")
+        print(">> Lengan DIBIARKAN di posisinya. Periksa apakah masih membawa package.")
 
 
 if __name__ == '__main__':
