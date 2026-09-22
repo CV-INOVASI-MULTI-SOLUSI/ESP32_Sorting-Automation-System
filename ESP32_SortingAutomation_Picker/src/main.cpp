@@ -180,8 +180,16 @@ enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_JOINT, WAIT_SAVE_SLOT, JO
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
                         TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
                         TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET,
-                        TEST_GERAKAN };
+                        TEST_GERAKAN , SYS_INFO};
 MenuState menuState = MenuState::NONE;
+
+// BARU (2026-09-22): layar Info Sistem didefinisikan tepat sebelum loop() -- di titik itu
+// otaReady/i2cErrorCount/lastFaultCode sudah terdeklarasi. Menu atas memanggilnya lebih
+// awal, jadi butuh dua baris pengenalan ini.
+uint8_t sysInfoPage = 0;
+void drawSysInfo();
+void handleSysInfoKey(char key);
+
 
 void usToDuty(uint8_t ch, uint16_t us) {
   us = constrain(us, ServoCfg::MIN_US, ServoCfg::MAX_US);
@@ -576,8 +584,8 @@ void drawListMenu(const char* title, const char* labels[], uint8_t count, uint8_
 }
 
 // --- LEVEL 0: TOP MENU ---
-constexpr uint8_t TOP_COUNT = 3;
-const char* TOP_LABELS[TOP_COUNT] = { "Setting Kalibrasi", "Test I/O", "Test Command" };
+constexpr uint8_t TOP_COUNT = 4;   // DIUBAH 3 -> 4, tambah "Info Sistem"
+const char* TOP_LABELS[TOP_COUNT] = { "Setting Kalibrasi", "Test I/O", "Test Command", "Info Sistem" };
 uint8_t topCursor = 0;
 
 void drawTopMenu() {
@@ -1210,6 +1218,7 @@ void handleTopMenuKey(char key) {
       case 0: menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); break;
       case 1: menuState = MenuState::TEST_IO_CATEGORY; testIoCatCursor = 0; drawTestIoCategory(); break;
       case 2: menuState = MenuState::TEST_CMD_LIST; cmdTestCursor = 0; drawTestCmdList(); break;
+      case 3: menuState = MenuState::SYS_INFO; sysInfoPage = 0; lcdClear(); drawSysInfo(); break;
     }
   } else if (key == 'D') { menuState = MenuState::NONE; lcdClear(); Serial.println("[CAL] Keluar mode kalibrasi"); }
 }
@@ -1460,6 +1469,55 @@ void setup() {
   Serial.println("[BOOT] setup SELESAI -- ketik HELP utk kalibrasi via Serial");
 }
 
+
+// ============================================================
+// INFO SISTEM -- kategori menu utama ke-4 (BARU 2026-09-22)
+//
+// Sebelumnya semua data ini hanya terlihat lewat Serial USB: operator yang berdiri di panel
+// harus mengambil laptop dan mencolok kabel hanya untuk tahu versi firmware atau alamat IP.
+// Alamat IP yang paling sering dicari -- tanpa itu OTA tidak bisa dijalankan sama sekali.
+//
+// Tiga halaman, A/B berpindah, D keluar.
+// ============================================================
+constexpr uint8_t SYS_INFO_PAGES = 3;
+
+String sysUptimeText() {
+  uint32_t d = millis() / 1000;
+  return String(d / 3600) + "j " + String((d % 3600) / 60) + "m " + String(d % 60) + "d";
+}
+
+void drawSysInfo() {
+  lcdPrint(0, 0, "INFO SISTEM " + String(sysInfoPage + 1) + "/" + String(SYS_INFO_PAGES));
+  switch (sysInfoPage) {
+    case 0: {
+      // FW_VERSION penuh 23 karakter, tidak muat di 20 kolom -- ambil bagian tengahnya yang
+      // paling informatif. Versi lengkap tetap utuh di Serial STATUS.
+      String v = FW_VERSION;
+      lcdPrint(0, 1, "FW:" + (v.length() >= 16 ? v.substring(2, 16) : v));
+      lcdPrint(0, 2, String(FW_BUILD));
+      break;
+    }
+    case 1:
+      lcdPrint(0, 1, "Hidup: " + sysUptimeText());
+      lcdPrint(0, 2, "Heap: " + String(ESP.getFreeHeap()) + "B");
+      break;
+    case 2:
+      if (otaReady) lcdPrint(0, 1, "IP:" + WiFi.localIP().toString());
+      else          lcdPrint(0, 1, "WiFi: tidak connect");
+      lcdPrint(0, 2, "I2Cerr:" + String(i2cErrorCount) + " Flt:" + String(lastFaultCode)
+                     + " S" + String(Rs485Cfg::SLAVE_ID));
+      break;
+  }
+  lcdPrint(0, 3, "A/B=halaman D=keluar");
+}
+
+void handleSysInfoKey(char key) {
+  if (key == 'A') sysInfoPage = (sysInfoPage == 0) ? SYS_INFO_PAGES - 1 : sysInfoPage - 1;
+  else if (key == 'B') sysInfoPage = (sysInfoPage + 1) % SYS_INFO_PAGES;
+  else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); return; }
+  drawSysInfo();
+}
+
 void loop() {
   mb.task();
   updateOTA();
@@ -1494,6 +1552,7 @@ void loop() {
       else if (menuState == MenuState::TEST_MOD_SERVO) handleTestModServoKey(key);
       else if (menuState == MenuState::TEST_CMD_LIST) handleTestCmdListKey(key);
       else if (menuState == MenuState::CONFIRM_RESET) handleConfirmResetKey(key);
+      else if (menuState == MenuState::SYS_INFO) handleSysInfoKey(key);
       else if (menuState == MenuState::TEST_GERAKAN) handleTestGerakanKey(key);
     }
   }
@@ -1570,6 +1629,14 @@ void loop() {
     processQueue();
     checkSequenceComplete();
   }
+  // Uptime berjalan terus, jadi layar ini harus hidup sendiri tanpa menunggu tombol.
+  // Aman dari masalah LCD-menahan-loop: lcdPrint() hanya menulis baris yang benar-benar
+  // berubah, dan di halaman ini cuma baris detik yang bergerak.
+  if (menuState == MenuState::SYS_INFO && lcdPresent) {
+    static uint32_t lastSysRefresh = 0;
+    if (millis() - lastSysRefresh > 500) { lastSysRefresh = millis(); drawSysInfo(); }
+  }
+
 
   if (menuState != MenuState::NONE) return;   // command eksternal dijeda saat menu aktif (§12.6)
 
