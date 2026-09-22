@@ -592,15 +592,37 @@ void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, ca
 // ============================================================
 uint32_t testCycleArmedAt = 0;   // kapan '#' pertama ditekan; 0 = belum bersiap
 
+// DIPERBAIKI (2026-09-22): layar ini sempat membuat gerakan lengan tersendat -- gejalanya
+// "begitu keluar menu, gerakannya jadi lebih halus".
+//
+// Sebabnya: menulis ke LCD lewat I2C itu lambat, satu baris 20 karakter memakan beberapa
+// milidetik. Menggambar ulang empat baris setiap 250 ms menahan loop() cukup lama sehingga
+// tick trajektori terlewat. Tiap tick hanya menggeser servo satu langkah dan TIDAK ada
+// mekanisme mengejar ketinggalan, jadi tick yang hilang langsung terlihat sebagai sentakan.
+//
+// Penanganannya: simpan isi terakhir tiap baris, dan hanya tulis baris yang benar-benar
+// berubah. Selama lengan bergerak mulus, praktis tidak ada yang ditulis ulang -- baris
+// aktivitas baru berubah saat tahap gerakannya berganti.
+String barisTerakhir[4];    // cache layar Test Gerakan
+String utamaTerakhir[4];    // cache layar utama (dipakai saat menu TIDAK aktif)
+
+void lcdBarisJikaBerubah(uint8_t row, const String &teks) {
+  if (barisTerakhir[row] == teks) return;
+  barisTerakhir[row] = teks;
+  lcdPrint(0, row, teks);
+}
+
+void lupakanIsiLayar() { for (uint8_t i = 0; i < 4; i++) barisTerakhir[i] = ""; }
+
 void drawTestGerakan() {
-  lcdPrint(0, 0, "TEST GERAKAN");
-  lcdPrint(0, 1, activityText());
+  lcdBarisJikaBerubah(0, "TEST GERAKAN");
+  lcdBarisJikaBerubah(1, activityText());
   if (testCycleArmedAt != 0) {
-    lcdPrint(0, 2, "# lagi = SIKLUS PENUH");
-    lcdPrint(0, 3, "D=batal");
+    lcdBarisJikaBerubah(2, "# lagi = SIKLUS PENUH");
+    lcdBarisJikaBerubah(3, "D=batal");
   } else {
-    lcdPrint(0, 2, "0hom 1pick 2lift");
-    lcdPrint(0, 3, "A=pick B=place #=sikl");
+    lcdBarisJikaBerubah(2, "0hom 1pick 2lift");
+    lcdBarisJikaBerubah(3, "A=pick B=place #=sikl");
   }
 }
 
@@ -609,6 +631,7 @@ void handleTestGerakanKey(char key) {
   // akan berebut antrian dengan siklus produksi yang sedang berjalan.
   if (mainModeActive && key != 'D') {
     lcdPrint(0, 3, "MAIN aktif! STOP dulu");
+    barisTerakhir[3] = "";   // ditulis langsung, jadi cache baris ini harus dianggap basi
     Serial.println("[TEST-MENU] Ditolak -- MAIN aktif, kirim STOP_MAIN dulu");
     return;
   }
@@ -810,7 +833,7 @@ void handleCalListKey(char key) {
       case 4: editingOffset = CLEARANCE_OFFSET; editingOffsetName = "CLEARANCE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
       case 5: editingOffset = POST_PLACE_OFFSET; editingOffsetName = "POSTPLACE"; menuState = MenuState::JOG_OFFSET; lcd.clear(); drawOffsetMenu(); break;
       case 6: menuState = MenuState::JOG_SPEED; lcd.clear(); drawSpeedMenu(); break;
-      case 7: menuState = MenuState::TEST_GERAKAN; testCycleArmedAt = 0; lcd.clear(); drawTestGerakan(); break;
+      case 7: menuState = MenuState::TEST_GERAKAN; testCycleArmedAt = 0; lcd.clear(); lupakanIsiLayar(); drawTestGerakan(); break;
       case 8: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
@@ -1357,6 +1380,7 @@ void checkLcdKeypadHotplug() {
     Serial.println("[HOTPLUG] !!! Keypad TIDAK TERDETEKSI LAGI !!!");
     if (menuState != MenuState::NONE) {
       menuState = MenuState::NONE;
+      for (uint8_t i = 0; i < 4; i++) utamaTerakhir[i] = "";   // layar bekas menu, cache harus basi
       Serial.println("[HOTPLUG] Keluar OTOMATIS dari mode kalibrasi -- keypad hilang, cegah node terjebak");
     }
   }
@@ -1563,9 +1587,19 @@ void loop() {
     static uint32_t lastLcdRefresh = 0;
     if (millis() - lastLcdRefresh > 500) {
       lastLcdRefresh = millis();
-      lcdPrint(0, 0, "[AUTO] " + activityText());
-      lcdPrint(0, 2, "State:" + String(stateText(currentState)));
-      lcdPrint(0, 3, "Tahan* utk kalibrasi");
+      // Sama alasannya dengan layar Test Gerakan: menulis LCD lewat I2C menahan loop() dan
+      // membuat tick trajektori terlewat, yang langsung terasa sebagai sentakan pada lengan.
+      // Layar utama ini pun menggambar ulang tiga baris tiap 500 ms padahal dua di antaranya
+      // hampir tidak pernah berubah. Cache sendiri (bukan milik menu) supaya tidak perlu ada
+      // urusan saling membatalkan saat berpindah layar.
+      auto tulisUtama = [&](uint8_t row, const String &teks) {
+        if (utamaTerakhir[row] == teks) return;
+        utamaTerakhir[row] = teks;
+        lcdPrint(0, row, teks);
+      };
+      tulisUtama(0, "[AUTO] " + activityText());
+      tulisUtama(2, "State:" + String(stateText(currentState)));
+      tulisUtama(3, "Tahan* utk kalibrasi");
     }
   }
 }
