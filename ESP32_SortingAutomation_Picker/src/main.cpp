@@ -736,20 +736,39 @@ void handleOffsetKey(char key) {
   drawOffsetMenu();
 }
 
+// BARU (2026-09-22): baris atas menampilkan LAJU HASIL, bukan sekadar judul.
+//
+// Yang membingungkan dari layar ini dulu: keempat angkanya berdiri sendiri-sendiri, padahal
+// kecepatan sebenarnya adalah HASIL BAGI dua di antaranya. Operator mengubah "Jelajah" lalu
+// mengubah "Interval" tanpa pernah melihat akibat gabungannya, sehingga dua setelan yang
+// terasa sangat berbeda bisa menghasilkan kecepatan yang persis sama.
+//
+// Laju jelajah = trajStepUs / trajStepIntervalMs, yaitu berapa mikrodetik lebar pulsa
+// bergeser tiap milidetik. Ditampilkan per detik supaya angkanya enak dibaca, bersama
+// perkiraan waktu tempuh satu gerakan penuh (rentang servo 1000us).
 void drawSpeedMenu() {
-  lcdPrint(0, 0, "KECEPATAN GERAK");
-  String line1;
+  uint32_t lajuPerDetik = (uint32_t)trajStepUs * 1000UL / max((uint16_t)1, trajStepIntervalMs);
+  uint32_t tempuhMs = (lajuPerDetik > 0) ? (1000UL * 1000UL / lajuPerDetik) : 0;
+  lcdPrint(0, 0, "Laju:" + String(lajuPerDetik) + "us/s " + String(tempuhMs / 1000.0f, 1) + "s");
+
+  String line1, hint;
   switch (selSpeedParam) {
-    case 1: line1 = "1:Jelajah=" + String(trajStepUs) + "us"; break;
-    case 2: line1 = "2:Interval=" + String(trajStepIntervalMs) + "ms"; break;
-    case 3: line1 = "3:RampMin=" + String(rampMinStepUs) + "us"; break;
-    case 4: line1 = "4:RampSteps=" + String(rampSteps); break;
-    case 5: line1 = "5:BuzzOn=" + String(buzzerOnMs) + "ms"; break;
-    case 6: line1 = "6:BuzzOff=" + String(buzzerOffMs) + "ms"; break;
+    case 1: line1 = "1:Jelajah=" + String(trajStepUs) + "us";
+            hint  = "Besar=cepat,kasar";   break;
+    case 2: line1 = "2:Interval=" + String(trajStepIntervalMs) + "ms";
+            hint  = "Kecil=cepat & halus";  break;
+    case 3: line1 = "3:RampMin=" + String(rampMinStepUs) + "us";
+            hint  = "Lompat awal-akhir";    break;
+    case 4: line1 = "4:RampSteps=" + String(rampSteps);
+            hint  = "Tick utk pelan2";      break;
+    case 5: line1 = "5:BuzzOn=" + String(buzzerOnMs) + "ms";
+            hint  = "Lama bunyi ON";        break;
+    case 6: line1 = "6:BuzzOff=" + String(buzzerOffMs) + "ms";
+            hint  = "Lama bunyi OFF";       break;
   }
   lcdPrint(0, 1, line1);
-  lcdPrint(0, 2, "1-6=pilih A+B-C:step");
-  lcdPrint(0, 3, "#=SIMPAN D=kembali");
+  lcdPrint(0, 2, hint);
+  lcdPrint(0, 3, "1-6 A+B- C:stp #save");
 }
 void handleSpeedKey(char key) {
   int16_t step = JOG_STEPS[jogStepIdx];
