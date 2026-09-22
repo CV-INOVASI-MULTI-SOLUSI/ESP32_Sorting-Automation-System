@@ -81,5 +81,11 @@ enum class Cmd : uint16_t {
   // PICK/PLACE) DITOLAK TOTAL -- cuma MOVE_PACKAGE (produksi
   // asli) yang jalan. Sebaliknya, MOVE_PACKAGE ditolak selama masih TEST mode.
   START_MAIN = 11,
-  STOP_MAIN = 12
+  STOP_MAIN = 12,
+  // BARU (2026-09-22): menuju pose mana pun, arg = nomor slot (0=HOME, 1=PACKAGE_PICKUP,
+  // 2=LIFT_LOAD). Sebelumnya hanya GOTO_HOME yang punya opcode, sehingga pose 1 dan 2 --
+  // dua-duanya tujuan produksi -- tidak bisa didatangi dari Orange Pi sama sekali. Untuk
+  // memverifikasi kalibrasi dari jarak jauh, keduanya justru yang paling perlu dilihat.
+  // Manual override, jadi DITOLAK selama MAIN aktif seperti GOTO_HOME/PICK/PLACE.
+  GOTO_POSE_N = 13
 };

@@ -494,6 +494,16 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       if (blockIfFaulted("GOTO_HOME")) return;
       enqueue(QCmd::GOTO_POSE, 0);
       break;
+    case Cmd::GOTO_POSE_N:
+      if (mainModeActive) { Serial.println("[CMD] GOTO_POSE_N ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
+      if (blockIfFaulted("GOTO_POSE_N")) return;
+      if (arg >= NUM_POSES) {
+        Serial.printf("[CMD] GOTO_POSE_N ditolak -- slot %u tidak ada (hanya 0=HOME 1=PICKUP 2=LIFT)\n", arg);
+        return;
+      }
+      enqueue(QCmd::GOTO_POSE, (uint8_t)arg);
+      Serial.printf("[CMD] GOTO_POSE_N -> pose %u (%s)\n", arg, POSE_NAMES[arg]);
+      break;
     // DIHAPUS (2026-09-22): Cmd::GOTO_PASS (opcode 3) -- pose 1 (PASS) hanya dituju jalur
     // objek satuan yang sudah dihapus. Opcode 3 sengaja dibiarkan kosong.
     // DIHAPUS: Cmd::GOTO_REJECT (opcode 4) -- Picker fisik cuma ambil dari PASS, gak pernah
