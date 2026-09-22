@@ -13,9 +13,9 @@ namespace Reg {
   constexpr uint16_t CMD_ACK_SEQ = 5;
   constexpr uint16_t HEARTBEAT   = 6;
 
-  // DIPERBARUI (2026-09-22): pose yang masih dipakai tinggal 0, 4, dan 5. Slot 1, 2, 3
-  // sudah tidak punya pembaca sejak jalur objek satuan dihapus.
-  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home, 4=package_pickup, 5=lift_load)
+  // DIPERBARUI (2026-09-22): slot pose dinomori ulang rapat jadi 0, 1, 2 -- lubang bekas
+  // jalur objek satuan (pass/reject/lift) dibuang seluruhnya.
+  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home, 1=package_pickup, 2=lift_load)
 
   // BARU: Lapis 2 (SubState) + Lapis 3 (diagnostik) -- sinkron pola SORTER
   constexpr uint16_t ACTIVITY_CODE   = 11;  // R
@@ -33,14 +33,15 @@ namespace Reg {
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik PICKER ---
 enum class ActivityCode : uint16_t {
-  // DIHAPUS: MENUJU_REJECT (value 3) -- Picker gak pernah reject, pose 2 gak pernah dituju lagi.
-  // DIHAPUS: MENUJU_PASS (value 2) dan MENUJU_LIFT (value 4) -- pose 1 dan 3 hanya dipakai
-  // jalur objek satuan, yang sudah dihapus. Nilainya dibiarkan kosong agar kode lain tidak geser.
-  // BARU: pose 4 dan 5 sekarang punya kode sendiri. Selama ini keduanya jatuh ke BERGERAK
-  // yang generik, padahal justru dua pose inilah satu-satunya tujuan produksi yang tersisa --
-  // operator tidak bisa membedakan "menuju package" dari "menuju lift" lewat register.
-  // Sengaja memakai nomor BARU (10, 11), bukan mendaur ulang 2/3/4 yang baru dikosongkan --
-  // master atau catatan lama yang masih memegang arti lama tidak boleh salah membaca.
+  // DIHAPUS (2026-09-22): MENUJU_PASS (2), MENUJU_REJECT (3) dan MENUJU_LIFT (4) -- ketiganya
+  // milik jalur objek satuan yang sudah dibuang seluruhnya.
+  //
+  // Dua tujuan produksi yang tersisa (pose 1 = PACKAGE_PICKUP, pose 2 = LIFT_LOAD) kini punya
+  // kode sendiri. Sebelumnya keduanya jatuh ke BERGERAK yang generik, sehingga operator tidak
+  // bisa membedakan "menuju package" dari "menuju lift" lewat register.
+  //
+  // Nomor 10 dan 11 dipakai, BUKAN mendaur ulang 2/3/4 yang baru dikosongkan -- master atau
+  // catatan lama yang masih memegang arti lama tidak boleh salah membaca.
   DIAM = 0, MENUJU_HOME = 1, MENUJU_PACKAGE_PICKUP = 10, MENUJU_LIFT_LOAD = 11,
   MENGAMBIL = 5, MELETAKKAN = 6, NAIK_CLEARANCE = 7, BERGERAK = 8, POST_PLACE_GERAK = 9,
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
@@ -69,7 +70,7 @@ enum class Cmd : uint16_t {
   // TIDAK dipakai ulang -- PICK/PLACE dkk tetap nomor eksplisit di bawah biar gak geser.
   PICK = 5, PLACE = 6,                              // manual override
   RESET_FAULT = 7,
-  MOVE_PACKAGE = 8,  // BARU -- urutan penuh home->PACKAGE_PICKUP(pose4)->pick->LIFT_LOAD(pose5)->place->home,
+  MOVE_PACKAGE = 8,  // urutan penuh home->PACKAGE_PICKUP(pose1)->pick->LIFT_LOAD(pose2)->place->home,
                       // dipicu Orange Pi saat SORTER.PASS_COUNT capai batch (mis. 20), TANPA arg
   // BARU -- biar kecepatan trajectory (berlaku SAMA ke semua 6 joint) bisa di-tuning dari
   // Orange Pi langsung, gak wajib lewat LCD/Serial lokal.

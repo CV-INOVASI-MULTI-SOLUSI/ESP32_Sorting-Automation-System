@@ -30,9 +30,9 @@ CATATAN:
     Dispenser; objek satuan tidak pernah disentuhnya, jadi seluruh jalur "ambil
     satu objek dari jalur PASS" tidak punya pemakai. GOTO_REJECT sudah lebih dulu
     dihapus karena reject ditangani palang SORTER.
-  - Tidak ada opcode untuk mendatangi pose 4 (PACKAGE_PICKUP) atau 5 (LIFT_LOAD).
-    Saat mengkalibrasi, pakai tombol BUTTON_2 di panel (menuju pose 4) atau
-    perintah Serial `GOTO 4` / `GOTO 5`.
+  - Tidak ada opcode untuk mendatangi pose 1 (PACKAGE_PICKUP) atau 2 (LIFT_LOAD).
+    Saat mengkalibrasi, pakai tombol BUTTON_2 di panel (menuju pose 1) atau
+    perintah Serial `GOTO 1` / `GOTO 2`.
   - MOVE_PACKAGE (produksi asli, full cycle home->pickup->place->home otomatis)
     BUTUH MAIN mode -- disediakan lewat run_move_package(), TAPI TIDAK dipanggil
     otomatis di main(). Uncomment manggilnya sendiri kalau mau test itu (lihat
@@ -197,7 +197,7 @@ def ensure_test_mode(instr):
 
 def run_move_package(instr):
     """BARU -- test PRODUKSI ASLI (MOVE_PACKAGE, opcode 8): full cycle
-    home->PACKAGE_PICKUP(pose4)->pick->LIFT_LOAD(pose5)->place->home, OTOMATIS,
+    home->PACKAGE_PICKUP(pose1)->pick->LIFT_LOAD(pose2)->place->home, OTOMATIS,
     TANPA jeda antar-tahap. BUTUH MAIN mode (kebalikan dari 5 langkah manual di
     atas) -- kirim START_MAIN dulu, jalanin, balik STOP_MAIN lagi di akhir biar
     Picker balik TEST mode (aman dipakai manual lagi setelahnya).
@@ -228,8 +228,8 @@ def main():
     # dari ujung Dispenser, tidak pernah menangani objek satuan, sehingga pose PASS tidak
     # punya pemakai lagi dan opcode-nya sudah tidak ada di firmware.
     #
-    # Untuk mendatangi titik ambil package (pose 4) saat kalibrasi, tidak ada opcode khusus:
-    # pakai tombol fisik BUTTON_2 di panel, atau perintah Serial `GOTO 4`.
+    # Untuk mendatangi titik ambil package (pose 1) saat kalibrasi, tidak ada opcode khusus:
+    # pakai tombol fisik BUTTON_2 di panel, atau perintah Serial `GOTO 1`.
     MANUAL_STEPS = [
         ("GOTO_HOME",  CMD_GOTO_HOME, 6.0),
         ("PICK",       CMD_PICK,      4.0),

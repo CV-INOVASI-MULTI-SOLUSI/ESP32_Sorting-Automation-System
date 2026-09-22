@@ -51,7 +51,7 @@ namespace CH {
   // di GPA3(ch19), PROX_2 di GPA2(ch18). Harus SAMA di keempat config.h (board universal).
   constexpr uint8_t PROX_1    = 19;
   constexpr uint8_t PROX_2    = 18;
-  constexpr uint8_t BUTTON_2  = 20;   // PICKER -- test menuju PACKAGE_PICKUP (pose 4)
+  constexpr uint8_t BUTTON_2  = 20;   // PICKER -- test menuju PACKAGE_PICKUP (pose 1)
   constexpr uint8_t BUTTON_3  = 21;   // nganggur -- Picker fisik cuma ambil dari PASS, gak ada reject
   constexpr uint8_t LIM_1     = 23;
   constexpr uint8_t LIM_2     = 22;

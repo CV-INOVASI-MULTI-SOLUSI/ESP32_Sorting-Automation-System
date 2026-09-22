@@ -75,16 +75,17 @@ uint32_t lastRs485Rx = 0;
 bool modbusEverUsed = false;
 
 struct Pose { uint16_t us[ServoCfg::NUM_JOINTS]; };
-// DIPERBARUI (2026-09-22): arm robot HANYA memindahkan package penuh dari ujung Dispenser.
-// Jalur objek satuan dihapus, sehingga yang benar-benar dipakai tinggal TIGA slot:
+// DIRAPIKAN (2026-09-22): arm robot HANYA memindahkan package penuh dari ujung Dispenser,
+// jadi slot pose dinomori ulang rapat tanpa lubang:
 //   0 = HOME            titik istirahat, awal & akhir MOVE_PACKAGE
-//   4 = PACKAGE_PICKUP  titik ambil package penuh di ujung conveyor Dispenser
-//   5 = LIFT_LOAD       titik taruh package di Load Position Stocker
-// Slot 1 (pass), 2 (bekas reject) dan 3 (bekas titik jatuh objek satuan) TIDAK ADA yang
-// membacanya lagi. Array tetap 6 slot supaya nomor 4 dan 5 tidak bergeser -- menggeser slot
-// yang sudah dipakai produksi jauh lebih berisiko daripada membiarkan lubang di tengah.
+//   1 = PACKAGE_PICKUP  titik ambil package penuh di ujung conveyor Dispenser
+//   2 = LIFT_LOAD       titik taruh package di Load Position Stocker
 //
-// Komentar lama (sudah tidak berlaku): Slot 0=home, 1=pass, 3=lift(clearance per-objek). BARU slot 4=PACKAGE_PICKUP
+// Sebelumnya array ini 6 slot dengan tiga lubang di tengah (bekas pass/reject/lift dari
+// jalur objek satuan yang sudah dihapus). Lubang itu dipertahankan sementara supaya nomor
+// 4 dan 5 tidak bergeser, tetapi karena satu-satunya pembaca nomor pose adalah firmware ini
+// sendiri, mempertahankannya hanya menyisakan jebakan saat kalibrasi -- operator harus
+// mengingat bahwa 1, 2, 3 tidak boleh dipakai.
 // (posisi ambil package berisi batch objek di ujung conveyor), 5=LIFT_LOAD (posisi taruh
 // package ke Lift Load Position STOCKER) -- dipakai Cmd::MOVE_PACKAGE. Default slot 4/5
 // SENGAJA disamakan dgn home (aman, tidak akan gerak ekstrem) sampai dikalibrasi manual
@@ -92,14 +93,16 @@ struct Pose { uint16_t us[ServoCfg::NUM_JOINTS]; };
 // Slot 2 SISA/GAK KEPAKE -- dulu "reject", sekarang gak ada Cmd/ActivityCode yang nunjuk ke
 // situ lagi (Picker fisik cuma ambil dari PASS, lihat Cmd::GOTO_REJECT DIHAPUS di registers.h).
 // Array TETAP 6 slot (index 0-5) -- ngosongin/nyusun ulang nomor slot lain berisiko
-// (pose 4/5 udah eksplisit dipakai produksi), array-nya dibiarkan apa adanya.
-Pose POSES[6] = {
-  {{1500,1500,1500,1500,1500,1000}},
-  {{1200,1600,1400,1500,1500,1000}},
-  {{1800,1600,1400,1500,1500,1000}},
-  {{1500,1300,1700,1500,1500,1000}},
-  {{1500,1500,1500,1500,1500,1000}},
-  {{1500,1500,1500,1500,1500,1000}},
+// (pose 1/2 dipakai produksi), tapi setelah jalur satuan dibuang lubang itu tidak ada lagi.
+constexpr uint8_t NUM_POSES = 3;
+const char* POSE_NAMES[NUM_POSES] = { "HOME", "PICKUP", "LIFT" };
+// Ketiganya sengaja sama dengan posisi netral: belum ada yang tahu di mana titik ambil dan
+// titik taruh sebelum dikalibrasi, dan menebaknya berarti lengan mengayun ke tempat yang
+// bisa menabrak. Operator wajib menyetel slot 1 dan 2 sebelum MOVE_PACKAGE ada artinya.
+Pose POSES[NUM_POSES] = {
+  {{1500,1500,1500,1500,1500,1000}},   // 0 HOME
+  {{1500,1500,1500,1500,1500,1000}},   // 1 PACKAGE_PICKUP
+  {{1500,1500,1500,1500,1500,1000}},   // 2 LIFT_LOAD
 };
 int16_t PICK_OFFSET[ServoCfg::NUM_JOINTS]      = {0,0,-200,0,0,600};
 int16_t PLACE_OFFSET[ServoCfg::NUM_JOINTS]     = {0,0,-200,0,0,1000};
@@ -254,7 +257,12 @@ void checkSequenceComplete() {
 
 void loadPosesFromNvs() {
   prefs.begin("picker_cal", true);
-  if (prefs.isKey("poses")) prefs.getBytes("poses", POSES, sizeof(POSES));
+  // KUNCI NVS SENGAJA DIGANTI "poses" -> "poses3" (2026-09-22). Blob lama berisi 6 pose
+  // dengan ARTI YANG BERBEDA; kalau dibaca ke array 3 slot yang baru, tiga pose pertama
+  // (home, pass, reject) akan masuk sebagai home/pickup/lift dan lengan bergerak ke tempat
+  // yang sama sekali salah. Dengan kunci baru, kalibrasi lama diabaikan dan nilai default
+  // yang aman dipakai sampai operator menyetel ulang.
+  if (prefs.isKey("poses3")) prefs.getBytes("poses3", POSES, sizeof(POSES));
   if (prefs.isKey("pick"))  prefs.getBytes("pick", PICK_OFFSET, sizeof(PICK_OFFSET));
   if (prefs.isKey("place")) prefs.getBytes("place", PLACE_OFFSET, sizeof(PLACE_OFFSET));
   if (prefs.isKey("clear")) prefs.getBytes("clear", CLEARANCE_OFFSET, sizeof(CLEARANCE_OFFSET));
@@ -267,7 +275,7 @@ void loadPosesFromNvs() {
   if (prefs.isKey("buzzOff")) buzzerOffMs = prefs.getUShort("buzzOff", buzzerOffMs);       // BARU
   prefs.end();
 }
-void savePosesToNvs() { prefs.begin("picker_cal", false); prefs.putBytes("poses", POSES, sizeof(POSES)); prefs.end(); }
+void savePosesToNvs() { prefs.begin("picker_cal", false); prefs.putBytes("poses3", POSES, sizeof(POSES)); prefs.end(); }
 void saveOffsetToNvs(const char* key, int16_t* arr, size_t len) {
   prefs.begin("picker_cal", false); prefs.putBytes(key, arr, len); prefs.end();
 }
@@ -333,9 +341,8 @@ String activityText() {
     case QCmd::GOTO_POSE:
       switch (currentActionPoseIdx) {
         case 0: return "Menuju Home";
-        case 1: return "Menuju Pass";
-        case 2: return "Menuju Reject";
-        case 3: return "Menuju Lift";
+        case 1: return "Menuju Package";
+        case 2: return "Menuju Lift";
       }
       return "Bergerak";
     case QCmd::PICK: return "Mengambil (Pick)";
@@ -355,11 +362,8 @@ ActivityCode activityCode() {
     case QCmd::GOTO_POSE:
       switch (currentActionPoseIdx) {
         case 0: return ActivityCode::MENUJU_HOME;
-        // DIHAPUS (2026-09-22): case 1 (MENUJU_PASS) & case 3 (MENUJU_LIFT) -- dua pose itu
-        // hanya dipakai jalur objek satuan, yang sudah dihapus. case 2 (MENUJU_REJECT) sudah
-        // lebih dulu hilang bersama jalur reject.
-        case 4: return ActivityCode::MENUJU_PACKAGE_PICKUP;
-        case 5: return ActivityCode::MENUJU_LIFT_LOAD;
+        case 1: return ActivityCode::MENUJU_PACKAGE_PICKUP;
+        case 2: return ActivityCode::MENUJU_LIFT_LOAD;
       }
       return ActivityCode::BERGERAK;
     case QCmd::PICK: return ActivityCode::MENGAMBIL;
@@ -409,7 +413,7 @@ bool blockIfFaulted(const char* opName) {
 // DISPENSER (BTN_TEST_BOX_FULL).
 // DIUBAH (2026-09-22): dulu tombol ini menuju pose 1 (PASS). Pose itu sudah tidak dipakai
 // sejak jalur objek satuan dihapus, jadi tombolnya akan menggerakkan lengan ke tempat yang
-// tidak punya arti. Sekarang diarahkan ke pose 4 (PACKAGE_PICKUP) -- titik ambil package di
+// tidak punya arti. Sekarang diarahkan ke pose 1 (PACKAGE_PICKUP) -- titik ambil package di
 // ujung Dispenser, yang justru paling sering perlu didatangi saat mengkalibrasi.
 void handleTestButtons() {
   static bool lastBtn = HIGH;
@@ -422,8 +426,8 @@ void handleTestButtons() {
     if (mainModeActive) {
       Serial.println("[TEST-BTN] Tombol ditolak -- MAIN aktif, STOP_MAIN dulu");
     } else if (!blockIfFaulted("GOTO PACKAGE_PICKUP")) {
-      enqueue(QCmd::GOTO_POSE, 4);
-      Serial.println("[TEST-BTN] Tombol ditekan -- menuju pose 4 (PACKAGE_PICKUP)");
+      enqueue(QCmd::GOTO_POSE, 1);
+      Serial.println("[TEST-BTN] Tombol ditekan -- menuju pose 1 (PACKAGE_PICKUP)");
     }
   }
   lastBtn = cur;
@@ -466,8 +470,8 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       if (blockIfFaulted("PLACE")) return;
       enqueue(QCmd::PLACE);
       break;
-    // BARU: angkat 1 package (batch objek) dari posisi ujung conveyor (pose4=PACKAGE_PICKUP)
-    // ke Lift Load Position STOCKER (pose5=LIFT_LOAD). Dipicu Orange Pi saat SORTER.PASS_COUNT
+    // BARU: angkat 1 package (batch objek) dari posisi ujung conveyor (pose1=PACKAGE_PICKUP)
+    // ke Lift Load Position STOCKER (pose2=LIFT_LOAD). Dipicu Orange Pi saat SORTER.PASS_COUNT
     // capai batas batch -- Orange Pi kirim RUN_FULL_CYCLE ke STOCKER SETELAH ack command ini.
     case Cmd::MOVE_PACKAGE:
       if (!mainModeActive) { Serial.println("[CMD] MOVE_PACKAGE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); return; }
@@ -475,9 +479,9 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       enqueue(QCmd::GOTO_POSE, 0);
       enqueue(QCmd::CLEARANCE);
       triggerBuzzerBeep();
-      enqueue(QCmd::GOTO_POSE, 4);
+      enqueue(QCmd::GOTO_POSE, 1);
       enqueue(QCmd::PICK);
-      enqueue(QCmd::GOTO_POSE, 5);
+      enqueue(QCmd::GOTO_POSE, 2);
       enqueue(QCmd::PLACE);
       enqueue(QCmd::POST_PLACE);
       enqueue(QCmd::GOTO_POSE, 0);
@@ -590,17 +594,20 @@ void handleCalibrationKey(char key) {
   else if (key == 'A') { currentUs[selJoint] = constrain((int)currentUs[selJoint] + JOG_STEPS[jogStepIdx], (int)ServoCfg::MIN_US, (int)ServoCfg::MAX_US); usToDuty(selJoint, currentUs[selJoint]); }
   else if (key == 'B') { currentUs[selJoint] = constrain((int)currentUs[selJoint] - JOG_STEPS[jogStepIdx], (int)ServoCfg::MIN_US, (int)ServoCfg::MAX_US); usToDuty(selJoint, currentUs[selJoint]); }
   else if (key == 'C') { jogStepIdx = (jogStepIdx + 1) % 4; }
-  else if (key == '#') { menuState = MenuState::WAIT_SAVE_SLOT; lcdPrint(0, 3, "Slot? 0-5 (cek doc)"); return; }
+  // DIUBAH: dulu tertulis "Slot? 0-5 (cek doc)" -- menyuruh operator membuka dokumen di
+  // tengah kalibrasi, dan itu memang sempat bikin lupa arti nomornya. Sekarang nama
+  // slotnya langsung tercetak, tidak ada yang perlu diingat.
+  else if (key == '#') { menuState = MenuState::WAIT_SAVE_SLOT; lcdPrint(0, 3, "Slot? 0hom 1pick 2lift"); return; }
   else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); return; }
   drawCalibrationLcd();
 }
 void handleSaveSlotKey(char key) {
-  if (key >= '0' && key <= '5') {
+  if (key >= '0' && key < '0' + NUM_POSES) {
     uint8_t slot = key - '0';
     memcpy(POSES[slot].us, currentUs, sizeof(currentUs));
     savePosesToNvs();
-    lcdPrint(0, 3, "Tersimpan slot " + String(slot));
-    Serial.printf("[CAL] Pose disimpan ke slot %u (NVS)\n", slot);
+    lcdPrint(0, 3, "Simpan " + String(slot) + "=" + POSE_NAMES[slot] + " OK");
+    Serial.printf("[CAL] Pose disimpan ke slot %u (%s), tersimpan di NVS\n", slot, POSE_NAMES[slot]);
     menuState = MenuState::JOG_JOINT;
   } else if (key == 'D') { menuState = MenuState::JOG_JOINT; drawCalibrationLcd(); }
 }
@@ -1085,13 +1092,13 @@ void handleSerialCommand() {
   }
   else if (cmd == "SAVEPOSE") {
     uint8_t slot = line.substring(sp1 + 1).toInt();
-    if (slot < 6) { memcpy(POSES[slot].us, currentUs, sizeof(currentUs)); savePosesToNvs(); Serial.printf("[SAVEPOSE] -> slot %u\n", slot); }
-    else Serial.println("[SAVEPOSE] Slot harus 0-5");
+    if (slot < NUM_POSES) { memcpy(POSES[slot].us, currentUs, sizeof(currentUs)); savePosesToNvs(); Serial.printf("[SAVEPOSE] -> slot %u (%s)\n", slot, POSE_NAMES[slot]); }
+    else Serial.println("[SAVEPOSE] Slot harus 0=HOME 1=PICKUP 2=LIFT");
   }
   else if (cmd == "GOTO") {
     uint8_t slot = line.substring(sp1 + 1).toInt();
-    if (slot < 6) { enqueue(QCmd::GOTO_POSE, slot); Serial.printf("[GOTO] Pindah ke pose %u\n", slot); }
-    else Serial.println("[GOTO] Slot harus 0-5");
+    if (slot < NUM_POSES) { enqueue(QCmd::GOTO_POSE, slot); Serial.printf("[GOTO] Pindah ke pose %u (%s)\n", slot, POSE_NAMES[slot]); }
+    else Serial.println("[GOTO] Slot harus 0=HOME 1=PICKUP 2=LIFT");
   }
   // DIHAPUS (2026-09-22): command Serial "SEQ" -- opcode RUN_SEQUENCE-nya sudah tidak ada.
   else if (cmd == "MOVEPKG") {
@@ -1114,7 +1121,7 @@ void handleSerialCommand() {
     Serial.println();
   }
   else if (cmd == "HELP") {
-    Serial.println("[HELP] JOG <0-5> <us> | SAVEPOSE <0-5> | GOTO <0-5> | MOVEPKG | STEP <us> | INTERVAL <ms>");
+    Serial.println("[HELP] JOG <0-5> <us> | SAVEPOSE <0-2> | GOTO <0-2> | MOVEPKG | STEP <us> | INTERVAL <ms>");
     Serial.println("[HELP] RAMPMIN <us> | RAMPSTEPS <n> | RESET | STATUS | HELP");
   }
   else Serial.printf("[SERIAL] '%s' tidak dikenal -- ketik HELP\n", cmd.c_str());
