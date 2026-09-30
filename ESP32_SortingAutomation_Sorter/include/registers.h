@@ -53,6 +53,10 @@ namespace Reg {
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik (bukan cuma IDLE/RUNNING generik) ---
 enum class ActivityCode : uint16_t {
+  // CONVEYOR_JALAN_PALANG_AKTIF (2) = palang sedang PUSH/RETRACT, apa pun keadaan conveyor.
+  // DIPERBAIKI 2026-09-28: dulu kode ini tidak pernah bisa muncul karena siklus palang ikut
+  // menyetel motorAState=1 dan MOTOR_A_JALAN (3) dicek lebih dulu. Sekarang 3 berarti khusus
+  // jog manual Motor A (SET_MOTOR_A / Serial MOTORA) TANPA siklus palang.
   DIAM = 0, CONVEYOR_JALAN = 1, CONVEYOR_JALAN_PALANG_AKTIF = 2, MOTOR_A_JALAN = 3,
   // BARU: TEST_HOPPER_CYCLE (opcode 97, ATAU tombol fisik BTN_TEST_HOPPER) TIDAK pernah
   // ubah currentState (sengaja, biar guard-nya cuma butuh currentState==IDLE) -- tanpa

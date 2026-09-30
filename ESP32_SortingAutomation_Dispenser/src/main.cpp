@@ -57,6 +57,32 @@ void lcdClear() {
   for (uint8_t i = 0; i < LcdCfg::ROWS; i++) lcdCacheValid[i] = false;
 }
 
+// BARU (2026-09-29): teks kiri rata kiri, teks kanan rata kanan, dalam satu baris.
+void lcdKiriKanan(uint8_t row, const String& kiri, const String& kanan) {
+  int celah = (int)LcdCfg::COLS - (int)kiri.length() - (int)kanan.length();
+  if (celah < 1) celah = 1;   // tetap dipisah; lcdPrint() memotong sisanya di kolom terakhir
+  String baris = kiri;
+  for (int i = 0; i < celah; i++) baris += ' ';
+  lcdPrint(0, row, baris + kanan);
+}
+
+// BARU (2026-09-29): dua pasangan "label : nilai" -- kiri rata kiri, kanan rata kanan.
+// Format lengkap "Label : nilai" sering tidak muat di 20 kolom, jadi dicoba bertingkat --
+// lengkap, lalu tanpa spasi di sekitar ':', lalu label singkat -- dan dipakai tingkat pertama
+// yang muat. Yang dikorbankan selalu labelnya, bukan nilainya. Sama persis dengan Sorter.
+void lcdPasangan(uint8_t row, const char* labelKiri, const char* singkatKiri, const String& nilaiKiri,
+                 const char* labelKanan, const char* singkatKanan, const String& nilaiKanan) {
+  String kiri, kanan;
+  for (uint8_t tingkat = 0; tingkat < 3; tingkat++) {
+    const char* pemisah = (tingkat == 0) ? " : " : ":";
+    kiri  = String(tingkat < 2 ? labelKiri  : singkatKiri)  + pemisah + nilaiKiri;
+    kanan = String(tingkat < 2 ? labelKanan : singkatKanan) + pemisah + nilaiKanan;
+    if (kiri.length() + kanan.length() + 1 <= LcdCfg::COLS) break;
+  }
+  lcdKiriKanan(row, kiri, kanan);
+}
+
+
 #define FW_VERSION "v.01.00.25082026.21.17"
 constexpr const char* FW_BUILD = __DATE__ " " __TIME__;
 
@@ -218,15 +244,16 @@ uint8_t servoIntervalTestWhich = 0;   // 1 atau 2, servo mana yang lagi di-loop
 // Sekarang selama operator berada di salah satu dari dua layar itu, sabuk berjalan live dan
 // langsung berubah saat angkanya diubah. Berhenti otomatis begitu keluar dari layar.
 bool conveyorLiveTestMode = false;
-void startTestServoCycle(uint8_t which) {
-  if (currentState != NodeState::IDLE) { Serial.println("[TEST] Servo cycle ditolak -- node sedang tidak IDLE"); return; }
-  if (isServoRefillAutoActive()) { Serial.println("[TEST] Servo cycle ditolak -- refill otomatis (PROX_2) lagi pegang servo"); return; }
+bool startTestServoCycle(uint8_t which) {
+  if (currentState != NodeState::IDLE) { Serial.println("[TEST] Servo cycle ditolak -- node sedang tidak IDLE"); return false; }
+  if (isServoRefillAutoActive()) { Serial.println("[TEST] Servo cycle ditolak -- refill otomatis (PROX_2) lagi pegang servo"); return false; }
   testServoCycleWhich = which;
   testServoCycleStage = TestServoCycleStage::TO_END;
   testServoCycleStateAt = millis();
   uint16_t startUs = (which == 1) ? cfg.servo1StartUs : cfg.servo2StartUs;
   startServoMove(which, startUs);
   Serial.printf("[TEST] Servo%u cycle dimulai (pakai nilai kalibrasi, termasuk Interval)\n", which);
+  return true;
 }
 void updateTestServoCycle() {
   if (testServoCycleStage == TestServoCycleStage::NONE) return;
@@ -270,9 +297,9 @@ void updateTestServoCycle() {
 bool manualServo1Moving = false, manualServo2Moving = false;
 uint16_t manualServo1Target = 0, manualServo2Target = 0;
 
-void startMoveServoTo(uint8_t which, bool toEnd) {
-  if (currentState != NodeState::IDLE) { Serial.printf("[CMD] MOVE_SERVO%u_TO ditolak -- node sedang tidak IDLE\n", which); return; }
-  if (isServoRefillAutoActive()) { Serial.printf("[CMD] MOVE_SERVO%u_TO ditolak -- refill otomatis (PROX_2) lagi pegang servo\n", which); return; }
+bool startMoveServoTo(uint8_t which, bool toEnd) {
+  if (currentState != NodeState::IDLE) { Serial.printf("[CMD] MOVE_SERVO%u_TO ditolak -- node sedang tidak IDLE\n", which); return false; }
+  if (isServoRefillAutoActive()) { Serial.printf("[CMD] MOVE_SERVO%u_TO ditolak -- refill otomatis (PROX_2) lagi pegang servo\n", which); return false; }
   uint16_t target = (which == 1)
       ? (toEnd ? cfg.servo1EndUs : cfg.servo1StartUs)
       : (toEnd ? cfg.servo2EndUs : cfg.servo2StartUs);
@@ -280,6 +307,7 @@ void startMoveServoTo(uint8_t which, bool toEnd) {
   if (which == 1) { manualServo1Target = target; manualServo1Moving = true; }
   else { manualServo2Target = target; manualServo2Moving = true; }
   Serial.printf("[CMD] MOVE_SERVO%u_TO -- menuju %s (%uus)\n", which, toEnd ? "titik akhir" : "titik awal", target);
+  return true;
 }
 void updateManualServoMove() {
   if (manualServo1Moving && updateServoTrajectory(1, manualServo1Target)) manualServo1Moving = false;
@@ -460,10 +488,10 @@ void updateTestRefillLoop() {
 }
 
 // --- Menu state (dideklarasikan awal, dipakai onCmdWrite) ---
-enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_PARAM,
+enum class MenuState { NONE, TOP_SELECT, CAL_GROUP, CAL_LIST, JOG_PARAM,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
                         TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
-                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET , SYS_INFO};
+                        TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET , SYS_INFO};
 MenuState menuState = MenuState::NONE;
 
 // BARU (2026-09-22): layar Info Sistem didefinisikan tepat sebelum loop() -- di titik itu
@@ -912,19 +940,19 @@ uint32_t forceMiddleRefillAt = 0;
 uint32_t forceServoStartAt = 0;
 constexpr uint32_t FORCE_MIDDLE_REFILL_TIMEOUT_MS = 8000;
 
-void startForceMiddleRefill() {
+bool startForceMiddleRefill() {
   if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
     Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
-    return;
+    return false;
   }
   // DIHAPUS: guard LIM_STOCK_EMPTY -- Dispenser tidak punya limit switch deteksi stok habis lagi.
   if (refillState != RefillState::IDLE || servoRefillStage != ServoRefillStage::NONE || forceMiddleRefillActive) {
     Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- masih ada siklus lain jalan");
-    return;
+    return false;
   }
   if (testLoopStage != TestLoopStage::OFF) {
     Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- TEST REFILL LOOP sedang aktif, matikan dulu");
-    return;
+    return false;
   }
   forceMiddleRefillActive = true;
   forceMiddleRefillAt = millis();
@@ -937,6 +965,7 @@ void startForceMiddleRefill() {
   forceServoStartAt = millis() + cfg.servoStartDelayMs;
   currentState = NodeState::RUNNING_OR_MOVING;
   Serial.println("[FEEDER] FORCE_MIDDLE_REFILL mulai -- conveyor MAJU duluan, servo nyusul setelah delay");
+  return true;
 }
 
 void updateForceMiddleRefill() {
@@ -1344,28 +1373,20 @@ const char* stateText(NodeState s) {
   }
 }
 
-// DIUBAH TOTAL: conveyor (refillState) & servo (servoRefillStage) sekarang PARALEL, jadi teks
-// aktivitas harus GABUNGKAN keduanya -- bukan lagi 1:1 dari 1 enum aja.
-const char* servoRefillStageText() {
-  switch (servoRefillStage) {
-    case ServoRefillStage::SERVO1_TO_END:   return "Srv1Buka";
-    case ServoRefillStage::SERVO1_HOLD:     return "Srv1Tahan";
-    case ServoRefillStage::SERVO1_TO_START: return "Srv1Tutup";
-    case ServoRefillStage::SERVO2_TO_END:   return "Srv2Buka";
-    case ServoRefillStage::SERVO2_HOLD:     return "Srv2Tahan";
-    case ServoRefillStage::SERVO2_TO_START: return "Srv2Tutup";
-    case ServoRefillStage::WAIT_MIDDLE_CONFIRM: return "TungguTengah";
-    default: return nullptr;
-  }
-}
-String activityText() {
-  if (refillState == RefillState::FAULT) return "FAULT!";
-  if (refillState == RefillState::ESTOPPED) return "E-STOP!";
-  bool convOn = (refillState == RefillState::CONVEYOR_RUN);
-  const char* srv = servoRefillStageText();
-  if (convOn && srv) return "Conv+" + String(srv);
-  if (convOn) return "Conveyor ON";
-  if (srv) return String(srv);
+// DIHAPUS (2026-09-29): activityText() dan servoRefillStageText() -- dulu tampil di baris 1
+// layar utama, dibangun dari refillState/servoRefillStage (FSM refill LAMA yang tidak dipakai
+// lagi oleh jalur produksi sejak pipeline masuk ke firmware). Digantikan aktivitasTest() di
+// bawah + pipelineText() di layar utama.
+
+// BARU (2026-09-29): apa yang sedang bergerak saat node di TEST mode. Di MAIN, layar utama
+// menampilkan tahap pipeline (pipelineText) karena itulah yang menentukan; di TEST, pipeline
+// selalu MATI dan yang perlu dilihat adalah aktuator mana yang sedang diuji.
+String aktivitasTest() {
+  if (testLoopStage != TestLoopStage::OFF) return "Refill Loop";
+  if (testServoCycleStage != TestServoCycleStage::NONE) return "Uji Servo" + String(testServoCycleWhich);
+  if (manualServo1Moving) return "Servo1 gerak";
+  if (manualServo2Moving) return "Servo2 gerak";
+  if (conveyorManualOn) return "Conveyor";
   return "Diam";
 }
 
@@ -1440,7 +1461,9 @@ void updateUniversalIndicators() {
 
 // DIPERBAIKI: guard FAULT/ESTOPPED -- REQUEST_REFILL sebelumnya TIDAK dicek sama sekali
 // (kelas bug sama dgn SORTER/PICKER/STOCKER yang sudah ditemukan)
-void applyCommand(uint16_t opcode, uint16_t arg) {
+// DIUBAH (2026-09-29): true = diterima & dijalankan, false = DITOLAK -- dipakai layar
+// Test Command untuk menampilkan hasilnya di panel. Pemanggil lama boleh mengabaikannya.
+bool applyCommand(uint16_t opcode, uint16_t arg) {
   switch ((Cmd)opcode) {
     // DIPERBAIKI (bug ditemukan): cek PACKAGE_READY_FLAG dulunya ada di DALAM
     // handleRefillFSM (case IDLE), dieksekusi SATU LOOP TICK SETELAH currentState sudah kepalang
@@ -1453,11 +1476,11 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     case Cmd::START_MAIN:
       if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
         Serial.println("[CMD] START_MAIN ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
-        return;
+        return false;
       }
       if (testLoopStage != TestLoopStage::OFF) {
         Serial.println("[CMD] START_MAIN ditolak -- TEST REFILL LOOP masih aktif, matikan dulu");
-        return;
+        return false;
       }
       mainModeActive = true;
       Serial.println("[CMD] START_MAIN -- mode produksi otomatis AKTIF, command TEST diblokir sampai STOP_MAIN");
@@ -1473,19 +1496,19 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     case Cmd::REQUEST_REFILL:
       if (!mainModeActive) {
         Serial.println("[CMD] REQUEST_REFILL ditolak -- MAIN belum aktif, kirim START_MAIN dulu");
-        return;
+        return false;
       }
       if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
         Serial.println("[CMD] REQUEST_REFILL ditolak -- masih FAULT/ESTOPPED, RESET_FAULT dulu");
-        return;
+        return false;
       }
       if (testLoopStage != TestLoopStage::OFF) {
         Serial.println("[CMD] REQUEST_REFILL ditolak -- TEST REFILL LOOP sedang aktif, matikan dulu");
-        return;
+        return false;
       }
       if (mb.Hreg(Reg::PACKAGE_READY_FLAG) != 0) {
         Serial.println("[CMD] REQUEST_REFILL ditolak -- package UJUNG belum di-ACK diambil (ACK_PACKAGE_TAKEN dulu)");
-        return;
+        return false;
       }
       // DIUBAH (2026-09-20): REQUEST_REFILL tidak lagi menjalankan RefillState lama (yang
       // membaca sensor mentah dan menghentikan conveyor sendiri). Sekarang ia hanya menjadi
@@ -1493,7 +1516,7 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       if (pipelineStage != PipelineStage::SIAP_ISI) {
         Serial.printf("[CMD] REQUEST_REFILL ditolak -- Dispenser belum SIAP (tahap sekarang: %s)\n",
                       pipelineText(pipelineStage));
-        return;
+        return false;
       }
       pipelineRefillDiminta = true;
       currentState = NodeState::RUNNING_OR_MOVING;
@@ -1523,7 +1546,7 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // BARU: Orange Pi konfirmasi arm SUDAH ambil package di UJUNG -- clear PACKAGE_READY_FLAG,
     // baru REQUEST_REFILL berikutnya diizinkan lanjut (lihat guard di handleRefillFSM IDLE).
     case Cmd::ACK_PACKAGE_TAKEN:
-      if (!mainModeActive) { Serial.println("[CMD] ACK_PACKAGE_TAKEN ditolak -- MAIN belum aktif"); return; }
+      if (!mainModeActive) { Serial.println("[CMD] ACK_PACKAGE_TAKEN ditolak -- MAIN belum aktif"); return false; }
       // DIUBAH: selain membersihkan flag, ini sekaligus izin melanjutkan siklus -- padanan
       // langsung dari BUTTON_3 saat pengujian. Conveyor dinyalakan lagi oleh pipeline,
       // bukan lewat perintah terpisah dari Orange Pi.
@@ -1537,9 +1560,8 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
       Serial.println("[CMD] ACK_PACKAGE_TAKEN -- arm sudah ambil, siklus dilanjutkan");
       break;
     case Cmd::FORCE_MIDDLE_REFILL:
-      if (!mainModeActive) { Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- MAIN belum aktif"); return; }
-      startForceMiddleRefill();
-      break;
+      if (!mainModeActive) { Serial.println("[CMD] FORCE_MIDDLE_REFILL ditolak -- MAIN belum aktif"); return false; }
+      return startForceMiddleRefill();
     // BARU -- biar Orange Pi bisa tuning kecepatan servo langsung, runtime-only (gak auto-save
     // NVS -- simpan permanen tetap lewat LCD '#' kalau mau bertahan setelah reboot).
     case Cmd::SET_SERVO1_STEP:          cfg.servo1StepUs = (uint16_t)constrain(arg, 1, 2500); break;
@@ -1550,32 +1572,48 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // Pi wajib STOP_MAIN dulu. Ini gantiin guard granular satu-satu yang sebelumnya rawan bolong
     // (lihat kasus MOVE_SERVOx_TO vs servoRefillStage otomatis yang baru ketemu & diperbaiki).
     case Cmd::SET_CONVEYOR_ON_OFF:
-      if (mainModeActive) { Serial.println("[CMD] SET_CONVEYOR_ON_OFF ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
+      if (mainModeActive) { Serial.println("[CMD] SET_CONVEYOR_ON_OFF ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
       if (refillState != RefillState::IDLE || testLoopStage != TestLoopStage::OFF || forceMiddleRefillActive) {
         Serial.println("[CMD] SET_CONVEYOR_ON_OFF ditolak -- ada siklus otomatis lain sedang jalan");
-        break;
+        return false;
       }
       setConveyorManual(arg != 0);
       Serial.printf("[CMD] SET_CONVEYOR_ON_OFF -- conveyor %s\n", arg != 0 ? "ON" : "OFF");
       break;
     case Cmd::MOVE_SERVO1_TO:
-      if (mainModeActive) { Serial.println("[CMD] MOVE_SERVO1_TO ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
-      startMoveServoTo(1, arg != 0);
-      break;
+      if (mainModeActive) { Serial.println("[CMD] MOVE_SERVO1_TO ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      return startMoveServoTo(1, arg != 0);
     case Cmd::MOVE_SERVO2_TO:
-      if (mainModeActive) { Serial.println("[CMD] MOVE_SERVO2_TO ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
-      startMoveServoTo(2, arg != 0);
-      break;
+      if (mainModeActive) { Serial.println("[CMD] MOVE_SERVO2_TO ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      return startMoveServoTo(2, arg != 0);
     case Cmd::TEST_SERVO1_CYCLE:
-      if (mainModeActive) { Serial.println("[CMD] TEST_SERVO1_CYCLE ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
-      startTestServoCycle(1);
-      break;
+      if (mainModeActive) { Serial.println("[CMD] TEST_SERVO1_CYCLE ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      return startTestServoCycle(1);
     case Cmd::TEST_SERVO2_CYCLE:
-      if (mainModeActive) { Serial.println("[CMD] TEST_SERVO2_CYCLE ditolak -- MAIN aktif, STOP_MAIN dulu"); break; }
-      startTestServoCycle(2);
-      break;
-    default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); break;
+      if (mainModeActive) { Serial.println("[CMD] TEST_SERVO2_CYCLE ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      return startTestServoCycle(2);
+    default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); return false;
   }
+  return true;
+}
+
+// BARU (2026-09-30): watchdog komunikasi (COMM_TIMEOUT) diperbarui oleh SETIAP request Modbus
+// yang sukses untuk node ini -- baca maupun tulis -- bukan hanya command.
+//
+// Dulu hanya onCmdWrite() yang memperbaruinya. Akibatnya node yang RUNNING lama tanpa menerima
+// command jatuh ke FAULT COMM_TIMEOUT setelah 30 detik, walaupun master hidup dan terus
+// membacanya. Di produksi itu PASTI terjadi: Sorter RUNNING sepanjang shift, sementara di
+// antara dua batch master hanya MEMBACA PASS_COUNT dan MENULIS CLASSIFY_IS_REJECT -- tidak ada
+// satu pun command. Arm Picker yang siklus MOVE_PACKAGE-nya lebih dari 30 detik, dan homing
+// Stocker, kena masalah yang sama di tengah gerakan.
+//
+// Maksud watchdog ini adalah "master masih hidup", dan request apa pun membuktikannya.
+// onRequestSuccess() dipanggil library SETELAH cek slave ID, jadi hanya request untuk node ini
+// yang dihitung. modbusEverUsed SENGAJA tidak disetel di sini: watchdog tetap baru aktif
+// setelah command pertama, sama seperti sebelumnya.
+Modbus::ResultCode onModbusRequestSukses(Modbus::FunctionCode fc, const Modbus::RequestData data) {
+  lastRs485Rx = millis();
+  return Modbus::EX_SUCCESS;
 }
 
 uint16_t onCmdWrite(TRegister* reg, uint16_t val) {
@@ -1625,28 +1663,75 @@ void drawTopMenuFeeder() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-// DIUBAH: slot "Servo Start Delay(ms)" (pensiun -- servo sekarang trigger PACKAGE_MIDDLE_SENSOR,
-// bukan delay lagi) di-reuse jadi "Middle Confirm Timeout(ms)" -- batas tunggu konfirmasi sensor
-// tengah setelah servo jatuhin package baru.
-// DIUBAH: "Servo1/2 Interval(ms)" (target durasi tetap) diganti "Step(us)" + "Step Interval(ms)"
-// (kecepatan tetap, SAMA pola dgn hopper SORTER/PICKER) -- durasi jadi hasil jarak/kecepatan.
-// BARU: "Force Servo Delay(ms)" -- pakai field servoStartDelayMs (dulu pensiun) KHUSUS utk
-// FORCE_MIDDLE_REFILL (startup/recovery): conveyor jalan duluan, servo1+2 baru dieksekusi
-// setelah jeda ini -- BEDA dari siklus produksi normal yang PROX_2-edge-triggered.
-// BARU: "Reset Fault" jadi item PERTAMA -- dulu cuma bisa dipicu lewat menu "Test Command"
-// yang terkubur. Item 1-18 (Conveyor Speed dst) TIDAK berubah nomornya terhadap selParam
-// (lihat handleCalListKey -- selParam = calCursor, bukan calCursor+1).
+// DIUBAH TOTAL (2026-09-29): dua tingkat, dikelompokkan per PERANGKAT -- sama dengan Sorter.
+//   Conveyor / Servo 1 / Servo 2 / Buzzer / Waktu / Reset
+// "Waktu" berisi batas waktu proses yang bukan milik satu perangkat (konfirmasi TENGAH, push,
+// tunda force-refill, retry test loop). Label lama banyak yang TERPOTONG ("Servo1 Step
+// Intv(ms)" 20 karakter di ruang 15); dengan nama perangkat pindah ke judul, labelnya muat.
+//
+// NOMOR PARAMETER (selParam) SENGAJA TIDAK DIUBAH -- drawParamMenuFeeder()/handleParamKeyFeeder()
+// bercabang pada nomor itu. Pengelompokan hanya memetakan urutan tampil ke nomor lama.
+namespace CalId {
+  constexpr uint8_t RESET_FAULT = 0, CONV_SPEED = 1, CONV_DIR = 2, TO_TENGAH = 3, TO_PUSH = 4, S1_AWAL = 5, S1_AKHIR = 6, S1_TAHAN = 7, S1_STEP = 8, S1_STEP_INTERVAL = 9, S2_AWAL = 10, S2_AKHIR = 11, S2_TAHAN = 12, S2_STEP = 13, S2_STEP_INTERVAL = 14, BUZZER_ON = 15, BUZZER_OFF = 16, FORCE_DELAY = 17, LOOP_RETRY = 18, RESET_DEFAULT = 19;
+}
 constexpr uint8_t CAL_COUNT = 20;
-const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault",
-                                        "Conveyor Speed", "Conveyor Dir", "Middle Confirm TO(ms)", "Push Timeout (ms)",
-                                        "Servo1 Titik Awal", "Servo1 Titik Akhir", "Servo1 Waktu Tahan",
-                                        "Servo1 Step (us)", "Servo1 Step Intv(ms)",
-                                        "Servo2 Titik Awal", "Servo2 Titik Akhir", "Servo2 Waktu Tahan",
-                                        "Servo2 Step (us)", "Servo2 Step Intv(ms)",
-                                        "Buzzer On (ms)", "Buzzer Off (ms)", "Force Servo Delay(ms)",
-                                        "Test Loop Retry(ms)", "Reset ke Default" };
-uint8_t calCursor = 0;
-void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
+// Label per ID, tanpa awalan nama perangkat -- nama perangkat ada di judul layar. Maks 15 karakter.
+const char* CAL_LABELS[CAL_COUNT] = {
+  "Reset Fault",
+  "Speed (PWM)",
+  "Dir",
+  "TO Tengah (ms)",
+  "TO Push (ms)",
+  "Titik Awal",
+  "Titik Akhir",
+  "Waktu Tahan",
+  "Step (us)",
+  "Step Intvl (ms)",
+  "Titik Awal",
+  "Titik Akhir",
+  "Waktu Tahan",
+  "Step (us)",
+  "Step Intvl (ms)",
+  "Bunyi On (ms)",
+  "Bunyi Off (ms)",
+  "Tunda Force(ms)",
+  "Retry Loop (ms)",
+  "Reset Default",
+};
+
+const uint8_t CAL_GRP_CONVEYOR[] = { CalId::CONV_SPEED, CalId::CONV_DIR };
+const uint8_t CAL_GRP_SERVO1[] = { CalId::S1_AWAL, CalId::S1_AKHIR, CalId::S1_TAHAN, CalId::S1_STEP, CalId::S1_STEP_INTERVAL };
+const uint8_t CAL_GRP_SERVO2[] = { CalId::S2_AWAL, CalId::S2_AKHIR, CalId::S2_TAHAN, CalId::S2_STEP, CalId::S2_STEP_INTERVAL };
+const uint8_t CAL_GRP_BUZZER[] = { CalId::BUZZER_ON, CalId::BUZZER_OFF };
+const uint8_t CAL_GRP_WAKTU[] = { CalId::TO_TENGAH, CalId::TO_PUSH, CalId::FORCE_DELAY, CalId::LOOP_RETRY };
+const uint8_t CAL_GRP_RESET[] = { CalId::RESET_FAULT, CalId::RESET_DEFAULT };
+
+struct CalGroup { const char* judul; const uint8_t* id; uint8_t jumlah; };
+constexpr uint8_t CAL_GROUP_COUNT = 6;
+const CalGroup CAL_GROUPS[CAL_GROUP_COUNT] = {
+  { "SETTING: CONVEYOR", CAL_GRP_CONVEYOR, sizeof(CAL_GRP_CONVEYOR) },
+  { "SETTING: SERVO 1", CAL_GRP_SERVO1, sizeof(CAL_GRP_SERVO1) },
+  { "SETTING: SERVO 2", CAL_GRP_SERVO2, sizeof(CAL_GRP_SERVO2) },
+  { "SETTING: BUZZER", CAL_GRP_BUZZER, sizeof(CAL_GRP_BUZZER) },
+  { "SETTING: WAKTU", CAL_GRP_WAKTU, sizeof(CAL_GRP_WAKTU) },
+  { "SETTING: RESET", CAL_GRP_RESET, sizeof(CAL_GRP_RESET) },
+};
+const char* CAL_GROUP_LABELS[CAL_GROUP_COUNT] = { "Conveyor", "Servo 1", "Servo 2", "Buzzer", "Waktu", "Reset" };
+
+uint8_t calGroupCursor = 0;   // perangkat yang sedang dibuka
+uint8_t calCursor = 0;        // posisi DI DALAM perangkat itu
+
+void drawCalGroup() { drawListMenu("SETTING KALIBRASI", CAL_GROUP_LABELS, CAL_GROUP_COUNT, calGroupCursor); }
+
+// Nama dan state-nya SENGAJA dipertahankan (drawCalList / CAL_LIST): semua layar di bawahnya
+// kembali lewat `menuState = CAL_LIST; drawCalList();`, dan dengan begini mereka kembali ke
+// daftar perangkat yang tadi dibuka tanpa satu pun jalur keluar itu perlu diubah.
+void drawCalList() {
+  const CalGroup &g = CAL_GROUPS[calGroupCursor];
+  static const char* labels[CAL_COUNT];
+  for (uint8_t i = 0; i < g.jumlah; i++) labels[i] = CAL_LABELS[g.id[i]];
+  drawListMenu(g.judul, labels, g.jumlah, calCursor);
+}
 
 void drawConfirmReset() {
   lcdClear();
@@ -1787,28 +1872,37 @@ void handleParamKeyFeeder(char key) {
   drawParamMenuFeeder();
 }
 
+void handleCalGroupKey(char key) {
+  if (key == 'A') { calGroupCursor = (calGroupCursor == 0) ? CAL_GROUP_COUNT - 1 : calGroupCursor - 1; drawCalGroup(); }
+  else if (key == 'B') { calGroupCursor = (calGroupCursor + 1) % CAL_GROUP_COUNT; drawCalGroup(); }
+  else if (key == 'C') { menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); }
+  else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuFeeder(); }
+}
+
 void handleCalListKey(char key) {
-  if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
-  else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
+  const CalGroup &g = CAL_GROUPS[calGroupCursor];
+  if (key == 'A') { calCursor = (calCursor == 0) ? g.jumlah - 1 : calCursor - 1; drawCalList(); }
+  else if (key == 'B') { calCursor = (calCursor + 1) % g.jumlah; drawCalList(); }
   else if (key == 'C') {
-    if (calCursor == 0) {   // BARU -- Reset Fault, langsung eksekusi (tidak destruktif, gak perlu konfirmasi)
+    // Bercabang pada ID, bukan posisi -- posisi berubah tiap daftar disusun ulang, ID tidak.
+    uint8_t id = g.id[calCursor];
+    if (id == CalId::RESET_FAULT) {   // langsung eksekusi (tidak destruktif, tanpa konfirmasi)
       applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
       lcdPrint(0, 3, "Fault direset!      ");
       Serial.println("[CAL] Reset Fault dari menu LCD");
-    } else if (calCursor == 19) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
+    } else if (id == CalId::RESET_DEFAULT) { menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); }
     else {
-      selParam = calCursor;
-      // BARU: aktifkan test-live di layar Servo1/2 Step(8/13) ATAU Step Interval(9/14) --
-      // sama pola dgn hopperIntervalTestMode SORTER, supaya servo keliatan gerak live pas
-      // salah satu dari 2 parameter kecepatan ini diubah, bukan diam kayak sebelumnya.
-      servoIntervalTestMode = (selParam == 8 || selParam == 9 || selParam == 13 || selParam == 14);
-      servoIntervalTestWhich = (selParam == 8 || selParam == 9) ? 1 : 2;
+      selParam = id;
+      // Test-live di layar Step / Step Interval servo 1 dan 2 -- servo terlihat bergerak
+      // selagi salah satu dari dua parameter kecepatan itu diubah.
+      servoIntervalTestMode = (id == CalId::S1_STEP || id == CalId::S1_STEP_INTERVAL ||
+                               id == CalId::S2_STEP || id == CalId::S2_STEP_INTERVAL);
+      servoIntervalTestWhich = (id == CalId::S1_STEP || id == CalId::S1_STEP_INTERVAL) ? 1 : 2;
       if (servoIntervalTestMode && testServoCycleStage == TestServoCycleStage::NONE) startTestServoCycle(servoIntervalTestWhich);
-      // BARU: sabuk berjalan live selama di layar Conveyor Speed / Conveyor Dir.
-      // Ditolak kalau ada mekanisme lain yang sedang memegang sabuk -- dua pihak menulis
-      // satu aktuator yang sama itu kelas bug yang sudah berkali-kali menggigit di proyek ini.
+      // Sabuk berjalan live selama di layar Conveyor Speed / Dir. Ditolak kalau ada mekanisme
+      // lain yang sedang memegang sabuk -- dua pihak menulis satu aktuator yang sama.
       conveyorLiveTestMode = false;
-      if (selParam == 1 || selParam == 2) {
+      if (id == CalId::CONV_SPEED || id == CalId::CONV_DIR) {
         if (mainModeActive || pipelineStage != PipelineStage::MATI ||
             refillState != RefillState::IDLE || testLoopStage != TestLoopStage::OFF ||
             forceMiddleRefillActive) {
@@ -1821,7 +1915,7 @@ void handleCalListKey(char key) {
       }
       menuState = MenuState::JOG_PARAM; lcdClear(); drawParamMenuFeeder();
     }
-  } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuFeeder(); }
+  } else if (key == 'D') { menuState = MenuState::CAL_GROUP; drawCalGroup(); }
 }
 
 // --- LEVEL 1b: TEST I/O ---
@@ -1829,15 +1923,23 @@ struct IOTestItem { const char* label; uint8_t ch; bool autoControlled; };
 void drawTestIoCategory();
 
 // --- Kategori: Test Output ---
-constexpr uint8_t OUTPUT_TEST_COUNT = 7;
+// DIUBAH (2026-09-29, disamakan dengan Sorter atas permintaan operator):
+//   - Label memakai nama channel lengkap (LED_OPR, LED_RUN, ...) supaya sama dengan yang
+//     tertulis di skema/wiring, bukan singkatan yang harus diterjemahkan dulu.
+//   - RELAY_1 dan RELAY_2 dipindah ke SINI dari Test Modul -> Relay (layar itu dihapus).
+//     Relay adalah output digital biasa; di sini ia diuji dengan cara yang sama persis dengan
+//     LED dan buzzer, termasuk rate-limit 300ms beban induktif dan syarat IDLE.
+constexpr uint8_t OUTPUT_TEST_COUNT = 9;
 IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
-  {"OPR",    CH::LED_OPERATION, true},
-  {"RUN",    CH::LED_RUN,       true},
-  {"MANUAL", CH::LED_MANUAL,    true},
-  {"FAULT",  CH::LED_FAULT,     true},   // DIUBAH -- sekarang auto-controlled (lihat updateUniversalIndicators)
-  {"BUZZER", CH::BUZZER,        false},
-  {"DISP_AIN1", CH::DISP_AIN1,  false},
-  {"DISP_AIN2", CH::DISP_AIN2,  false},
+  {"LED_OPR",    CH::LED_OPERATION, true},
+  {"LED_RUN",    CH::LED_RUN,       true},
+  {"LED_MANUAL", CH::LED_MANUAL,    true},
+  {"LED_FAULT",  CH::LED_FAULT,     true},   // auto-controlled (lihat updateUniversalIndicators)
+  {"BUZZER",     CH::BUZZER,        false},
+  {"DISP_AIN1",  CH::DISP_AIN1,     false},
+  {"DISP_AIN2",  CH::DISP_AIN2,     false},
+  {"RELAY_1",    CH::RLY1,          false},
+  {"RELAY_2",    CH::RLY2,          false},
 };
 uint8_t outputTestCursor = 0;
 bool testOutputLastVal = false, testOutputFirstDraw = true;
@@ -2006,8 +2108,9 @@ void pcaSetServoUs(uint8_t channel, uint16_t us) {
   pwm.setPWM(channel, 0, duty);
 }
 
-constexpr uint8_t MODULE_TYPE_COUNT = 4;
-const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Relay", "Servo" };
+// DIUBAH (2026-09-29): "Relay" dipindah ke Test I/O -> Test Output (RELAY_1/RELAY_2).
+constexpr uint8_t MODULE_TYPE_COUNT = 3;
+const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Servo" };
 uint8_t moduleTypeCursor = 0;
 void drawModuleTypeSelect() { drawListMenu("TEST MODUL", MODULE_TYPE_LABELS, MODULE_TYPE_COUNT, moduleTypeCursor); }
 void handleModuleTypeKey(char key);
@@ -2085,30 +2188,6 @@ void handleTestModMotorDCKey(char key) {
   drawTestModMotorDC();
 }
 
-uint8_t testModRelaySel = 0;
-void drawTestModRelay() {
-  if (testModFirstDraw) {
-    lcdClear(); lcdPrint(0, 0, "MODUL: RELAY");
-    lcdPrint(0, 3, "C=pilih A=tgl D=kmb");
-    testModFirstDraw = false; testModLine1 = "\x01";
-  }
-  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
-  bool val = io.read(ch);
-  String line1 = "RLY" + String(testModRelaySel + 1) + " = " + String(val ? "HIGH" : "LOW");
-  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
-}
-void handleTestModRelayKey(char key) {
-  static uint32_t lastToggleMs = 0;
-  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
-  if (key == 'C') { testModRelaySel = (testModRelaySel + 1) % 2; }
-  else if (key == 'A') {
-    if (millis() - lastToggleMs < 300) return;
-    lastToggleMs = millis();
-    io.write(ch, !io.read(ch));
-  } else if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
-  drawTestModRelay();
-}
-
 uint8_t testModServoCh = 0;
 bool testModServoDetected = false;
 void drawTestModServo() {
@@ -2140,8 +2219,7 @@ void handleModuleTypeKey(char key) {
     switch (moduleTypeCursor) {
       case 0: menuState = MenuState::TEST_MOD_STEPPER; drawTestModStepper(); break;
       case 1: menuState = MenuState::TEST_MOD_MOTORDC; drawTestModMotorDC(); break;
-      case 2: menuState = MenuState::TEST_MOD_RELAY; drawTestModRelay(); break;
-      case 3: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
+      case 2: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
 }
@@ -2166,43 +2244,70 @@ void handleTestIoCategoryKey(char key) {
 }
 
 // --- LEVEL 1c: TEST COMMAND ---
-// BARU: field isLocalToggle -- item dgn ini true BUKAN opcode Modbus asli (opcode/testArg
-// diabaikan), tapi toggle fungsi lokal (TEST REFILL LOOP), lihat handleTestCmdListKey().
-struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; bool isLocalToggle; };
+// DIPERIKSA ULANG (2026-09-29), disamakan dengan Sorter:
+//   DIBUANG  SET_SPEED (test=200) dan SET_DIR (test=REV) -- keduanya MENIMPA kalibrasi (speed
+//            jadi 200, conveyor jadi MUNDUR) tanpa item untuk mengembalikannya, dan '#' di
+//            layar parameter mana pun menyimpan seluruh cfg ke NVS -- termasuk nilai uji itu.
+//   DITAMBAH START_MAIN dan STOP_MAIN. REQUEST_REFILL / ACK_TAKEN / FORCE_REFILL semuanya
+//            butuh MAIN, dan tanpa dua item ini ketiganya SELALU ditolak dari panel.
+//   REFILL_LOOP tetap toggle lokal (bukan opcode Modbus), gate GATE_LOKAL.
+// Label maksimal 15 karakter supaya muat setelah "> a. ". Petunjuk "C=kirim D=kembali" yang dulu
+// ditulis di baris 4 dibuang: ia MENIMPA baris daftar ketiga, sehingga item terakhir tidak
+// pernah terlihat saat kursor ada di situ. Tombolnya sama dengan semua layar daftar lain.
+//
+// Hasil ditulis di baris JUDUL: "OK, amati aksinya" atau "TOLAK: <alasan>". Dulu layar
+// menulis "Terkirim, amati aksi" PERSIS SAMA untuk command yang dijalankan maupun yang
+// ditolak -- penolakan hanya tercetak di Serial, jadi operator di panel tidak bisa
+// membedakan keduanya. Kolom `gate` dipakai untuk menyebut alasan penolakan yang paling
+// mungkin tanpa harus membuka Serial.
+enum CmdGate : uint8_t { GATE_NETRAL, GATE_MAIN, GATE_TEST, GATE_LOKAL };
+struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; CmdGate gate; };
+// URUTAN BAKU (2026-09-30) -- SAMA di keempat node dan di sorting_automation.py (file acuan):
+//   a START_MAIN   b STOP_MAIN   c RESET_FAULT      <- huruf ini tetap di SEMUA node
+//   lalu kelompok Produksi (hanya MAIN) -> Aksi (bebas mode) -> Uji (ditolak saat MAIN).
+// Jangan menyisipkan item di tengah tanpa menyamakan OPCODES di sorting_automation.py.
 constexpr uint8_t CMD_TEST_COUNT = 9;
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
-  {"REQUEST_REFILL",       Cmd::REQUEST_REFILL,     0, false},
-  {"SET_SPEED (test=200)", Cmd::SET_CONVEYOR_SPEED, 200, false},
-  {"SET_DIR (test=REV)",   Cmd::SET_CONVEYOR_DIR,   0, false},
-  {"ACK_PACKAGE_TAKEN",    Cmd::ACK_PACKAGE_TAKEN,  0, false},
-  {"FORCE_MIDDLE_REFILL",  Cmd::FORCE_MIDDLE_REFILL,0, false},
-  {"RESET_FAULT",          Cmd::RESET_FAULT,        0, false},
-  {"Test Srv1 M/M", Cmd::TEST_SERVO1_CYCLE, 0, false},
-  {"Test Srv2 M/M", Cmd::TEST_SERVO2_CYCLE, 0, false},
-  {"TEST REFILL LOOP (toggle)", Cmd::NONE, 0, true},
+  {"START_MAIN",      Cmd::START_MAIN,               0, GATE_NETRAL},
+  {"STOP_MAIN",       Cmd::STOP_MAIN,                0, GATE_NETRAL},
+  {"RESET_FAULT",     Cmd::RESET_FAULT,              0, GATE_NETRAL},
+  {"REQUEST_REFILL",  Cmd::REQUEST_REFILL,           0, GATE_MAIN},
+  {"ACK_TAKEN",       Cmd::ACK_PACKAGE_TAKEN,        0, GATE_MAIN},
+  {"FORCE_REFILL",    Cmd::FORCE_MIDDLE_REFILL,      0, GATE_MAIN},
+  {"SERVO1_CYCLE",    Cmd::TEST_SERVO1_CYCLE,        0, GATE_TEST},
+  {"SERVO2_CYCLE",    Cmd::TEST_SERVO2_CYCLE,        0, GATE_TEST},
+  {"REFILL_LOOP",     Cmd::NONE,                     0, GATE_LOKAL},
 };
 const char* CMD_TEST_LABELS_ONLY[CMD_TEST_COUNT];
 void buildCmdTestLabels() { for (uint8_t i = 0; i < CMD_TEST_COUNT; i++) CMD_TEST_LABELS_ONLY[i] = CMD_TEST_ITEMS[i].label; }
 uint8_t cmdTestCursor = 0;
+
 void drawTestCmdList() {
   buildCmdTestLabels();
   drawListMenu("TEST COMMAND", CMD_TEST_LABELS_ONLY, CMD_TEST_COUNT, cmdTestCursor);
-  lcdPrint(0, 3, "C=kirim D=kembali");
 }
+
 void handleTestCmdListKey(char key) {
   if (key == 'A') { cmdTestCursor = (cmdTestCursor == 0) ? CMD_TEST_COUNT - 1 : cmdTestCursor - 1; drawTestCmdList(); }
   else if (key == 'B') { cmdTestCursor = (cmdTestCursor + 1) % CMD_TEST_COUNT; drawTestCmdList(); }
   else if (key == 'C') {
     CmdTestItem &item = CMD_TEST_ITEMS[cmdTestCursor];
-    if (item.isLocalToggle) {
+    if (item.gate == GATE_LOKAL) {   // REFILL_LOOP -- toggle fungsi lokal, bukan opcode
       toggleTestRefillLoop();
-      lcdPrint(0, 3, testLoopStage != TestLoopStage::OFF ? "AKTIF, tekan tombol" : "Dimatikan");
-    } else {
-      Serial.printf("[TEST-CMD] Simulasi command dari 'node lain': opcode=%u (%s) arg=%u -- amati aksi fisik SEKARANG\n",
-                    (uint16_t)item.opcode, item.label, item.testArg);
-      applyCommand((uint16_t)item.opcode, item.testArg);
-      lcdPrint(0, 3, "Terkirim, amati aksi");
+      lcdPrint(0, 0, testLoopStage != TestLoopStage::OFF ? "LOOP AKTIF,tkn tombol" : "LOOP dimatikan");
+      return;
     }
+    Serial.printf("[TEST-CMD] Simulasi command dari 'node lain': opcode=%u (%s) arg=%u\n",
+                  (uint16_t)item.opcode, item.label, item.testArg);
+    bool diterima = applyCommand((uint16_t)item.opcode, item.testArg);
+    String hasil;
+    if (diterima)                                          hasil = "OK, amati aksinya";
+    else if (faultCode != 0 || currentState == NodeState::FAULT ||
+             currentState == NodeState::ESTOPPED)          hasil = "TOLAK: FAULT/ESTOP";
+    else if (item.gate == GATE_MAIN && !mainModeActive)    hasil = "TOLAK: belum MAIN";
+    else if (item.gate == GATE_TEST && mainModeActive)     hasil = "TOLAK: MAIN aktif";
+    else                                                   hasil = "TOLAK: lihat Serial";
+    lcdPrint(0, 0, hasil);
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuFeeder(); }
 }
 
@@ -2211,7 +2316,7 @@ void handleTopMenuKeyFeeder(char key) {
   else if (key == 'B') { topCursor = (topCursor + 1) % TOP_COUNT; drawTopMenuFeeder(); }
   else if (key == 'C') {
     switch (topCursor) {
-      case 0: menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); break;
+      case 0: menuState = MenuState::CAL_GROUP; calGroupCursor = 0; drawCalGroup(); break;
       case 1: menuState = MenuState::TEST_IO_CATEGORY; testIoCatCursor = 0; drawTestIoCategory(); break;
       case 2: menuState = MenuState::TEST_CMD_LIST; cmdTestCursor = 0; drawTestCmdList(); break;
       case 3: menuState = MenuState::SYS_INFO; sysInfoPage = 0; lcdClear(); drawSysInfo(); break;
@@ -2395,6 +2500,7 @@ void setup() {
   mb.addHreg(Reg::PIPELINE_STAGE, 0);           // BARU -- tahap pipeline produksi
   mb.addHreg(Reg::MIDDLE_ARRIVAL_COUNT, 0);     // BARU -- counter latch PROX_2, anti-kelewatan
   mb.onSetHreg(Reg::CMD, onCmdWrite);
+  mb.onRequestSuccess(onModbusRequestSukses);   // BARU -- watchdog dari request apa pun
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
 
@@ -2490,6 +2596,7 @@ void loop() {
         if (lcdPresent) drawTopMenuFeeder();
         Serial.println("[CAL] Masuk mode kalibrasi (command eksternal dijeda, logic fisik tetap jalan)");
       } else if (menuState == MenuState::TOP_SELECT) handleTopMenuKeyFeeder(key);
+      else if (menuState == MenuState::CAL_GROUP) handleCalGroupKey(key);
       else if (menuState == MenuState::CAL_LIST) handleCalListKey(key);
       else if (menuState == MenuState::JOG_PARAM) handleParamKeyFeeder(key);
       else if (menuState == MenuState::TEST_IO_CATEGORY) handleTestIoCategoryKey(key);
@@ -2502,7 +2609,6 @@ void loop() {
       else if (menuState == MenuState::TEST_MODULE_SELECT) handleModuleTypeKey(key);
       else if (menuState == MenuState::TEST_MOD_STEPPER) handleTestModStepperKey(key);
       else if (menuState == MenuState::TEST_MOD_MOTORDC) handleTestModMotorDCKey(key);
-      else if (menuState == MenuState::TEST_MOD_RELAY) handleTestModRelayKey(key);
       else if (menuState == MenuState::TEST_MOD_SERVO) handleTestModServoKey(key);
       else if (menuState == MenuState::TEST_CMD_LIST) handleTestCmdListKey(key);
       else if (menuState == MenuState::CONFIRM_RESET) handleConfirmResetKey(key);
@@ -2561,10 +2667,6 @@ void loop() {
     static uint32_t lastTestModRefresh = 0;
     if (millis() - lastTestModRefresh > 150) { lastTestModRefresh = millis(); drawTestModMotorDC(); }
   }
-  if (menuState == MenuState::TEST_MOD_RELAY && lcdPresent) {
-    static uint32_t lastTestModRefresh2 = 0;
-    if (millis() - lastTestModRefresh2 > 150) { lastTestModRefresh2 = millis(); drawTestModRelay(); }
-  }
   handleSafety();
   // BARU -- counter tombol konfirmasi. Sengaja DI LUAR blok bersyarat: ini murni pelaporan,
   // tidak menggerakkan aktuator, dan justru berguna saat node sedang FAULT/ESTOPPED (operator
@@ -2595,10 +2697,9 @@ void loop() {
 
   handleSerialCommand();
 
-  // DIPERBAIKI: timeout diperlebar dari 5000ms -- watchdog cuma reset saat command BARU
-  // dikirim, TIDAK ikut ter-reset oleh pembacaan status. Testing manual (baca status
-  // berulang sambil menunggu progres) wajar jeda lebih dari 5 detik -- nilai lama terlalu
-  // ketat. 30 detik cukup toleran, tetap berfungsi sbg pengaman komunikasi terputus total.
+  // Batas 30 detik tanpa request APA PUN dari master (baca atau tulis -- lihat
+  // onModbusRequestSukses()). Dulu hanya command yang dihitung, sehingga node yang RUNNING
+  // lama tanpa command jatuh FAULT walaupun master terus membacanya.
   constexpr uint32_t COMM_TIMEOUT_MS = 30000;
   if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > COMM_TIMEOUT_MS) {
     currentState = NodeState::FAULT; faultCode = (uint16_t)FaultCode::COMM_TIMEOUT;
@@ -2634,10 +2735,23 @@ void loop() {
     static uint32_t lastLcdRefresh = 0;
     if (millis() - lastLcdRefresh > 500) {
       lastLcdRefresh = millis();
-      lcdPrint(0, 0, "[AUTO] " + activityText());
-      lcdPrint(0, 1, "State:" + String(stateText(currentState)));
-      lcdPrint(0, 2, "Refill:" + String((int)refillState));
-      lcdPrint(0, 3, "Tahan* utk kalibrasi");
+      // DIUBAH (2026-09-29), pola sama dengan Sorter:
+      //   baris 1  DISPENSER [AUTO]
+      //   baris 2  <tahap pipeline>   (MAIN)   atau   TEST : <aktivitas>
+      //   baris 3  State : IDLE
+      //   baris 4  Tengah:ADA   Ujung:--
+      // "DISPENSER [AUTO]" sudah 16 kolom -- aktivitas tidak muat di baris 1 seperti di Sorter,
+      // jadi pindah ke baris 2. Baris 2 juga menggantikan "Refill:<angka>": itu refillState,
+      // FSM LAMA yang sejak pipeline masuk ke firmware tidak dipakai jalur produksi lagi, jadi
+      // angkanya diam di 0 dan menyesatkan. Tahap pipeline-lah yang menunjukkan di mana siklus
+      // produksi sedang berada (mis. "SIAP ISI (ready)" atau "tunggu diambil arm").
+      // Baris 4: sensor TENGAH (PROX_2) dan UJUNG (PROX_1), dari register yang sama dengan
+      // yang dibaca Orange Pi -- panel dan Modbus tidak pernah berbeda pendapat.
+      lcdPrint(0, 0, "DISPENSER [AUTO]");
+      lcdPrint(0, 1, mainModeActive ? String(pipelineText(pipelineStage)) : ("TEST : " + aktivitasTest()));
+      lcdPrint(0, 2, "State : " + String(stateText(currentState)));
+      lcdPasangan(3, "Tengah", "T", mb.Hreg(Reg::MIDDLE_PACKAGE_PRESENT) ? "ADA" : "--",
+                     "Ujung", "U", mb.Hreg(Reg::UJUNG_PACKAGE_PRESENT) ? "ADA" : "--");
     }
   }
 }

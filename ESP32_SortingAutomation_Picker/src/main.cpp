@@ -55,6 +55,32 @@ void lcdClear() {
   for (uint8_t i = 0; i < LcdCfg::ROWS; i++) lcdCacheValid[i] = false;
 }
 
+// BARU (2026-09-29): teks kiri rata kiri, teks kanan rata kanan, dalam satu baris.
+void lcdKiriKanan(uint8_t row, const String& kiri, const String& kanan) {
+  int celah = (int)LcdCfg::COLS - (int)kiri.length() - (int)kanan.length();
+  if (celah < 1) celah = 1;   // tetap dipisah; lcdPrint() memotong sisanya di kolom terakhir
+  String baris = kiri;
+  for (int i = 0; i < celah; i++) baris += ' ';
+  lcdPrint(0, row, baris + kanan);
+}
+
+// BARU (2026-09-29): dua pasangan "label : nilai" -- kiri rata kiri, kanan rata kanan.
+// Format lengkap "Label : nilai" sering tidak muat di 20 kolom, jadi dicoba bertingkat --
+// lengkap, lalu tanpa spasi di sekitar ':', lalu label singkat -- dan dipakai tingkat pertama
+// yang muat. Yang dikorbankan selalu labelnya, bukan nilainya. Sama persis dengan Sorter.
+void lcdPasangan(uint8_t row, const char* labelKiri, const char* singkatKiri, const String& nilaiKiri,
+                 const char* labelKanan, const char* singkatKanan, const String& nilaiKanan) {
+  String kiri, kanan;
+  for (uint8_t tingkat = 0; tingkat < 3; tingkat++) {
+    const char* pemisah = (tingkat == 0) ? " : " : ":";
+    kiri  = String(tingkat < 2 ? labelKiri  : singkatKiri)  + pemisah + nilaiKiri;
+    kanan = String(tingkat < 2 ? labelKanan : singkatKanan) + pemisah + nilaiKanan;
+    if (kiri.length() + kanan.length() + 1 <= LcdCfg::COLS) break;
+  }
+  lcdKiriKanan(row, kiri, kanan);
+}
+
+
 #define FW_VERSION "v.01.00.25082026.21.17"
 constexpr const char* FW_BUILD = __DATE__ " " __TIME__;
 
@@ -115,14 +141,18 @@ struct Pose { uint16_t us[ServoCfg::NUM_JOINTS]; };
 // (pose 1/2 dipakai produksi), tapi setelah jalur satuan dibuang lubang itu tidak ada lagi.
 constexpr uint8_t NUM_POSES = 3;
 const char* POSE_NAMES[NUM_POSES] = { "HOME", "PICKUP", "LIFT" };
-// Ketiganya sengaja sama dengan posisi netral: belum ada yang tahu di mana titik ambil dan
-// titik taruh sebelum dikalibrasi, dan menebaknya berarti lengan mengayun ke tempat yang
-// bisa menabrak. Operator wajib menyetel slot 1 dan 2 sebelum MOVE_PACKAGE ada artinya.
-Pose POSES[NUM_POSES] = {
+// Ketiganya sengaja SAMA: belum ada yang tahu di mana titik ambil dan titik taruh sebelum
+// dikalibrasi, dan menebaknya berarti lengan mengayun ke tempat yang bisa menabrak. Operator
+// wajib menyetel slot 1 dan 2 sebelum MOVE_PACKAGE ada artinya. Pose di NVS ("poses3") menang.
+// DIPERBAIKI (2026-09-30): satu sumber default -- dulu Reset Default memakai array tersendiri
+// berisi nilai LAIN (pose 1 & 2 = 1200/1800,...), jadi hasil reset tidak sama dengan board baru
+// dan lengan bisa melompat ke angka yang tidak pernah dikalibrasi siapa pun.
+const Pose POSES_DEFAULT[NUM_POSES] = {
   {{1500,1500,1500,1500,1500,1000}},   // 0 HOME
   {{1500,1500,1500,1500,1500,1000}},   // 1 PACKAGE_PICKUP
   {{1500,1500,1500,1500,1500,1000}},   // 2 LIFT_LOAD
 };
+Pose POSES[NUM_POSES] = { POSES_DEFAULT[0], POSES_DEFAULT[1], POSES_DEFAULT[2] };
 int16_t PICK_OFFSET[ServoCfg::NUM_JOINTS]      = {0,0,-200,0,0,600};
 int16_t PLACE_OFFSET[ServoCfg::NUM_JOINTS]     = {0,0,-200,0,0,1000};
 int16_t CLEARANCE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,300,0,0,0};
@@ -139,6 +169,56 @@ int16_t CLEARANCE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,300,0,0,0};
 // keluar dari bawah package. Selama masih berisi nol, siklus MOVE_PACKAGE akan meletakkan
 // package lalu langsung menyeretnya pergi.
 int16_t POST_PLACE_OFFSET[ServoCfg::NUM_JOINTS] = {0,0,0,0,0,0};
+
+// ============================================================
+// GERAKAN & ADEGAN (BARU 2026-09-30)
+//
+// Satu siklus Picker = Home -> Pick -> Home -> Place -> Home. Tiap perpindahan pose adalah satu
+// GERAKAN (ada 4). Tiap gerakan punya 20 slot ADEGAN; adegan yang ON menggerakkan SATU joint ke
+// SATU nilai (us, absolut). Slot dijalankan berurutan 1..20, yang OFF dilewati, lalu lengan
+// menuju pose tujuan gerakan itu:
+//
+//   Home - adegan 1 - adegan 2 - ... - adegan 13 - (14-20 OFF, dilewati) - Pick
+//
+// Kenapa: GOTO_POSE menggerakkan SEMUA joint bersamaan menuju tujuan, jadi jalur di antaranya
+// ditentukan kebetulan -- bisa menyapu package, rangka, atau conveyor. Dengan sendok yang
+// mengangkat dari bawah, urutan gerak (turun dulu, maju, baru naik) justru yang menentukan
+// berhasil tidaknya. Adegan membuat urutan itu eksplisit dan bisa disetel satu per satu.
+//
+// DEFAULT: semua adegan OFF, nilainya = posisi HOME yang tersimpan (pose 0). Gerakan tanpa
+// adegan ON langsung menuju pose tujuan -- persis GOTO_POSE seperti sebelum fitur ini ada.
+// TIDAK ADA angka yang ditanam di kode: angka yang tidak berasal dari lengan ini sendiri membuat
+// joint MELOMPAT begitu adegannya dinyalakan.
+//
+// Gerak terakhir ke pose tujuan dijalankan SEMUA joint bersamaan (seperti GOTO_POSE). Kalau
+// urutannya penting di situ, isi adegan terakhir dengan nilai yang sama dengan pose tujuan --
+// gerak akhir otomatis lalu tidak menggerakkan apa pun.
+//
+// PICK_OFFSET/PLACE_OFFSET tetap ada untuk perintah manual PICK/PLACE, tapi MOVE_PACKAGE tidak
+// memakai offset apa pun. CLEARANCE dan POST_PLACE tidak dipakai lagi.
+// ============================================================
+constexpr uint8_t NUM_GERAKAN = 4;
+constexpr uint8_t SLOT_ADEGAN = 20;
+struct Adegan { uint8_t aktif; uint8_t joint; uint16_t us; };
+struct Gerakan { Adegan adegan[SLOT_ADEGAN]; };
+const char* GERAKAN_NAMA[NUM_GERAKAN] = { "Home>Pick", "Pick>Home", "Home>Place", "Place>Home" };
+const uint8_t GERAKAN_ASAL[NUM_GERAKAN]   = { 0, 1, 0, 2 };   // pose tempat gerakan dimulai
+const uint8_t GERAKAN_TUJUAN[NUM_GERAKAN] = { 1, 0, 2, 0 };   // pose yang dituju sesudah adegan terakhir
+Gerakan GERAKAN[NUM_GERAKAN];   // diisi isiGerakanDefault() lalu NVS -- lihat loadPosesFromNvs()
+int8_t  gerakanJalan = -1;      // gerakan yang sedang dijalankan, -1 = tidak ada
+uint8_t adeganKe = 0;           // slot BERIKUTNYA yang diperiksa
+uint8_t gerakanBatas = 0xFF;    // hanya slot di bawah batas ini; 0xFF = semua slot + pose tujuan
+
+Adegan adeganKosong() { return {0, 0, POSES[0].us[0]}; }   // OFF, joint 0, nilai = HOME
+void isiGerakanDefault() {
+  for (uint8_t g = 0; g < NUM_GERAKAN; g++)
+    for (uint8_t s = 0; s < SLOT_ADEGAN; s++) GERAKAN[g].adegan[s] = adeganKosong();
+}
+uint8_t jumlahAktif(uint8_t g) {
+  uint8_t n = 0;
+  for (uint8_t s = 0; s < SLOT_ADEGAN; s++) if (GERAKAN[g].adegan[s].aktif) n++;
+  return n;
+}
 
 uint16_t currentUs[ServoCfg::NUM_JOINTS];
 uint16_t targetUs[ServoCfg::NUM_JOINTS];
@@ -180,17 +260,19 @@ uint16_t rampSteps = 15;        // jumlah "langkah update" utk naik/turun kecepa
 uint16_t moveStepCount[ServoCfg::NUM_JOINTS] = {0};   // hitung sudah berapa kali joint ini di-update sejak mulai gerak
 bool jointWasMoving[ServoCfg::NUM_JOINTS] = {false};
 
-enum class QCmd : uint8_t { GOTO_POSE, PICK, PLACE, CLEARANCE, POST_PLACE };
-struct QItem { QCmd cmd; uint8_t poseIdx; };
+// DIUBAH (2026-09-30): +GERAKAN (arg = nomor gerakan, batas = slot batas) dan +JOINT (arg =
+// joint, us = tujuan; satu joint saja -- dipakai layar setel & uji adegan).
+enum class QCmd : uint8_t { GOTO_POSE, PICK, PLACE, CLEARANCE, POST_PLACE, GERAKAN, JOINT };
+struct QItem { QCmd cmd; uint8_t arg; uint8_t batas; uint16_t us; };
 QItem cmdQueue[8]; uint8_t qHead = 0, qTail = 0;
 bool ackPending = false; uint16_t pendingAckSeq = 0;
 
 // --- Menu state (dideklarasikan di sini, SEBELUM onCmdWrite, supaya urutan kompilasi benar) ---
-enum class MenuState { NONE, TOP_SELECT, CAL_LIST, JOG_JOINT, WAIT_SAVE_SLOT, JOG_OFFSET, JOG_SPEED,
+enum class MenuState { NONE, TOP_SELECT, CAL_GROUP, CAL_LIST, JOG_JOINT, WAIT_SAVE_SLOT, JOG_OFFSET, JOG_SPEED,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
                         TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
-                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET,
-                        TEST_GERAKAN , SYS_INFO};
+                        TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET,
+                        TEST_GERAKAN, GERAKAN_PILIH, ADEGAN_LIST, ADEGAN_EDIT, TEST_ADEGAN, SYS_INFO};
 MenuState menuState = MenuState::NONE;
 
 // BARU (2026-09-22): layar Info Sistem didefinisikan tepat sebelum loop() -- di titik itu
@@ -276,33 +358,112 @@ void updateTrajectory() {
   wasMoving = moving;
 }
 
-void enqueue(QCmd c, uint8_t poseIdx = 0) {
+void enqueue(QCmd c, uint8_t arg = 0, uint8_t batas = 0xFF, uint16_t us = 0) {
   uint8_t next = (qTail + 1) % 8;
   if (next == qHead) return;
-  cmdQueue[qTail] = {c, poseIdx}; qTail = next;
+  cmdQueue[qTail] = {c, arg, batas, us}; qTail = next;
+}
+
+// Satu siklus MOVE_PACKAGE: Home -> Pick -> Home -> Place -> Home, lewat keempat gerakan.
+// Dimulai dengan GOTO HOME karena gerakan 0 dirancang dari HOME; kalau lengan sudah di sana,
+// langkah itu tidak menggerakkan apa pun.
+void antrekanSiklusPenuh() {
+  enqueue(QCmd::GOTO_POSE, 0);
+  for (uint8_t i = 0; i < NUM_GERAKAN; i++) enqueue(QCmd::GERAKAN, i);
+}
+
+// Uji satu gerakan: ke pose ASAL dulu, lalu jalankan. batas < 0xFF = hanya slot di bawah
+// `batas`, TANPA pose tujuan -- membawa lengan ke keadaan tepat sebelum satu adegan.
+void antrekanUjiGerakan(uint8_t idx, uint8_t batas = 0xFF) {
+  enqueue(QCmd::GOTO_POSE, GERAKAN_ASAL[idx]);
+  enqueue(QCmd::GERAKAN, idx, batas);
 }
 // BARU: lacak aksi yang SEDANG dieksekusi -- utk tampilan aktivitas spesifik di LCD
 QCmd currentAction = QCmd::GOTO_POSE;
 uint8_t currentActionPoseIdx = 0;
 
+// Gerakkan SATU joint ke `us`, joint lain tetap di posisinya sekarang.
+void gerakSatuJoint(uint8_t joint, uint16_t us) {
+  uint16_t target[ServoCfg::NUM_JOINTS];
+  memcpy(target, currentUs, sizeof(target));
+  target[joint] = us;
+  startMoveAbs(target, 0);
+}
+
+void selesaiGerakan() {
+  gerakanJalan = -1;
+  mb.Hreg(Reg::GERAKAN_AKTIF, 0xFF);
+  mb.Hreg(Reg::ADEGAN_KE, 0);
+}
+
 void processQueue() {
-  if (moving || qHead == qTail) return;
+  if (moving) return;
+
+  // Gerakan yang sedang berjalan didahulukan: adegan ON dijalankan satu per satu, masing-masing
+  // baru dimulai setelah gerakan servo sebelumnya selesai. Slot OFF dilewati tanpa menunggu.
+  if (gerakanJalan >= 0) {
+    const Gerakan &g = GERAKAN[gerakanJalan];
+    uint8_t batas = (gerakanBatas < SLOT_ADEGAN) ? gerakanBatas : SLOT_ADEGAN;
+    while (adeganKe < batas && !g.adegan[adeganKe].aktif) adeganKe++;
+    if (adeganKe < batas) {
+      const Adegan &a = g.adegan[adeganKe];
+      adeganKe++;
+      mb.Hreg(Reg::ADEGAN_KE, adeganKe);
+      gerakSatuJoint(a.joint, a.us);
+      return;
+    }
+    uint8_t idx = (uint8_t)gerakanJalan;
+    bool penuh = (gerakanBatas == 0xFF);
+    selesaiGerakan();
+    if (penuh) {   // semua adegan selesai -> pose tujuan
+      uint8_t p = GERAKAN_TUJUAN[idx];
+      currentAction = QCmd::GOTO_POSE; currentActionPoseIdx = p;
+      poseSedangDituju = (int8_t)p;
+      startMoveAbs(POSES[p].us, 800);
+      if (p == 2) triggerBuzzerBeep();   // notifikasi: package diletakkan
+      return;
+    }
+  }
+
+  if (qHead == qTail) return;
   QItem item = cmdQueue[qHead]; qHead = (qHead + 1) % 8;
-  currentAction = item.cmd; currentActionPoseIdx = item.poseIdx;   // BARU
+  currentAction = item.cmd; currentActionPoseIdx = item.arg;   // BARU
   switch (item.cmd) {
-    case QCmd::GOTO_POSE: poseSedangDituju = (int8_t)item.poseIdx; startMoveAbs(POSES[item.poseIdx].us, 800); break;
+    case QCmd::GOTO_POSE: poseSedangDituju = (int8_t)item.arg; startMoveAbs(POSES[item.arg].us, 800); break;
     case QCmd::PICK:  startMoveDelta(PICK_OFFSET, 400); break;
     case QCmd::PLACE: startMoveDelta(PLACE_OFFSET, 400); triggerBuzzerBeep(); break;   // BARU -- notifikasi: package diletakkan
     case QCmd::CLEARANCE: startMoveDelta(CLEARANCE_OFFSET, 400); break;
     case QCmd::POST_PLACE: startMoveDelta(POST_PLACE_OFFSET, 400); break;
+    case QCmd::GERAKAN:
+      gerakanJalan = (int8_t)item.arg; adeganKe = 0; gerakanBatas = item.batas;
+      mb.Hreg(Reg::GERAKAN_AKTIF, item.arg);
+      mb.Hreg(Reg::ADEGAN_KE, 0);
+      processQueue();   // langsung mulai adegan ON pertama (atau pose tujuan kalau tidak ada)
+      break;
+    case QCmd::JOINT: gerakSatuJoint(item.arg, item.us); break;
   }
 }
 void checkSequenceComplete() {
-  if (ackPending && qHead == qTail && !moving) {
+  // gerakanJalan ikut dicek: di antara dua adegan, antrian kosong dan lengan diam sesaat --
+  // tanpa ini ack MOVE_PACKAGE terkirim di tengah siklus.
+  if (ackPending && qHead == qTail && !moving && gerakanJalan < 0) {
     ackPending = false; mb.Hreg(Reg::CMD_ACK_SEQ, pendingAckSeq);
     triggerBuzzerBeep();   // BARU -- notifikasi: siklus selesai, sudah kembali Home
   }
 }
+
+// Data gerakan dari NVS diperiksa sebelum dipakai: flag ON/OFF selain 0/1, joint di luar 0-5,
+// atau nilai di luar rentang servo berarti blob rusak atau berasal dari versi lain.
+// Menjalankannya bisa menggerakkan lengan ke mana saja, jadi semua adegan dibiarkan OFF.
+bool gerakanValid(const Gerakan *daftar) {
+  for (uint8_t g = 0; g < NUM_GERAKAN; g++)
+    for (uint8_t s = 0; s < SLOT_ADEGAN; s++) {
+      const Adegan &a = daftar[g].adegan[s];
+      if (a.aktif > 1 || a.joint >= ServoCfg::NUM_JOINTS || a.us < ServoCfg::MIN_US || a.us > ServoCfg::MAX_US) return false;
+    }
+  return true;
+}
+void saveGerakanToNvs() { prefs.begin("picker_cal", false); prefs.putBytes("gerakan20", GERAKAN, sizeof(GERAKAN)); prefs.end(); }
 
 void loadPosesFromNvs() {
   prefs.begin("picker_cal", true);
@@ -316,6 +477,14 @@ void loadPosesFromNvs() {
   if (prefs.isKey("place")) prefs.getBytes("place", PLACE_OFFSET, sizeof(PLACE_OFFSET));
   if (prefs.isKey("clear")) prefs.getBytes("clear", CLEARANCE_OFFSET, sizeof(CLEARANCE_OFFSET));
   if (prefs.isKey("postplace")) prefs.getBytes("postplace", POST_PLACE_OFFSET, sizeof(POST_PLACE_OFFSET));
+  // BARU (2026-09-30): SESUDAH pose dimuat -- nilai default adegan = HOME yang tersimpan.
+  isiGerakanDefault();
+  if (prefs.isKey("gerakan20") && prefs.getBytesLength("gerakan20") == sizeof(GERAKAN)) {
+    Gerakan tmp[NUM_GERAKAN];
+    prefs.getBytes("gerakan20", tmp, sizeof(tmp));
+    if (gerakanValid(tmp)) memcpy(GERAKAN, tmp, sizeof(GERAKAN));
+    else Serial.println("[NVS] Data gerakan TIDAK VALID -- semua adegan OFF");
+  }
   if (prefs.isKey("trajStep")) trajStepUs = prefs.getUShort("trajStep", trajStepUs);
   if (prefs.isKey("trajIntv")) trajStepIntervalMs = prefs.getUShort("trajIntv", trajStepIntervalMs);
   if (prefs.isKey("rampMin")) rampMinStepUs = prefs.getUShort("rampMin", rampMinStepUs);   // BARU
@@ -351,11 +520,8 @@ void resetAllToDefault() {
   prefs.begin("picker_cal", false);
   prefs.clear();
   prefs.end();
-  Pose defaultPoses[4] = {
-    {{1500,1500,1500,1500,1500,1000}}, {{1200,1600,1400,1500,1500,1000}},
-    {{1800,1600,1400,1500,1500,1000}}, {{1500,1300,1700,1500,1500,1000}},
-  };
-  memcpy(POSES, defaultPoses, sizeof(POSES));
+  memcpy(POSES, POSES_DEFAULT, sizeof(POSES));
+  isiGerakanDefault();   // BARU -- semua adegan OFF, nilai = HOME default
   int16_t defPick[ServoCfg::NUM_JOINTS] = {0,0,-200,0,0,600};
   int16_t defPlace[ServoCfg::NUM_JOINTS] = {0,0,-200,0,0,1000};
   int16_t defClear[ServoCfg::NUM_JOINTS] = {0,0,300,0,0,0};
@@ -398,8 +564,37 @@ String activityText() {
     case QCmd::PLACE: return "Meletakkan (Place)";
     case QCmd::CLEARANCE: return "Naik (Clearance)";
     case QCmd::POST_PLACE: return "Post-Place";
+    case QCmd::GERAKAN:
+      return String(GERAKAN_NAMA[currentActionPoseIdx]) + " adegan " + String(adeganKe);
+    case QCmd::JOINT: return "Uji joint " + String(currentActionPoseIdx);
   }
   return "Bergerak";
+}
+
+// BARU (2026-09-29): teks aktivitas untuk baris 1 layar utama, maksimal 6 karakter.
+// "PICKER [AUTO]" sudah 13 kolom; activityText() bisa sampai 18 karakter ("Meletakkan (Place)")
+// dan terpotong di tengah kata. activityText() tetap dipakai layar Test Gerakan yang punya
+// satu baris penuh untuknya. Urutan & cabang sama persis dengan activityCode().
+const char* activityPendek() {
+  if (currentState == NodeState::FAULT) return "FAULT!";
+  if (currentState == NodeState::ESTOPPED) return "ESTOP!";
+  if (!moving) return "Diam";
+  switch (currentAction) {
+    case QCmd::GOTO_POSE:
+      switch (currentActionPoseIdx) {
+        case 0: return "Home";
+        case 1: return "Pickup";
+        case 2: return "Lift";
+      }
+      return "Gerak";
+    case QCmd::PICK: return "Ambil";
+    case QCmd::PLACE: return "Taruh";
+    case QCmd::CLEARANCE: return "Naik";
+    case QCmd::POST_PLACE: return "Lepas";
+    case QCmd::GERAKAN: return "Adegan";
+    case QCmd::JOINT: return "Joint";
+  }
+  return "Gerak";
 }
 
 // BARU: versi kode numerik dari activityText() -- dikirim ke register Modbus (Lapis 2)
@@ -419,6 +614,8 @@ ActivityCode activityCode() {
     case QCmd::PLACE: return ActivityCode::MELETAKKAN;
     case QCmd::CLEARANCE: return ActivityCode::NAIK_CLEARANCE;
     case QCmd::POST_PLACE: return ActivityCode::POST_PLACE_GERAK;
+    case QCmd::GERAKAN: return ActivityCode::ADEGAN_GERAK;
+    case QCmd::JOINT: return ActivityCode::BERGERAK;
   }
   return ActivityCode::BERGERAK;
 }
@@ -482,10 +679,12 @@ void handleTestButtons() {
   lastBtn = cur;
 }
 
-void applyCommand(uint16_t opcode, uint16_t arg) {
+// DIUBAH (2026-09-29): true = diterima & dijalankan, false = DITOLAK -- dipakai layar
+// Test Command untuk menampilkan hasilnya di panel. Pemanggil lama boleh mengabaikannya.
+bool applyCommand(uint16_t opcode, uint16_t arg) {
   switch ((Cmd)opcode) {
     case Cmd::START_MAIN:
-      if (blockIfFaulted("START_MAIN")) return;
+      if (blockIfFaulted("START_MAIN")) return false;
       mainModeActive = true;
       Serial.println("[CMD] START_MAIN -- MAIN aktif, command manual override diblokir sampai STOP_MAIN");
       break;
@@ -500,16 +699,16 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // BARU: command "manual override" di bawah DITOLAK TOTAL selama mainModeActive --
     // Orange Pi wajib STOP_MAIN dulu.
     case Cmd::GOTO_HOME:
-      if (mainModeActive) { Serial.println("[CMD] GOTO_HOME ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
-      if (blockIfFaulted("GOTO_HOME")) return;
+      if (mainModeActive) { Serial.println("[CMD] GOTO_HOME ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      if (blockIfFaulted("GOTO_HOME")) return false;
       enqueue(QCmd::GOTO_POSE, 0);
       break;
     case Cmd::GOTO_POSE_N:
-      if (mainModeActive) { Serial.println("[CMD] GOTO_POSE_N ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
-      if (blockIfFaulted("GOTO_POSE_N")) return;
+      if (mainModeActive) { Serial.println("[CMD] GOTO_POSE_N ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      if (blockIfFaulted("GOTO_POSE_N")) return false;
       if (arg >= NUM_POSES) {
         Serial.printf("[CMD] GOTO_POSE_N ditolak -- slot %u tidak ada (hanya 0=HOME 1=PICKUP 2=LIFT)\n", arg);
-        return;
+        return false;
       }
       enqueue(QCmd::GOTO_POSE, (uint8_t)arg);
       Serial.printf("[CMD] GOTO_POSE_N -> pose %u (%s)\n", arg, POSE_NAMES[arg]);
@@ -520,30 +719,31 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // reject. Opcode 4 SENGAJA gak dipakai ulang (lihat registers.h), biar nomor command lain
     // (PICK=5 dst) gak geser/pecah kompatibilitas Modbus yang sudah ada.
     case Cmd::PICK:
-      if (mainModeActive) { Serial.println("[CMD] PICK ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
-      if (blockIfFaulted("PICK")) return;
+      if (mainModeActive) { Serial.println("[CMD] PICK ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      if (blockIfFaulted("PICK")) return false;
       enqueue(QCmd::PICK);
       break;
     case Cmd::PLACE:
-      if (mainModeActive) { Serial.println("[CMD] PLACE ditolak -- MAIN aktif, STOP_MAIN dulu"); return; }
-      if (blockIfFaulted("PLACE")) return;
+      if (mainModeActive) { Serial.println("[CMD] PLACE ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      if (blockIfFaulted("PLACE")) return false;
       enqueue(QCmd::PLACE);
       break;
     // BARU: angkat 1 package (batch objek) dari posisi ujung conveyor (pose1=PACKAGE_PICKUP)
     // ke Lift Load Position STOCKER (pose2=LIFT_LOAD). Dipicu Orange Pi saat SORTER.PASS_COUNT
     // capai batas batch -- Orange Pi kirim RUN_FULL_CYCLE ke STOCKER SETELAH ack command ini.
     case Cmd::MOVE_PACKAGE:
-      if (!mainModeActive) { Serial.println("[CMD] MOVE_PACKAGE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); return; }
-      if (blockIfFaulted("MOVE_PACKAGE")) return;
-      enqueue(QCmd::GOTO_POSE, 0);
-      enqueue(QCmd::CLEARANCE);
+      if (!mainModeActive) { Serial.println("[CMD] MOVE_PACKAGE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); return false; }
+      if (blockIfFaulted("MOVE_PACKAGE")) return false;
+      // DIUBAH (2026-09-30): Home -> Pick -> Home -> Place -> Home lewat keempat gerakan.
       triggerBuzzerBeep();
-      enqueue(QCmd::GOTO_POSE, 1);
-      enqueue(QCmd::PICK);
-      enqueue(QCmd::GOTO_POSE, 2);
-      enqueue(QCmd::PLACE);
-      enqueue(QCmd::POST_PLACE);
-      enqueue(QCmd::GOTO_POSE, 0);
+      antrekanSiklusPenuh();
+      break;
+    case Cmd::RUN_GERAKAN:
+      if (mainModeActive) { Serial.println("[CMD] RUN_GERAKAN ditolak -- MAIN aktif, STOP_MAIN dulu"); return false; }
+      if (blockIfFaulted("RUN_GERAKAN")) return false;
+      if (arg >= NUM_GERAKAN) { Serial.printf("[CMD] RUN_GERAKAN ditolak -- gerakan %u tidak ada (0-3)\n", arg); return false; }
+      antrekanUjiGerakan((uint8_t)arg);
+      Serial.printf("[CMD] RUN_GERAKAN %u (%s, %u adegan ON)\n", arg, GERAKAN_NAMA[arg], jumlahAktif(arg));
       break;
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb sebelum di-nol-kan
@@ -554,8 +754,28 @@ void applyCommand(uint16_t opcode, uint16_t arg) {
     // kalau mau bertahan setelah reboot, lihat saveSpeedToNvs()).
     case Cmd::SET_TRAJ_STEP:          trajStepUs = (uint16_t)constrain(arg, 1, 500); break;
     case Cmd::SET_TRAJ_STEP_INTERVAL: trajStepIntervalMs = (uint16_t)constrain(arg, 5, 200); break;
-    default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); break;
+    default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); return false;
   }
+  return true;
+}
+
+// BARU (2026-09-30): watchdog komunikasi (COMM_TIMEOUT) diperbarui oleh SETIAP request Modbus
+// yang sukses untuk node ini -- baca maupun tulis -- bukan hanya command.
+//
+// Dulu hanya onCmdWrite() yang memperbaruinya. Akibatnya node yang RUNNING lama tanpa menerima
+// command jatuh ke FAULT COMM_TIMEOUT setelah 30 detik, walaupun master hidup dan terus
+// membacanya. Di produksi itu PASTI terjadi: Sorter RUNNING sepanjang shift, sementara di
+// antara dua batch master hanya MEMBACA PASS_COUNT dan MENULIS CLASSIFY_IS_REJECT -- tidak ada
+// satu pun command. Arm Picker yang siklus MOVE_PACKAGE-nya lebih dari 30 detik, dan homing
+// Stocker, kena masalah yang sama di tengah gerakan.
+//
+// Maksud watchdog ini adalah "master masih hidup", dan request apa pun membuktikannya.
+// onRequestSuccess() dipanggil library SETELAH cek slave ID, jadi hanya request untuk node ini
+// yang dihitung. modbusEverUsed SENGAJA tidak disetel di sini: watchdog tetap baru aktif
+// setelah command pertama, sama seperti sebelumnya.
+Modbus::ResultCode onModbusRequestSukses(Modbus::FunctionCode fc, const Modbus::RequestData data) {
+  lastRs485Rx = millis();
+  return Modbus::EX_SUCCESS;
 }
 
 uint16_t onCmdWrite(TRegister* reg, uint16_t val) {
@@ -614,13 +834,58 @@ void drawTopMenu() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-// BARU: "Reset Fault" jadi item pertama -- dulu cuma bisa dipicu lewat menu "Test Command"
-// yang terkubur, gak gampang ditemukan operator pas node FAULT.
-constexpr uint8_t CAL_COUNT = 9;   // DIUBAH 8 -> 9, item "Test Gerakan" ditambahkan
-const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault", "Pose (Home/Pickup/Lift)", "Pick Offset", "Place Offset", "Clearance Offset", "Post-Place Offset", "Speed (Step/Interval)", "Test Gerakan", "Reset ke Default" };
-uint8_t calCursor = 0;
+// DIUBAH TOTAL (2026-09-29): dua tingkat per PERANGKAT -- sama dengan Sorter. Picker hanya
+// punya satu perangkat (lengan 6 servo, tanpa gripper), jadi grupnya "Lengan" + "Reset".
+// Tetap dibuat dua tingkat supaya cara menavigasi Setting SAMA di keempat panel, dan label
+// lama yang terpotong ("Pose (Home/Pickup/Lift)" 23 karakter di ruang 15) kini muat.
+namespace CalId {
+  constexpr uint8_t RESET_FAULT = 0, POSE = 1, PICK_OFF = 2, PLACE_OFF = 3, CLEARANCE_OFF = 4, POST_PLACE_OFF = 5, SPEED = 6, TEST_GERAKAN = 7, RESET_DEFAULT = 8,
+    ADEGAN = 9, TEST_ADEGAN = 10;   // BARU 2026-09-30
+}
+constexpr uint8_t CAL_COUNT = 11;
+// Label per ID, tanpa awalan nama perangkat -- nama perangkat ada di judul layar. Maks 15 karakter.
+const char* CAL_LABELS[CAL_COUNT] = {
+  "Reset Fault",
+  "Pose 0/1/2",
+  "Pick Offset",
+  "Place Offset",
+  "Clearance Off.",
+  "Post-Place Off.",
+  "Kecepatan",
+  "Test Gerakan",
+  "Reset Default",
+  "Adegan Gerak",
+  "Test Adegan",
+};
 
-void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
+// DIUBAH (2026-09-30): +Adegan Gerak. Clearance & Post-Place DIKELUARKAN dari menu -- tidak
+// dipakai lagi oleh apa pun sejak MOVE_PACKAGE berjalan lewat adegan. Membiarkannya di menu
+// berarti operator menyetel angka yang diam-diam diabaikan. Nomor ID-nya tetap dipertahankan.
+const uint8_t CAL_GRP_LENGAN[] = { CalId::POSE, CalId::ADEGAN, CalId::TEST_ADEGAN, CalId::PICK_OFF, CalId::PLACE_OFF, CalId::SPEED, CalId::TEST_GERAKAN };
+const uint8_t CAL_GRP_RESET[] = { CalId::RESET_FAULT, CalId::RESET_DEFAULT };
+
+struct CalGroup { const char* judul; const uint8_t* id; uint8_t jumlah; };
+constexpr uint8_t CAL_GROUP_COUNT = 2;
+const CalGroup CAL_GROUPS[CAL_GROUP_COUNT] = {
+  { "SETTING: LENGAN", CAL_GRP_LENGAN, sizeof(CAL_GRP_LENGAN) },
+  { "SETTING: RESET", CAL_GRP_RESET, sizeof(CAL_GRP_RESET) },
+};
+const char* CAL_GROUP_LABELS[CAL_GROUP_COUNT] = { "Lengan", "Reset" };
+
+uint8_t calGroupCursor = 0;   // perangkat yang sedang dibuka
+uint8_t calCursor = 0;        // posisi DI DALAM perangkat itu
+
+void drawCalGroup() { drawListMenu("SETTING KALIBRASI", CAL_GROUP_LABELS, CAL_GROUP_COUNT, calGroupCursor); }
+
+// Nama dan state-nya SENGAJA dipertahankan (drawCalList / CAL_LIST): semua layar di bawahnya
+// kembali lewat `menuState = CAL_LIST; drawCalList();`, dan dengan begini mereka kembali ke
+// daftar perangkat yang tadi dibuka tanpa satu pun jalur keluar itu perlu diubah.
+void drawCalList() {
+  const CalGroup &g = CAL_GROUPS[calGroupCursor];
+  static const char* labels[CAL_COUNT];
+  for (uint8_t i = 0; i < g.jumlah; i++) labels[i] = CAL_LABELS[g.id[i]];
+  drawListMenu(g.judul, labels, g.jumlah, calCursor);
+}
 
 // ============================================================
 // LAYAR TEST GERAKAN (BARU 2026-09-22)
@@ -638,6 +903,9 @@ void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, ca
 //   D          kembali
 // ============================================================
 uint32_t testCycleArmedAt = 0;   // kapan '#' pertama ditekan; 0 = belum bersiap
+extern uint8_t gerakanSel;       // layar Adegan -- didefinisikan di bawah
+extern bool pilihUntukUji;
+void drawGerakanPilih();
 
 // DIPERBAIKI (2026-09-22): layar ini sempat membuat gerakan lengan tersendat -- gejalanya
 // "begitu keluar menu, gerakannya jadi lebih halus".
@@ -683,15 +951,8 @@ void handleTestGerakanKey(char key) {
   if (key == '#') {
     if (testCycleArmedAt != 0 && millis() - testCycleArmedAt < 5000) {
       testCycleArmedAt = 0;
-      enqueue(QCmd::GOTO_POSE, 0);
-      enqueue(QCmd::CLEARANCE);
-      enqueue(QCmd::GOTO_POSE, 1);
-      enqueue(QCmd::PICK);
-      enqueue(QCmd::GOTO_POSE, 2);
-      enqueue(QCmd::PLACE);
-      enqueue(QCmd::POST_PLACE);
-      enqueue(QCmd::GOTO_POSE, 0);
-      Serial.println("[TEST-MENU] Siklus penuh dimulai (setara MOVE_PACKAGE)");
+      antrekanSiklusPenuh();
+      Serial.println("[TEST-MENU] Siklus penuh dimulai (keempat adegan, setara MOVE_PACKAGE)");
     } else {
       testCycleArmedAt = millis();
     }
@@ -714,10 +975,285 @@ void handleTestGerakanKey(char key) {
   drawTestGerakan();
 }
 
+// ============================================================
+// LAYAR ADEGAN (BARU 2026-09-30)
+//
+// Setting -> Lengan -> Adegan Gerak  : SETEL adegan
+// Setting -> Lengan -> Test Adegan   : UJI gerakan -- penuh, atau satu adegan per tekan
+// Keduanya diawali layar pilih gerakan: "Home>Pick (13)" = 13 dari 20 adegan ON.
+//
+// ADEGAN_LIST   baris "01 ON J1 1450" / "14 -- J0 1500", lalu "-> pose <tujuan>"
+//                 A/B pilih   C setel   * ON/OFF   1 sisip slot kosong di sini
+//                 0 (dua kali) hapus & geser naik   D kembali
+// ADEGAN_EDIT   satu adegan
+//                 A/B nilai +/-   C besar step (5/10/50/100)   0-5 pilih joint
+//                 * UJI: bawa lengan ke keadaan TEPAT SEBELUM adegan ini (pose asal + adegan ON
+//                   sebelumnya), lalu jalankan adegan ini. Sesudahnya A/B langsung menggerakkan
+//                   joint itu (LIVE) -- setel sambil melihat.
+//                 # simpan (adegan otomatis ON)   D batal
+// TEST_ADEGAN   A adegan berikutnya (tekan pertama: ke pose asal; terakhir: ke pose tujuan)
+//               B ulang dari pose asal   # (dua kali) gerakan penuh   D kembali
+//
+// MENAMBAH ADEGAN: pilih slot OFF (biasanya slot sesudah adegan terakhir), C, setel, #.
+// MENYISIPKAN di tengah: taruh kursor di tempatnya, tekan 1 -- slot itu dan sesudahnya bergeser
+// turun satu (syarat: slot 20 masih OFF), lalu C untuk menyetel slot kosong yang muncul.
+// Banyak adegan sekaligus dari tabel: perintah Serial GERAKAN (ketik HELP).
+//
+// Tanpa '*', mengubah angka TIDAK menggerakkan apa pun -- menggerakkan satu joint dari posisi
+// sembarang bisa menabrak.
+// ============================================================
+uint8_t gerakanSel = 0;
+bool pilihUntukUji = false;    // layar pilih gerakan dibuka dari "Test Adegan"
+uint8_t slotSel = 0;           // baris terpilih; == SLOT_ADEGAN berarti baris "-> pose tujuan"
+uint8_t editJoint = 0;
+uint16_t editUs = 1500;
+bool editLive = false;         // sesudah '*': A/B langsung menggerakkan joint
+uint8_t editStepIdx = 2;
+constexpr int16_t EDIT_STEPS[4] = {5, 10, 50, 100};
+uint32_t hapusArmedAt = 0, jalanArmedAt = 0;
+int8_t ujiSlot = -1;           // Test Adegan: -1 belum mulai, 0..20 slot berikutnya, 21 = di pose tujuan
+uint8_t ujiTerakhir = 0;       // slot yang terakhir dijalankan (1-based), 0 = belum ada
+String ujiPesan = "";
+uint32_t ujiPesanSampai = 0;
+
+bool lenganSibuk() { return moving || qHead != qTail || gerakanJalan >= 0; }
+void pesanJudul(const String &teks) { lcdPrint(0, 0, teks); }
+
+// nullptr = boleh; selain itu alasan penolakan untuk ditampilkan.
+const char* alasanTidakBolehGerak() {
+  if (mainModeActive) return "MAIN aktif! STOP dulu";
+  if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) return "FAULT/ESTOP aktif";
+  if (lenganSibuk()) return "Lengan masih gerak";
+  return nullptr;
+}
+
+String duaDigit(uint8_t n) { return (n < 10 ? "0" : "") + String(n); }
+
+void drawGerakanPilih() {
+  static String lbl[NUM_GERAKAN];
+  static const char* p[NUM_GERAKAN];
+  for (uint8_t i = 0; i < NUM_GERAKAN; i++) {
+    lbl[i] = String(GERAKAN_NAMA[i]) + " (" + String(jumlahAktif(i)) + ")";
+    p[i] = lbl[i].c_str();
+  }
+  drawListMenu(pilihUntukUji ? "TEST ADEGAN" : "ADEGAN GERAK", p, NUM_GERAKAN, gerakanSel);
+}
+
+void drawAdeganList();
+void drawAdeganEdit();
+void drawTestAdegan();
+
+void handleGerakanPilihKey(char key) {
+  if (key == 'A') { gerakanSel = (gerakanSel == 0) ? NUM_GERAKAN - 1 : gerakanSel - 1; drawGerakanPilih(); }
+  else if (key == 'B') { gerakanSel = (gerakanSel + 1) % NUM_GERAKAN; drawGerakanPilih(); }
+  else if (key == 'C') {
+    if (pilihUntukUji) {
+      menuState = MenuState::TEST_ADEGAN; ujiSlot = -1; ujiTerakhir = 0; jalanArmedAt = 0;
+      lcdClear(); drawTestAdegan();
+    } else {
+      menuState = MenuState::ADEGAN_LIST; slotSel = 0; lcdClear(); drawAdeganList();
+    }
+  }
+  else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); }
+}
+
+// ---------------- daftar 20 adegan ----------------
+void drawAdeganList() {
+  const Gerakan &g = GERAKAN[gerakanSel];
+  lcdPrint(0, 0, String(GERAKAN_NAMA[gerakanSel]) + " " + String(jumlahAktif(gerakanSel)) + " ON");
+  uint8_t total = SLOT_ADEGAN + 1;   // + baris pose tujuan
+  uint8_t viewStart = 0;
+  if (slotSel >= 2) viewStart = slotSel - 1;
+  if (viewStart > total - 3) viewStart = total - 3;
+  for (uint8_t row = 0; row < 3; row++) {
+    uint8_t idx = viewStart + row;
+    String kursor = (idx == slotSel) ? "> " : "  ";
+    String s;
+    if (idx < SLOT_ADEGAN) {
+      const Adegan &a = g.adegan[idx];
+      s = kursor + duaDigit(idx + 1) + (a.aktif ? " ON J" : " -- J") + String(a.joint) + " " + String(a.us);
+    } else {
+      s = kursor + "-> pose " + POSE_NAMES[GERAKAN_TUJUAN[gerakanSel]];
+    }
+    lcdPrint(0, row + 1, s);
+  }
+}
+
+void handleAdeganListKey(char key) {
+  Gerakan &g = GERAKAN[gerakanSel];
+  if (key != '0') hapusArmedAt = 0;
+  bool barisAdegan = slotSel < SLOT_ADEGAN;
+
+  if (key == 'A') { slotSel = (slotSel == 0) ? SLOT_ADEGAN : slotSel - 1; }
+  else if (key == 'B') { slotSel = (slotSel + 1) % (SLOT_ADEGAN + 1); }
+  else if (key == 'C') {
+    if (!barisAdegan) { drawAdeganList(); pesanJudul("Ubah di menu Pose"); return; }
+    editJoint = g.adegan[slotSel].joint; editUs = g.adegan[slotSel].us; editLive = false;
+    menuState = MenuState::ADEGAN_EDIT; lcdClear(); drawAdeganEdit(); return;
+  }
+  else if (key == '*' || key == '1' || key == '0') {
+    // Data yang sedang dipakai lengan tidak boleh berubah di tengah jalan.
+    if (!barisAdegan) { drawAdeganList(); return; }
+    if (lenganSibuk()) { drawAdeganList(); pesanJudul("Lengan masih gerak"); return; }
+    if (key == '*') {   // ON/OFF
+      g.adegan[slotSel].aktif = !g.adegan[slotSel].aktif;
+      saveGerakanToNvs();
+      Serial.printf("[ADEGAN] %s adegan %u -> %s\n", GERAKAN_NAMA[gerakanSel], slotSel + 1, g.adegan[slotSel].aktif ? "ON" : "OFF");
+    } else if (key == '1') {   // sisip slot kosong (OFF) di sini, geser turun
+      if (g.adegan[SLOT_ADEGAN - 1].aktif) { drawAdeganList(); pesanJudul("Slot 20 masih ON"); return; }
+      for (int8_t i = SLOT_ADEGAN - 1; i > (int8_t)slotSel; i--) g.adegan[i] = g.adegan[i - 1];
+      g.adegan[slotSel] = adeganKosong();
+      saveGerakanToNvs();
+      drawAdeganList(); pesanJudul("Slot kosong disisip"); return;
+    } else {   // '0' hapus -- tekan dua kali, geser naik
+      if (hapusArmedAt != 0 && millis() - hapusArmedAt < 3000) {
+        for (uint8_t i = slotSel; i + 1 < SLOT_ADEGAN; i++) g.adegan[i] = g.adegan[i + 1];
+        g.adegan[SLOT_ADEGAN - 1] = adeganKosong();
+        hapusArmedAt = 0;
+        saveGerakanToNvs();
+        drawAdeganList(); pesanJudul("Adegan dihapus"); return;
+      }
+      hapusArmedAt = millis();
+      drawAdeganList(); pesanJudul("0 lagi = HAPUS"); return;
+    }
+  }
+  else if (key == 'D') { menuState = MenuState::GERAKAN_PILIH; drawGerakanPilih(); return; }
+  drawAdeganList();
+}
+
+// ---------------- setel satu adegan ----------------
+void drawAdeganEdit() {
+  const Adegan &a = GERAKAN[gerakanSel].adegan[slotSel];
+  lcdPrint(0, 0, String(GERAKAN_NAMA[gerakanSel]) + " A" + duaDigit(slotSel + 1) + (a.aktif ? " ON" : " OFF"));
+  lcdPrint(0, 1, "Joint " + String(editJoint) + "   us " + String(editUs));
+  lcdPrint(0, 2, "Step " + String(EDIT_STEPS[editStepIdx]) + (editLive ? "  LIVE" : "  C:step"));
+  lcdPrint(0, 3, "0-5jnt *uji #simpan");
+}
+
+// LIVE: pindahkan HANYA joint yang sedang disetel. Kalau pratinjau sebelumnya masih bergerak,
+// tujuannya diganti langsung -- menekan A berkali-kali tidak menumpuk gerakan di antrian.
+void gerakkanPratinjau() {
+  if (!editLive) return;
+  if (moving && currentAction == QCmd::JOINT && qHead == qTail && gerakanJalan < 0) {
+    targetUs[editJoint] = constrain(editUs, ServoCfg::MIN_US, ServoCfg::MAX_US);
+    return;
+  }
+  if (lenganSibuk()) return;
+  enqueue(QCmd::JOINT, editJoint, 0xFF, editUs);
+}
+
+void handleAdeganEditKey(char key) {
+  int16_t step = EDIT_STEPS[editStepIdx];
+  if (key == 'A') { editUs = constrain((int)editUs + step, (int)ServoCfg::MIN_US, (int)ServoCfg::MAX_US); gerakkanPratinjau(); }
+  else if (key == 'B') { editUs = constrain((int)editUs - step, (int)ServoCfg::MIN_US, (int)ServoCfg::MAX_US); gerakkanPratinjau(); }
+  else if (key == 'C') { editStepIdx = (editStepIdx + 1) % 4; }
+  else if (key >= '0' && key < '0' + ServoCfg::NUM_JOINTS) {
+    // Nilai awal joint yang baru dipilih: saat LIVE = posisi joint itu SEKARANG (A/B tidak
+    // membuatnya melompat); saat tidak LIVE = posisi HOME, sama dengan default adegan baru.
+    editJoint = key - '0';
+    editUs = editLive ? currentUs[editJoint] : POSES[0].us[editJoint];
+  }
+  else if (key == '*') {   // UJI: bawa ke keadaan sebelum adegan ini, lalu jalankan adegan ini
+    const char* alasan = alasanTidakBolehGerak();
+    if (alasan) { drawAdeganEdit(); pesanJudul(alasan); return; }
+    antrekanUjiGerakan(gerakanSel, slotSel);   // pose asal + adegan ON di slot sebelumnya, tanpa pose tujuan
+    enqueue(QCmd::JOINT, editJoint, 0xFF, editUs);
+    editLive = true;
+    Serial.printf("[ADEGAN] Uji konteks %s adegan %u\n", GERAKAN_NAMA[gerakanSel], slotSel + 1);
+  }
+  else if (key == '#') {   // simpan -- adegan otomatis ON
+    // Data yang sedang dipakai lengan tidak boleh berubah di tengah jalan -- kecuali gerakan itu
+    // adalah uji konteks milik layar ini sendiri (editLive).
+    if (!editLive && lenganSibuk()) { pesanJudul("Lengan masih gerak"); return; }
+    GERAKAN[gerakanSel].adegan[slotSel] = {1, editJoint, editUs};
+    saveGerakanToNvs();
+    Serial.printf("[ADEGAN] %s adegan %u = J%u %u us, ON (tersimpan)\n", GERAKAN_NAMA[gerakanSel], slotSel + 1, editJoint, editUs);
+    editLive = false;
+    menuState = MenuState::ADEGAN_LIST; lcdClear(); drawAdeganList(); pesanJudul("TERSIMPAN, ON");
+    return;
+  }
+  else if (key == 'D') {   // batal -- data tidak berubah
+    editLive = false;
+    menuState = MenuState::ADEGAN_LIST; lcdClear(); drawAdeganList();
+    return;
+  }
+  drawAdeganEdit();
+}
+
+// ---------------- Test Adegan ----------------
+void drawTestAdegan() {
+  const Gerakan &g = GERAKAN[gerakanSel];
+  lcdPrint(0, 0, "UJI " + String(GERAKAN_NAMA[gerakanSel]) + " (" + String(jumlahAktif(gerakanSel)) + ")");
+  String status;
+  if (millis() < ujiPesanSampai) status = ujiPesan;
+  else if (jalanArmedAt != 0) status = "# lagi = PENUH";
+  else if (gerakanJalan == (int8_t)gerakanSel) status = "Penuh: adegan " + String(adeganKe);
+  else if (ujiSlot < 0) status = String("A = mulai dari ") + POSE_NAMES[GERAKAN_ASAL[gerakanSel]];
+  else if (ujiSlot > SLOT_ADEGAN) status = String("Di ") + POSE_NAMES[GERAKAN_TUJUAN[gerakanSel]] + ". B=ulang";
+  else if (ujiTerakhir == 0) status = String("Di ") + POSE_NAMES[GERAKAN_ASAL[gerakanSel]] + " (awal)";
+  else {
+    const Adegan &a = g.adegan[ujiTerakhir - 1];
+    status = "Adegan " + duaDigit(ujiTerakhir) + " J" + String(a.joint) + " " + String(a.us);
+  }
+  if (lenganSibuk() && millis() >= ujiPesanSampai) status += " ..";
+  lcdPrint(0, 1, status);
+  lcdPrint(0, 2, "A:adegan  B:ulang");
+  lcdPrint(0, 3, "##:penuh D:kembali");
+}
+
+void pesanUji(const String &teks) { ujiPesan = teks; ujiPesanSampai = millis() + 2000; }
+
+// Satu tekan = satu adegan ON berikutnya. Tekan pertama membawa lengan ke pose asal, tekan
+// sesudah adegan terakhir membawanya ke pose tujuan -- jadi setiap adegan bisa diamati sendiri,
+// termasuk gerak otomatis terakhir yang menggerakkan banyak joint sekaligus.
+void ujiLangkah() {
+  const Gerakan &g = GERAKAN[gerakanSel];
+  if (ujiSlot < 0) {
+    enqueue(QCmd::GOTO_POSE, GERAKAN_ASAL[gerakanSel]);
+    ujiSlot = 0; ujiTerakhir = 0;
+    return;
+  }
+  if (ujiSlot > SLOT_ADEGAN) { pesanUji("Selesai. B = ulang"); return; }
+  while (ujiSlot < SLOT_ADEGAN && !g.adegan[ujiSlot].aktif) ujiSlot++;
+  if (ujiSlot < SLOT_ADEGAN) {
+    const Adegan &a = g.adegan[ujiSlot];
+    enqueue(QCmd::JOINT, a.joint, 0xFF, a.us);
+    ujiTerakhir = ujiSlot + 1;
+    ujiSlot++;
+    Serial.printf("[TEST-ADEGAN] %s adegan %u: J%u -> %u us\n", GERAKAN_NAMA[gerakanSel], ujiTerakhir, a.joint, a.us);
+    return;
+  }
+  enqueue(QCmd::GOTO_POSE, GERAKAN_TUJUAN[gerakanSel]);
+  ujiSlot = SLOT_ADEGAN + 1; ujiTerakhir = 0;
+  Serial.printf("[TEST-ADEGAN] %s -> pose %s\n", GERAKAN_NAMA[gerakanSel], POSE_NAMES[GERAKAN_TUJUAN[gerakanSel]]);
+}
+
+void handleTestAdeganKey(char key) {
+  if (key != '#') jalanArmedAt = 0;
+  if (key == 'D') { menuState = MenuState::GERAKAN_PILIH; drawGerakanPilih(); return; }
+  if (key == 'A' || key == 'B' || key == '#') {
+    const char* alasan = alasanTidakBolehGerak();
+    if (alasan) { jalanArmedAt = 0; pesanUji(alasan); drawTestAdegan(); return; }
+  }
+  if (key == 'A') ujiLangkah();
+  else if (key == 'B') { ujiSlot = -1; ujiTerakhir = 0; ujiLangkah(); }   // langsung ke pose asal
+  else if (key == '#') {   // gerakan penuh -- dua kali tekan, lengan berayun tanpa berhenti
+    if (jalanArmedAt != 0 && millis() - jalanArmedAt < 5000) {
+      jalanArmedAt = 0;
+      antrekanUjiGerakan(gerakanSel);
+      ujiSlot = SLOT_ADEGAN + 1; ujiTerakhir = 0;
+      Serial.printf("[TEST-ADEGAN] %s penuh, %u adegan ON\n", GERAKAN_NAMA[gerakanSel], jumlahAktif(gerakanSel));
+    } else {
+      jalanArmedAt = millis();
+    }
+  }
+  drawTestAdegan();
+}
+
 void drawConfirmReset() {
   lcdClear();
   lcdPrint(0, 0, "RESET KE DEFAULT?");
-  lcdPrint(0, 1, "Pose & offset akan");
+  lcdPrint(0, 1, "Pose,adegan,offset");
   lcdPrint(0, 2, "HILANG, TAK BS BATAL");
   lcdPrint(0, 3, "C=YA,RESET D=batal");
 }
@@ -852,26 +1388,37 @@ void handleSpeedKey(char key) {
   drawSpeedMenu();
 }
 
+void handleCalGroupKey(char key) {
+  if (key == 'A') { calGroupCursor = (calGroupCursor == 0) ? CAL_GROUP_COUNT - 1 : calGroupCursor - 1; drawCalGroup(); }
+  else if (key == 'B') { calGroupCursor = (calGroupCursor + 1) % CAL_GROUP_COUNT; drawCalGroup(); }
+  else if (key == 'C') { menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); }
+  else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
+}
+
 void handleCalListKey(char key) {
-  if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
-  else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
+  const CalGroup &g = CAL_GROUPS[calGroupCursor];
+  if (key == 'A') { calCursor = (calCursor == 0) ? g.jumlah - 1 : calCursor - 1; drawCalList(); }
+  else if (key == 'B') { calCursor = (calCursor + 1) % g.jumlah; drawCalList(); }
   else if (key == 'C') {
-    switch (calCursor) {
-      case 0:   // BARU -- Reset Fault, langsung eksekusi (tidak destruktif, gak perlu konfirmasi)
+    // Bercabang pada ID, bukan posisi -- posisi berubah tiap daftar disusun ulang, ID tidak.
+    switch (g.id[calCursor]) {
+      case CalId::RESET_FAULT:   // langsung eksekusi (tidak destruktif, tanpa konfirmasi)
         applyCommand((uint16_t)Cmd::RESET_FAULT, 0);
         lcdPrint(0, 3, "Fault direset!      ");
         Serial.println("[CAL] Reset Fault dari menu LCD");
         break;
-      case 1: menuState = MenuState::JOG_JOINT; lcdClear(); drawCalibrationLcd(); break;
-      case 2: editingOffset = PICK_OFFSET; editingOffsetName = "PICK"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
-      case 3: editingOffset = PLACE_OFFSET; editingOffsetName = "PLACE"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
-      case 4: editingOffset = CLEARANCE_OFFSET; editingOffsetName = "CLEARANCE"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
-      case 5: editingOffset = POST_PLACE_OFFSET; editingOffsetName = "POSTPLACE"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
-      case 6: menuState = MenuState::JOG_SPEED; lcdClear(); drawSpeedMenu(); break;
-      case 7: menuState = MenuState::TEST_GERAKAN; testCycleArmedAt = 0; lcdClear(); drawTestGerakan(); break;
-      case 8: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
+      case CalId::POSE: menuState = MenuState::JOG_JOINT; lcdClear(); drawCalibrationLcd(); break;
+      case CalId::PICK_OFF: editingOffset = PICK_OFFSET; editingOffsetName = "PICK"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
+      case CalId::PLACE_OFF: editingOffset = PLACE_OFFSET; editingOffsetName = "PLACE"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
+      case CalId::CLEARANCE_OFF: editingOffset = CLEARANCE_OFFSET; editingOffsetName = "CLEARANCE"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
+      case CalId::POST_PLACE_OFF: editingOffset = POST_PLACE_OFFSET; editingOffsetName = "POSTPLACE"; menuState = MenuState::JOG_OFFSET; lcdClear(); drawOffsetMenu(); break;
+      case CalId::SPEED: menuState = MenuState::JOG_SPEED; lcdClear(); drawSpeedMenu(); break;
+      case CalId::TEST_GERAKAN: menuState = MenuState::TEST_GERAKAN; testCycleArmedAt = 0; lcdClear(); drawTestGerakan(); break;
+      case CalId::ADEGAN: menuState = MenuState::GERAKAN_PILIH; pilihUntukUji = false; gerakanSel = 0; drawGerakanPilih(); break;
+      case CalId::TEST_ADEGAN: menuState = MenuState::GERAKAN_PILIH; pilihUntukUji = true; gerakanSel = 0; drawGerakanPilih(); break;
+      case CalId::RESET_DEFAULT: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
-  } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
+  } else if (key == 'D') { menuState = MenuState::CAL_GROUP; drawCalGroup(); }
 }
 
 // --- LEVEL 1b: TEST I/O ---
@@ -879,12 +1426,21 @@ struct IOTestItem { const char* label; uint8_t ch; bool autoControlled; };
 void drawTestIoCategory();
 
 // --- Kategori: Test Output ---
-constexpr uint8_t OUTPUT_TEST_COUNT = 4;
+// DIUBAH (2026-09-29, disamakan dengan Sorter atas permintaan operator):
+//   - Label memakai nama channel lengkap (LED_OPR, LED_RUN, ...) supaya sama dengan yang
+//     tertulis di skema/wiring, bukan singkatan yang harus diterjemahkan dulu.
+//   - RELAY_1 dan RELAY_2 dipindah ke SINI dari Test Modul -> Relay (layar itu dihapus).
+//     Relay adalah output digital biasa; di sini ia diuji dengan cara yang sama persis dengan
+//     LED dan buzzer, termasuk rate-limit 300ms beban induktif dan syarat IDLE.
+constexpr uint8_t OUTPUT_TEST_COUNT = 7;
 IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
-  {"OPR",    CH::LED_OPERATION, true},
-  {"RUN",    CH::LED_RUN,       true},
-  {"MANUAL", CH::LED_MANUAL,    true},
-  {"FAULT",  CH::LED_FAULT,     true},   // DIUBAH -- sekarang auto-controlled (lihat updateUniversalIndicators)
+  {"LED_OPR",    CH::LED_OPERATION, true},
+  {"LED_RUN",    CH::LED_RUN,       true},
+  {"LED_MANUAL", CH::LED_MANUAL,    true},
+  {"LED_FAULT",  CH::LED_FAULT,     true},   // auto-controlled (lihat updateUniversalIndicators)
+  {"BUZZER",     CH::BUZZER,        false},
+  {"RELAY_1",    CH::RLY1,          false},
+  {"RELAY_2",    CH::RLY2,          false},
 };
 uint8_t outputTestCursor = 0;
 bool testOutputLastVal = false, testOutputFirstDraw = true;
@@ -1045,8 +1601,9 @@ void handleTestRs485Key(char key) {
 // TIDAK bikin driver raw terpisah (beda dgn SORTER/STOCKER yang tidak punya driver resmi).
 bool testModFirstDraw = true;
 String testModLine1 = "";
-constexpr uint8_t MODULE_TYPE_COUNT = 4;
-const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Relay", "Servo" };
+// DIUBAH (2026-09-29): "Relay" dipindah ke Test I/O -> Test Output (RELAY_1/RELAY_2).
+constexpr uint8_t MODULE_TYPE_COUNT = 3;
+const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Servo" };
 uint8_t moduleTypeCursor = 0;
 void drawModuleTypeSelect() { drawListMenu("TEST MODUL", MODULE_TYPE_LABELS, MODULE_TYPE_COUNT, moduleTypeCursor); }
 void handleModuleTypeKey(char key);
@@ -1121,31 +1678,6 @@ void handleTestModMotorDCKey(char key) {
   drawTestModMotorDC();
 }
 
-// --- Modul: Relay (RLY1/RLY2) ---
-uint8_t testModRelaySel = 0;
-void drawTestModRelay() {
-  if (testModFirstDraw) {
-    lcdClear(); lcdPrint(0, 0, "MODUL: RELAY");
-    lcdPrint(0, 3, "C=pilih A=tgl D=kmb");
-    testModFirstDraw = false; testModLine1 = "\x01";
-  }
-  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
-  bool val = io.read(ch);
-  String line1 = "RLY" + String(testModRelaySel + 1) + " = " + String(val ? "HIGH" : "LOW");
-  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
-}
-void handleTestModRelayKey(char key) {
-  static uint32_t lastToggleMs = 0;
-  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
-  if (key == 'C') { testModRelaySel = (testModRelaySel + 1) % 2; }
-  else if (key == 'A') {
-    if (millis() - lastToggleMs < 300) return;
-    lastToggleMs = millis();
-    io.write(ch, !io.read(ch));
-  } else if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
-  drawTestModRelay();
-}
-
 // --- Modul: Servo -- REUSE driver PCA9685 RESMI (objek pwm) yang sudah aktif produksi ---
 uint8_t testModServoCh = 0;
 void drawTestModServo() {
@@ -1173,8 +1705,7 @@ void handleModuleTypeKey(char key) {
     switch (moduleTypeCursor) {
       case 0: menuState = MenuState::TEST_MOD_STEPPER; drawTestModStepper(); break;
       case 1: menuState = MenuState::TEST_MOD_MOTORDC; drawTestModMotorDC(); break;
-      case 2: menuState = MenuState::TEST_MOD_RELAY; drawTestModRelay(); break;
-      case 3: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
+      case 2: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
 }
@@ -1199,15 +1730,36 @@ void handleTestIoCategoryKey(char key) {
 }
 
 // --- LEVEL 1c: TEST COMMAND ---
-struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
-// DIHAPUS: "RUN_SEQUENCE(reject)" & "GOTO_REJECT" -- Picker fisik cuma ambil dari PASS.
-constexpr uint8_t CMD_TEST_COUNT = 5;   // DIUBAH 7 -> 5, RUN_SEQUENCE & GOTO_PASS dihapus
+// DIPERIKSA ULANG (2026-09-29), disamakan dengan Sorter:
+//   DITAMBAH START_MAIN dan STOP_MAIN. MOVE_PACKAGE -- satu-satunya command produksi Picker --
+//            butuh MAIN, dan tanpa dua item ini ia SELALU ditolak dari panel. Sebaliknya
+//            GOTO_HOME/PICK/PLACE ditolak selama MAIN, jadi STOP_MAIN juga perlu ada di sini.
+//   Pose 1 dan 2 tidak ditambahkan: layar Setting -> Lengan -> Test Gerakan sudah mencakup
+//   ketiga pose beserta PICK/PLACE dan satu siklus penuh.
+// Label maksimal 15 karakter supaya muat setelah "> a. ". Petunjuk "C=kirim D=kembali" yang dulu
+// ditulis di baris 4 dibuang: ia MENIMPA baris daftar ketiga, sehingga item terakhir tidak
+// pernah terlihat saat kursor ada di situ. Tombolnya sama dengan semua layar daftar lain.
+//
+// Hasil ditulis di baris JUDUL: "OK, amati aksinya" atau "TOLAK: <alasan>". Dulu layar
+// menulis "Terkirim, amati aksi" PERSIS SAMA untuk command yang dijalankan maupun yang
+// ditolak -- penolakan hanya tercetak di Serial, jadi operator di panel tidak bisa
+// membedakan keduanya. Kolom `gate` dipakai untuk menyebut alasan penolakan yang paling
+// mungkin tanpa harus membuka Serial.
+enum CmdGate : uint8_t { GATE_NETRAL, GATE_MAIN, GATE_TEST, GATE_LOKAL };
+struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; CmdGate gate; };
+// URUTAN BAKU (2026-09-30) -- SAMA di keempat node dan di sorting_automation.py (file acuan):
+//   a START_MAIN   b STOP_MAIN   c RESET_FAULT      <- huruf ini tetap di SEMUA node
+//   lalu kelompok Produksi (hanya MAIN) -> Aksi (bebas mode) -> Uji (ditolak saat MAIN).
+// Jangan menyisipkan item di tengah tanpa menyamakan OPCODES di sorting_automation.py.
+constexpr uint8_t CMD_TEST_COUNT = 7;
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
-  {"GOTO_HOME",            Cmd::GOTO_HOME,    0},
-  {"PICK",                 Cmd::PICK,         0},
-  {"PLACE",                Cmd::PLACE,        0},
-  {"MOVE_PACKAGE",         Cmd::MOVE_PACKAGE, 0},
-  {"RESET_FAULT",          Cmd::RESET_FAULT,  0},
+  {"START_MAIN",      Cmd::START_MAIN,               0, GATE_NETRAL},
+  {"STOP_MAIN",       Cmd::STOP_MAIN,                0, GATE_NETRAL},
+  {"RESET_FAULT",     Cmd::RESET_FAULT,              0, GATE_NETRAL},
+  {"MOVE_PACKAGE",    Cmd::MOVE_PACKAGE,             0, GATE_MAIN},
+  {"GOTO_HOME",       Cmd::GOTO_HOME,                0, GATE_TEST},
+  {"PICK",            Cmd::PICK,                     0, GATE_TEST},
+  {"PLACE",           Cmd::PLACE,                    0, GATE_TEST},
 };
 const char* CMD_TEST_LABELS_ONLY[CMD_TEST_COUNT];
 void buildCmdTestLabels() { for (uint8_t i = 0; i < CMD_TEST_COUNT; i++) CMD_TEST_LABELS_ONLY[i] = CMD_TEST_ITEMS[i].label; }
@@ -1216,17 +1768,24 @@ uint8_t cmdTestCursor = 0;
 void drawTestCmdList() {
   buildCmdTestLabels();
   drawListMenu("TEST COMMAND", CMD_TEST_LABELS_ONLY, CMD_TEST_COUNT, cmdTestCursor);
-  lcdPrint(0, 3, "C=kirim D=kembali");
 }
+
 void handleTestCmdListKey(char key) {
   if (key == 'A') { cmdTestCursor = (cmdTestCursor == 0) ? CMD_TEST_COUNT - 1 : cmdTestCursor - 1; drawTestCmdList(); }
   else if (key == 'B') { cmdTestCursor = (cmdTestCursor + 1) % CMD_TEST_COUNT; drawTestCmdList(); }
   else if (key == 'C') {
     CmdTestItem &item = CMD_TEST_ITEMS[cmdTestCursor];
-    Serial.printf("[TEST-CMD] Simulasi command dari 'node lain': opcode=%u (%s) arg=%u -- amati aksi fisik SEKARANG\n",
+    Serial.printf("[TEST-CMD] Simulasi command dari 'node lain': opcode=%u (%s) arg=%u\n",
                   (uint16_t)item.opcode, item.label, item.testArg);
-    applyCommand((uint16_t)item.opcode, item.testArg);
-    lcdPrint(0, 3, "Terkirim, amati aksi");
+    bool diterima = applyCommand((uint16_t)item.opcode, item.testArg);
+    String hasil;
+    if (diterima)                                          hasil = "OK, amati aksinya";
+    else if (faultCode != 0 || currentState == NodeState::FAULT ||
+             currentState == NodeState::ESTOPPED)          hasil = "TOLAK: FAULT/ESTOP";
+    else if (item.gate == GATE_MAIN && !mainModeActive)    hasil = "TOLAK: belum MAIN";
+    else if (item.gate == GATE_TEST && mainModeActive)     hasil = "TOLAK: MAIN aktif";
+    else                                                   hasil = "TOLAK: lihat Serial";
+    lcdPrint(0, 0, hasil);
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenu(); }
 }
 
@@ -1235,12 +1794,124 @@ void handleTopMenuKey(char key) {
   else if (key == 'B') { topCursor = (topCursor + 1) % TOP_COUNT; drawTopMenu(); }
   else if (key == 'C') {
     switch (topCursor) {
-      case 0: menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); break;
+      case 0: menuState = MenuState::CAL_GROUP; calGroupCursor = 0; drawCalGroup(); break;
       case 1: menuState = MenuState::TEST_IO_CATEGORY; testIoCatCursor = 0; drawTestIoCategory(); break;
       case 2: menuState = MenuState::TEST_CMD_LIST; cmdTestCursor = 0; drawTestCmdList(); break;
       case 3: menuState = MenuState::SYS_INFO; sysInfoPage = 0; lcdClear(); drawSysInfo(); break;
     }
   } else if (key == 'D') { menuState = MenuState::NONE; lcdClear(); Serial.println("[CAL] Keluar mode kalibrasi"); }
+}
+
+// ============================================================
+// SERIAL: GERAKAN (BARU 2026-09-30) -- memasukkan banyak adegan sekaligus dari tabel.
+//   GERAKAN                        tampilkan keempat gerakan (adegan ON saja)
+//   GERAKAN <g>                    tampilkan satu gerakan, termasuk slot OFF
+//   GERAKAN <g> SET j:us j:us ..   isi slot 1..N berurutan dan ON-kan; slot sisanya OFF.
+//                                  Contoh: GERAKAN 0 SET 1:1450 2:835 1:1650
+//   GERAKAN <g> SLOT <s> j:us      isi satu slot (1-20) dan ON-kan
+//   GERAKAN <g> SLOT <s> OFF       matikan satu slot
+//   GERAKAN <g> JALAN              uji satu gerakan dari pose asalnya (hanya TEST mode)
+// J1:1450 dan 1=1450 juga diterima. Satu token salah = seluruh perintah ditolak, supaya
+// tidak pernah tersimpan setengah. g = 0 Home>Pick, 1 Pick>Home, 2 Home>Place, 3 Place>Home.
+// Baris "salin:" di keluaran memakai format SET, jadi bisa ditempel balik apa adanya.
+// ============================================================
+bool uraiJointUs(String tok, uint8_t &joint, uint16_t &us) {
+  if (tok.length() && (tok.charAt(0) == 'J' || tok.charAt(0) == 'j')) tok = tok.substring(1);
+  int pisah = tok.indexOf(':');
+  if (pisah == -1) pisah = tok.indexOf('=');
+  if (pisah <= 0) return false;
+  int j = tok.substring(0, pisah).toInt();
+  int v = tok.substring(pisah + 1).toInt();
+  if (!isDigit(tok.charAt(0)) || j < 0 || j >= ServoCfg::NUM_JOINTS || v < ServoCfg::MIN_US || v > ServoCfg::MAX_US) return false;
+  joint = (uint8_t)j; us = (uint16_t)v;
+  return true;
+}
+
+void cetakGerakan(uint8_t g, bool lengkap) {
+  const Gerakan &gr = GERAKAN[g];
+  Serial.printf("[GERAKAN %u] %s: %u adegan ON, dari pose %s -> pose %s\n", g, GERAKAN_NAMA[g],
+                jumlahAktif(g), POSE_NAMES[GERAKAN_ASAL[g]], POSE_NAMES[GERAKAN_TUJUAN[g]]);
+  for (uint8_t s = 0; s < SLOT_ADEGAN; s++) {
+    const Adegan &a = gr.adegan[s];
+    if (a.aktif || lengkap) Serial.printf("   adegan %2u  %s  J%u  %u us\n", s + 1, a.aktif ? "ON " : "off", a.joint, a.us);
+  }
+  Serial.printf("   salin: GERAKAN %u SET", g);
+  for (uint8_t s = 0; s < SLOT_ADEGAN; s++)
+    if (gr.adegan[s].aktif) Serial.printf(" %u:%u", gr.adegan[s].joint, gr.adegan[s].us);
+  Serial.println();
+}
+
+void perintahGerakanSerial(String sisa) {
+  sisa.trim();
+  if (sisa.length() == 0) { for (uint8_t g = 0; g < NUM_GERAKAN; g++) cetakGerakan(g, false); return; }
+  int sp = sisa.indexOf(' ');
+  String no = (sp == -1) ? sisa : sisa.substring(0, sp);
+  int g = no.toInt();
+  if (!isDigit(no.charAt(0)) || g < 0 || g >= NUM_GERAKAN) { Serial.println("[GERAKAN] nomor gerakan 0-3"); return; }
+  if (sp == -1) { cetakGerakan(g, true); return; }
+  String sub = sisa.substring(sp + 1);
+  sub.trim();
+  int sp2 = sub.indexOf(' ');
+  String kata = (sp2 == -1) ? sub : sub.substring(0, sp2);
+  String argumen = (sp2 == -1) ? "" : sub.substring(sp2 + 1);
+  argumen.trim();
+  kata.toUpperCase();
+
+  if (kata == "JALAN") {
+    if (mainModeActive) { Serial.println("[GERAKAN] ditolak -- MAIN aktif"); return; }
+    if (lenganSibuk()) { Serial.println("[GERAKAN] ditolak -- lengan masih bergerak"); return; }
+    antrekanUjiGerakan(g);
+    Serial.printf("[GERAKAN] Uji %s dari pose %s, %u adegan ON\n", GERAKAN_NAMA[g], POSE_NAMES[GERAKAN_ASAL[g]], jumlahAktif(g));
+    return;
+  }
+  if (lenganSibuk()) { Serial.println("[GERAKAN] ditolak -- lengan masih bergerak, tunggu sampai diam"); return; }
+
+  if (kata == "SET") {
+    Gerakan baru;
+    for (uint8_t s = 0; s < SLOT_ADEGAN; s++) baru.adegan[s] = adeganKosong();
+    uint8_t n = 0;
+    while (argumen.length() > 0) {
+      int s = argumen.indexOf(' ');
+      String tok = (s == -1) ? argumen : argumen.substring(0, s);
+      argumen = (s == -1) ? "" : argumen.substring(s + 1);
+      argumen.trim();
+      if (tok.length() == 0) continue;
+      uint8_t j; uint16_t us;
+      if (!uraiJointUs(tok, j, us)) {
+        Serial.printf("[GERAKAN] DITOLAK -- token '%s' salah (joint:us, joint 0-5, us %u-%u). Tidak ada yang diubah.\n",
+                      tok.c_str(), ServoCfg::MIN_US, ServoCfg::MAX_US);
+        return;
+      }
+      if (n >= SLOT_ADEGAN) { Serial.println("[GERAKAN] DITOLAK -- lebih dari 20 adegan. Tidak ada yang diubah."); return; }
+      baru.adegan[n++] = {1, j, us};
+    }
+    GERAKAN[g] = baru;
+    saveGerakanToNvs();
+    Serial.print("[GERAKAN] TERSIMPAN. ");
+    cetakGerakan(g, false);
+    return;
+  }
+
+  if (kata == "SLOT") {
+    int sp3 = argumen.indexOf(' ');
+    int slot = ((sp3 == -1) ? argumen : argumen.substring(0, sp3)).toInt();
+    String nilai = (sp3 == -1) ? "" : argumen.substring(sp3 + 1);
+    nilai.trim();
+    if (slot < 1 || slot > SLOT_ADEGAN || nilai.length() == 0) { Serial.println("[GERAKAN] format: SLOT <1-20> j:us | OFF"); return; }
+    Adegan &a = GERAKAN[g].adegan[slot - 1];
+    String besar = nilai; besar.toUpperCase();
+    if (besar == "OFF") {
+      a.aktif = 0;
+    } else {
+      uint8_t j; uint16_t us;
+      if (!uraiJointUs(nilai, j, us)) { Serial.println("[GERAKAN] DITOLAK -- format joint:us (joint 0-5). Tidak ada yang diubah."); return; }
+      a = {1, j, us};
+    }
+    saveGerakanToNvs();
+    Serial.printf("[GERAKAN] %s adegan %d: %s J%u %u us (tersimpan)\n", GERAKAN_NAMA[g], slot, a.aktif ? "ON" : "OFF", a.joint, a.us);
+    return;
+  }
+  Serial.println("[GERAKAN] perintah: SET, SLOT, atau JALAN -- ketik HELP");
 }
 
 void handleSerialCommand() {
@@ -1273,6 +1944,7 @@ void handleSerialCommand() {
     else Serial.println("[GOTO] Slot harus 0=HOME 1=PICKUP 2=LIFT");
   }
   // DIHAPUS (2026-09-22): command Serial "SEQ" -- opcode RUN_SEQUENCE-nya sudah tidak ada.
+  else if (cmd == "GERAKAN") { perintahGerakanSerial(sp1 == -1 ? String("") : line.substring(sp1 + 1)); }
   else if (cmd == "MOVEPKG") {
     applyCommand((uint16_t)Cmd::MOVE_PACKAGE, 0);
     Serial.println("[MOVEPKG] MOVE_PACKAGE dimulai");
@@ -1295,6 +1967,7 @@ void handleSerialCommand() {
   else if (cmd == "HELP") {
     Serial.println("[HELP] JOG <0-5> <us> | SAVEPOSE <0-2> | GOTO <0-2> | MOVEPKG | STEP <us> | INTERVAL <ms>");
     Serial.println("[HELP] RAMPMIN <us> | RAMPSTEPS <n> | RESET | STATUS | HELP");
+    Serial.println("[HELP] GERAKAN | GERAKAN <0-3> | GERAKAN <0-3> SET j:us j:us .. | GERAKAN <0-3> SLOT <1-20> j:us|OFF | GERAKAN <0-3> JALAN");
   }
   else Serial.printf("[SERIAL] '%s' tidak dikenal -- ketik HELP\n", cmd.c_str());
 }
@@ -1304,6 +1977,7 @@ void handleSafety() {
     io.write(CH::PCA_OE, HIGH);
     currentState = NodeState::ESTOPPED; moving = false;
     qHead = qTail = 0; ackPending = false;
+    if (gerakanJalan >= 0) selesaiGerakan();   // BARU -- gerakan ikut dibatalkan, bukan dilanjut setelah E-stop dilepas
     return;
   }
   if (currentState == NodeState::ESTOPPED) {
@@ -1477,7 +2151,10 @@ void setup() {
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
   mb.addHreg(Reg::MENU_ACTIVE, 0);        // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
+  mb.addHreg(Reg::GERAKAN_AKTIF, 0xFF);   // BARU 2026-09-30 -- 255 = tidak ada gerakan berjalan
+  mb.addHreg(Reg::ADEGAN_KE, 0);
   mb.onSetHreg(Reg::CMD, onCmdWrite);
+  mb.onRequestSuccess(onModbusRequestSukses);   // BARU -- watchdog dari request apa pun
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
 
@@ -1553,6 +2230,7 @@ void loop() {
         if (lcdPresent) drawTopMenu();
         Serial.println("[CAL] Masuk mode kalibrasi (command eksternal dijeda, logic fisik TETAP jalan)");
       } else if (menuState == MenuState::TOP_SELECT) handleTopMenuKey(key);
+      else if (menuState == MenuState::CAL_GROUP) handleCalGroupKey(key);
       else if (menuState == MenuState::CAL_LIST) handleCalListKey(key);
       else if (menuState == MenuState::JOG_JOINT) handleCalibrationKey(key);
       else if (menuState == MenuState::WAIT_SAVE_SLOT) handleSaveSlotKey(key);
@@ -1568,12 +2246,15 @@ void loop() {
       else if (menuState == MenuState::TEST_MODULE_SELECT) handleModuleTypeKey(key);
       else if (menuState == MenuState::TEST_MOD_STEPPER) handleTestModStepperKey(key);
       else if (menuState == MenuState::TEST_MOD_MOTORDC) handleTestModMotorDCKey(key);
-      else if (menuState == MenuState::TEST_MOD_RELAY) handleTestModRelayKey(key);
       else if (menuState == MenuState::TEST_MOD_SERVO) handleTestModServoKey(key);
       else if (menuState == MenuState::TEST_CMD_LIST) handleTestCmdListKey(key);
       else if (menuState == MenuState::CONFIRM_RESET) handleConfirmResetKey(key);
       else if (menuState == MenuState::SYS_INFO) handleSysInfoKey(key);
       else if (menuState == MenuState::TEST_GERAKAN) handleTestGerakanKey(key);
+      else if (menuState == MenuState::GERAKAN_PILIH) handleGerakanPilihKey(key);
+      else if (menuState == MenuState::ADEGAN_LIST) handleAdeganListKey(key);
+      else if (menuState == MenuState::ADEGAN_EDIT) handleAdeganEditKey(key);
+      else if (menuState == MenuState::TEST_ADEGAN) handleTestAdeganKey(key);
     }
   }
 
@@ -1621,6 +2302,11 @@ void loop() {
     static uint32_t lastTestGerakRefresh = 0;
     if (millis() - lastTestGerakRefresh > 250) { lastTestGerakRefresh = millis(); drawTestGerakan(); }
   }
+  // Test Adegan hidup sendiri: status gerak, adegan ke berapa, dan pesan yang kedaluwarsa.
+  if (menuState == MenuState::TEST_ADEGAN && lcdPresent) {
+    static uint32_t lastUjiAdeganRefresh = 0;
+    if (millis() - lastUjiAdeganRefresh > 250) { lastUjiAdeganRefresh = millis(); drawTestAdegan(); }
+  }
   if (menuState == MenuState::TEST_RS485 && lcdPresent) {
     static uint32_t lastTestRs485Refresh = 0;
     if (millis() - lastTestRs485Refresh > 500) { lastTestRs485Refresh = millis(); drawTestRs485(); }
@@ -1628,10 +2314,6 @@ void loop() {
   if (menuState == MenuState::TEST_MOD_MOTORDC && lcdPresent) {
     static uint32_t lastTestModRefresh = 0;
     if (millis() - lastTestModRefresh > 150) { lastTestModRefresh = millis(); drawTestModMotorDC(); }
-  }
-  if (menuState == MenuState::TEST_MOD_RELAY && lcdPresent) {
-    static uint32_t lastTestModRefresh2 = 0;
-    if (millis() - lastTestModRefresh2 > 150) { lastTestModRefresh2 = millis(); drawTestModRelay(); }
   }
   if (menuState == MenuState::TEST_MOD_SERVO && lcdPresent) {
     static uint32_t lastTestModRefresh3 = 0;
@@ -1662,10 +2344,9 @@ void loop() {
 
   handleSerialCommand();
 
-  // DIPERBAIKI: timeout diperlebar dari 5000ms -- watchdog cuma reset saat command BARU
-  // dikirim, TIDAK ikut ter-reset oleh pembacaan status. Testing manual (baca status
-  // berulang sambil menunggu progres) wajar jeda lebih dari 5 detik -- nilai lama terlalu
-  // ketat. 30 detik cukup toleran, tetap berfungsi sbg pengaman komunikasi terputus total.
+  // Batas 30 detik tanpa request APA PUN dari master (baca atau tulis -- lihat
+  // onModbusRequestSukses()). Dulu hanya command yang dihitung, sehingga node yang RUNNING
+  // lama tanpa command jatuh FAULT walaupun master terus membacanya.
   constexpr uint32_t COMM_TIMEOUT_MS = 30000;
   if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > COMM_TIMEOUT_MS) {
     currentState = NodeState::FAULT; faultCode = (uint16_t)FaultCode::COMM_TIMEOUT;
@@ -1681,8 +2362,20 @@ void loop() {
     static uint32_t lastLcdRefresh = 0;
     if (millis() - lastLcdRefresh > 500) {
       lastLcdRefresh = millis();
-      lcdPrint(0, 0, "[AUTO] " + activityText());
-      lcdPrint(0, 2, "State:" + String(stateText(currentState)));
+      // DIUBAH (2026-09-29), pola sama dengan Sorter:
+      //   baris 1  PICKER [AUTO]   Diam
+      //   baris 2  Mode : TEST  Pose : 0
+      //   baris 3  State : IDLE
+      //   baris 4  Tahan* utk kalibrasi
+      // Mode: MAIN/TEST tidak selalu sama dengan State -- RESET_FAULT mengembalikan State ke
+      // IDLE tapi tidak mematikan MAIN, sehingga GOTO_HOME/PICK/PLACE ditolak dengan alasan
+      // yang tidak kelihatan. Pose: pose terakhir yang BENAR-BENAR dicapai (register
+      // CURRENT_POSE, 0=HOME 1=PICKUP 2=LIFT), sama dengan yang dibaca Orange Pi.
+      // Picker tidak punya penghitung produksi, jadi baris 4 tetap petunjuk masuk kalibrasi.
+      lcdKiriKanan(0, "PICKER [AUTO]", activityPendek());
+      lcdPasangan(1, "Mode", "M", mainModeActive ? "MAIN" : "TEST",
+                     "Pose", "P", String(mb.Hreg(Reg::CURRENT_POSE)));
+      lcdPrint(0, 2, "State : " + String(stateText(currentState)));
       lcdPrint(0, 3, "Tahan* utk kalibrasi");
     }
   }
