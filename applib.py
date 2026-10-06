@@ -423,11 +423,6 @@ def periksa(bus, pakai_kamera):
             log(f"  !! {NAMA[sid]:10s} " + "; ".join(masalah))
         else:
             log(f"  OK {NAMA[sid]:10s} state={state}")
-        # Titik acuan deteksi restart -- lihat laporan_node().
-        try:
-            UPTIME_AWAL[sid] = (bus.baca(sid, R_UPTIME[sid]), time.monotonic())
-        except (Gagal, RegisterTidakAda):
-            UPTIME_AWAL.pop(sid, None)
 
     try:
         global rak_kosong_awal
@@ -1060,24 +1055,9 @@ def pantau(bus):
         time.sleep(POLL_S)
 
 
-UPTIME_AWAL = {}   # sid -> (uptime node, waktu monotonic) saat pemeriksaan awal
-
-
-def _restart(sid, up, umur):
-    """DIPERBAIKI (2026-10-07): restart = uptime node MUNDUR dibanding yang tercatat saat
-    pemeriksaan awal. Dulu dibandingkan dengan lama program berjalan -- salah kalau Orange Pi
-    dan ESP32 dinyalakan bersamaan (uptime node memang pendek, padahal tidak restart).
-    Register uptime 16 bit (kembali ke 0 tiap 18 jam), jadi dihitung modulo 65536."""
-    if sid not in UPTIME_AWAL:
-        return up + 5 < umur            # tidak ada acuan -- pakai cara lama
-    up0, t0 = UPTIME_AWAL[sid]
-    harapan = (up0 + int(time.monotonic() - t0)) % 65536
-    selisih = (harapan - up) % 65536
-    return 3 < selisih < 65536 - 3      # toleransi 3 s: uptime dibaca dalam detik bulat
-
 def laporan_node(bus):
     """Dipanggil saat produksi ditahan: node mana yang menjawab, dan apakah ada yang RESTART
-    selama program berjalan (uptime-nya mundur dibanding saat pemeriksaan awal) -- node itu
+    selama program berjalan. Node yang uptime-nya lebih pendek dari umur program ini pasti
     menyala ulang di tengah jalan -- penyebab paling umum: tegangan turun saat motor/servo
     menarik arus besar. 'Tidak menjawab' biasa tidak bisa membedakan itu dari kabel putus."""
     umur = time.monotonic() - T_MULAI
@@ -1092,7 +1072,7 @@ def laporan_node(bus):
                 time.sleep(1)
         if up is None:
             log(f"       {NAMA[sid]:10s} TIDAK MENJAWAB -- cek daya, kabel RS485, layar LCD-nya")
-        elif _restart(sid, up, umur):
+        elif up < umur:
             log(f"       {NAMA[sid]:10s} uptime {up} s -- RESTART selama produksi! "
                 f"(kemungkinan tegangan turun saat motor/servo jalan)")
         else:
@@ -3167,7 +3147,7 @@ def jalankan(panel, layar, sentuh):
 BERHENTI_PANEL = threading.Event()
 
 
-def jalankan_panel(kalibrasi=False, judul_tambahan=''):
+def jalankan_panel(kalibrasi=False):
     """Mode utama: panel LCD sentuh. Produksi dimulai/dihentikan dari layar."""
     if not ADA_PIL:
         sys.exit("ERROR: panel butuh Pillow & numpy:  apt install python3-pil python3-numpy fonts-dejavu-core")
@@ -3181,7 +3161,7 @@ def jalankan_panel(kalibrasi=False, judul_tambahan=''):
     except Exception as e:
         log(f"!! RS485 {RS485_PORT} tidak bisa dibuka: {e}")
         bus = None
-    panel = Panel(layar, sentuh, kal, bus, (k.get('lcd_judul') or 'SORTING') + judul_tambahan)
+    panel = Panel(layar, sentuh, kal, bus, k.get('lcd_judul') or 'SORTING')
 
     def keluar(*_):
         BERHENTI_PANEL.set()

@@ -97,7 +97,7 @@ def main():
             sys.exit(1)
         return
 
-    A.jalankan_panel(kalibrasi=args.kalibrasi, judul_tambahan=' SIM' if args.simulasi else '')
+    A.jalankan_panel(kalibrasi=args.kalibrasi)
 
 
 def siapkan_simulasi(args):
