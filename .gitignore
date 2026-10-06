@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+rak_terisi.txt
+touch_kalibrasi.json
+alarm_riwayat.json
+rak_terisi_simulasi.txt
+alarm_riwayat_simulasi.json

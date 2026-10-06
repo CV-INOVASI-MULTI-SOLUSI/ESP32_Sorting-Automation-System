@@ -1,0 +1,31 @@
+# ============================================================
+#  Panel LCD Sorting Automation -- jalan otomatis saat Orange Pi menyala
+#
+#  Pasang (sekali):
+#      cp sorting-automation.service /etc/systemd/system/
+#      systemctl daemon-reload
+#      systemctl enable --now sorting-automation
+#
+#  Selama service ini jalan, /dev/ttyS3 dipegang panel. Untuk mode terminal
+#  (--tanpa-lcd, --uji, --cek), hentikan dulu:
+#      systemctl stop sorting-automation
+#  Log:  journalctl -u sorting-automation -f
+#
+#  Sesuaikan WorkingDirectory/ExecStart kalau folder script bukan /root/sorting_automation.
+# ============================================================
+[Unit]
+Description=Panel LCD Sorting Automation
+After=multi-user.target time-sync.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sorting_automation
+ExecStart=/usr/bin/python3 -u /root/sorting_automation/sorting-automation.py
+Restart=on-failure
+RestartSec=5
+# SIGTERM -> panel menghentikan produksi dengan rapi (Sorter dulu, lalu semua node ke TEST).
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

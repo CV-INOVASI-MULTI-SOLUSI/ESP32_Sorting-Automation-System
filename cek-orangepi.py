@@ -125,4 +125,4 @@ if gagal:
     for t in gagal:
         print("   - " + t)
     sys.exit(1)
-print(" SEMUA OK. Lanjut: python3 /root/sorting/sorting_automation.py  (menu 'f')")
+print(" SEMUA OK. Lanjut: python3 sorting-automation.py --uji  (menu 'f')")

@@ -5,6 +5,7 @@
 #  Jalankan SEKALI di board baru, sebagai root:
 #      sudo bash setup-orangepi-one.sh              # dasar: UART + Python
 #      sudo bash setup-orangepi-one.sh --wiringop   # + wiringOP (LED/buzzer HuskyLens)
+#      sudo bash setup-orangepi-one.sh --panel      # + LCD sentuh ILI9341 (SPI, Pillow) -- termasuk wiringOP
 #
 #  Yang dikerjakan:
 #    1. cek model board
@@ -19,7 +20,11 @@
 set -euo pipefail
 
 PASANG_WIRINGOP=0
-[[ "${1:-}" == "--wiringop" ]] && PASANG_WIRINGOP=1
+PASANG_PANEL=0
+for a in "$@"; do
+  [[ "$a" == "--wiringop" ]] && PASANG_WIRINGOP=1
+  [[ "$a" == "--panel" ]] && { PASANG_PANEL=1; PASANG_WIRINGOP=1; }   # panel butuh GPIO wiringOP
+done
 
 if [[ $EUID -ne 0 ]]; then
   echo "Jalankan sebagai root:  sudo bash $0 ${1:-}"
@@ -82,6 +87,17 @@ else
   else
     echo "overlays=uart1 uart3" >> "$ENV"
   fi
+  if [[ $PASANG_PANEL -eq 1 ]]; then
+    # Panel LCD sorting-automation.py: SPI0 sebagai /dev/spidev0.0. Batas frekuensi bawaan overlay
+    # hanya 1 MHz -- satu layar penuh butuh >1 detik. 32 MHz memberi ruang untuk 24 MHz.
+    if ! grep -qE "^overlays=(.*[[:space:]])?spi-spidev([[:space:]]|$)" "$ENV"; then
+      sed -i "s/^overlays=\(.*\)$/overlays=\1 spi-spidev/" "$ENV"
+    fi
+    for p in param_spidev_spi_bus=0 param_spidev_max_freq=32000000; do
+      k="${p%%=*}"
+      if grep -q "^$k=" "$ENV"; then sed -i "s/^$k=.*/$p/" "$ENV"; else echo "$p" >> "$ENV"; fi
+    done
+  fi
   echo "   $ENV  ->  $(grep '^overlays=' "$ENV")"
   echo "   cadangan asli: $ENV.sebelum-sorting"
 fi
@@ -95,6 +111,10 @@ if ! pip3 install -q minimalmodbus pyserial 2>/dev/null; then
   pip3 install -q --break-system-packages minimalmodbus pyserial
 fi
 python3 -c "import minimalmodbus, serial; print('   minimalmodbus', minimalmodbus.__version__, '| pyserial', serial.VERSION)"
+if [[ $PASANG_PANEL -eq 1 ]]; then
+  apt-get install -y -qq python3-pil python3-numpy python3-spidev fonts-dejavu-core
+  python3 -c "import PIL, numpy, spidev; print('   Pillow', PIL.__version__, '| numpy', numpy.__version__, '| spidev OK')"
+fi
 
 echo
 echo "== 4. Folder script"
@@ -143,4 +163,8 @@ echo "   1. reboot                       (overlay UART baru aktif setelah ini)"
 echo "   2. ls -l /dev/ttyS1 /dev/ttyS3  (dua-duanya harus ada)"
 echo "   3. salin script ke /root/sorting, lalu:"
 echo "      python3 /root/sorting/cek-orangepi.py"
+if [[ $PASANG_PANEL -eq 1 ]]; then
+  echo "   4. panel LCD: ls -l /dev/spidev0.0, cocokkan [lcd] di display.config dengan"
+  echo "      'gpio readall', lalu: python3 sorting-automation.py  (lihat sorting-automation.service)"
+fi
 echo "============================================================"
