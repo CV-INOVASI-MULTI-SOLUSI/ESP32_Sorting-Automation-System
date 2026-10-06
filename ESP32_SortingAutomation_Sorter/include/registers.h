@@ -49,6 +49,8 @@ namespace Reg {
   // Kecepatan yang disetarakan ke PWM penuh (255). Ini SARAN nilai untuk parameter
   // kalibrasi "Mm/s Max", yang dipakai menghitung waktu tempuh objek scan->palang.
   constexpr uint16_t SPEED_MM_S_AT_MAX_PWM  = 23;  // R
+  // BARU (2026-10-05): 1 = hopper dijeda lewat Cmd::SET_HOPPER_JEDA (conveyor tetap jalan).
+  constexpr uint16_t HOPPER_DIJEDA          = 24;  // R
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik (bukan cuma IDLE/RUNNING generik) ---
@@ -84,6 +86,10 @@ enum class Cmd : uint16_t {
   // BARU -- biar kecepatan bisa di-tuning dari Orange Pi langsung, gak wajib lewat LCD/Serial lokal.
   SET_PALANG_SPEED = 9,   // arg: palangSpeed PWM 0-255
   SET_HOPPER_STEP  = 10,  // arg: hopperStepUs (pasangan SET_HOPPER_INTERVAL yg sudah ada), 1-2500
+  // BARU (2026-10-05): arg 1 = jeda umpan hopper, 0 = lanjut. Conveyor & palang TETAP jalan,
+  // supaya objek yang sudah di belt tetap terklasifikasi dan didorong tepat waktu. Dipakai
+  // orchestrator saat package diganti. START/STOP selalu membatalkan jeda.
+  SET_HOPPER_JEDA  = 11,
   TEST_HOPPER_CYCLE = 97,      // test-only -- 1x siklus maju-mundur hopper pakai nilai KALIBRASI
   TEST_TRIGGER_PALANG = 98    // O12 -- simulasi 1 hasil reject tanpa HuskyLens, utk kalibrasi TOF
   // DIHAPUS (2026-09-20): TEST_FAULT = 99 -- komentarnya sendiri sudah menyuruh hapus sebelum

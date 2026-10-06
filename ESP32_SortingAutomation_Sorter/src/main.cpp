@@ -256,6 +256,14 @@ uint32_t testHopperPushHoldStartMs = 0;
 // layar Uji Hopper untuk membandingkan "berapa kali mendorong" dengan "berapa objek yang
 // benar-benar lewat sensor". Selisih keduanya itulah yang dicari saat menguji hopper.
 uint32_t hopperSiklusSelesai = 0;
+// BARU (2026-10-05): umpan hopper dijeda (Cmd::SET_HOPPER_JEDA). Siklus yang SEDANG berjalan
+// diselesaikan dulu -- hopper berhenti di posisi awal, tidak pernah menggantung di tengah dorongan.
+bool hopperDijeda = false;
+void setHopperJeda(bool jeda) {
+  if (hopperDijeda != jeda) Serial.printf("[HOPPER] umpan %s\n", jeda ? "DIJEDA" : "dilanjutkan");
+  hopperDijeda = jeda;
+  mb.Hreg(Reg::HOPPER_DIJEDA, jeda ? 1 : 0);
+}
 // DIUBAH (2026-09-29): mengembalikan true kalau siklus benar-benar dimulai -- dipakai layar
 // Test Command untuk menampilkan DITERIMA/DITOLAK di panel, bukan cuma di Serial.
 bool startTestHopperCycle() {
@@ -452,6 +460,9 @@ void handleHopper() {
       // dorong-tarik nonstop selama RUNNING. Sekarang diam dulu selama cfg.hopperCycleGapMs
       // (0 = perilaku lama). Ini satu-satunya kendali laju umpan yang dimiliki Sorter.
       if (cfg.hopperCycleGapMs > 0 && millis() - hopperAtStartSinceMs < cfg.hopperCycleGapMs) break;
+      // BARU (2026-10-05): dijeda -- tetap di posisi awal. Jeda antar siklus dihitung ulang
+      // dari saat dilanjutkan, jadi dorongan pertama sesudahnya tidak langsung menyusul.
+      if (hopperDijeda && !hopperIntervalTestMode && !hopperUjiBerulang) { hopperAtStartSinceMs = millis(); break; }
       hopperState = HopperState::MOVING_TO_PUSH;
       break;
     case HopperState::MOVING_TO_PUSH:
@@ -949,6 +960,7 @@ bool applyCommand(uint16_t opcode, uint16_t arg) {
       } else {
         currentState = NodeState::RUNNING_OR_MOVING;
         mainModeActive = true;   // BARU -- MAIN aktif, command TEST diblokir sampai STOP
+        setHopperJeda(false);    // BARU (2026-10-05) -- jeda lama tidak boleh terbawa ke produksi baru
         Serial.println("[CMD] START -- MAIN aktif, command TEST diblokir sampai STOP");
       }
       break;
@@ -962,6 +974,11 @@ bool applyCommand(uint16_t opcode, uint16_t arg) {
       // menghentikannya di tengah meninggalkan palang menjulur di atas conveyor.
       clearClassificationQueue("STOP diterima");
       palangPending = false;
+      setHopperJeda(false);    // BARU (2026-10-05)
+      break;
+    // BARU (2026-10-05): jeda/lanjut umpan hopper tanpa menghentikan conveyor -- lihat registers.h.
+    case Cmd::SET_HOPPER_JEDA:
+      setHopperJeda(arg != 0);
       break;
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb, simpan SEBELUM di-nol-kan
@@ -2216,6 +2233,7 @@ const char* activityPendek() {
   // operator tidak tahu bahwa yang bergerak sebenarnya palang. Motor fisiknya sama dengan
   // "Palang" di atas; bedanya yang ini arah mentah dan tidak berhenti sendiri.
   if (motorAState != 0) return "PlgMan";
+  if (currentState == NodeState::RUNNING_OR_MOVING && hopperDijeda) return "HopJed";   // BARU 2026-10-05
   if (currentState == NodeState::RUNNING_OR_MOVING) return "Jalan";
   return "Diam";
 }
@@ -2424,6 +2442,7 @@ void setup() {
   mb.addHreg(Reg::SPEED_LAST_MS, 0);
   mb.addHreg(Reg::SPEED_SAMPLE_COUNT, 0);
   mb.addHreg(Reg::SPEED_MM_S_AT_MAX_PWM, 0);
+  mb.addHreg(Reg::HOPPER_DIJEDA, 0);         // BARU 2026-10-05
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   mb.onRequestSuccess(onModbusRequestSukses);   // BARU -- watchdog dari request apa pun
   mb.onSetHreg(Reg::CLASSIFY_IS_REJECT, onClassifyWrite);

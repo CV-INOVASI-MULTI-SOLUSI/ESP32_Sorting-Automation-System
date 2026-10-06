@@ -15,7 +15,7 @@ namespace Reg {
 
   // DIPERBARUI (2026-09-22): slot pose dinomori ulang rapat jadi 0, 1, 2 -- lubang bekas
   // jalur objek satuan (pass/reject/lift) dibuang seluruhnya.
-  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home, 1=package_pickup, 2=lift_load)
+  constexpr uint16_t CURRENT_POSE = 10;   // R -- pose terakhir tercapai (0=home, 1=package_pickup, 2=lift_load, 3=ready)
 
   // BARU: Lapis 2 (SubState) + Lapis 3 (diagnostik) -- sinkron pola SORTER
   constexpr uint16_t ACTIVITY_CODE   = 11;  // R
@@ -29,8 +29,8 @@ namespace Reg {
   // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
   // Register ini bikin master bisa bedain dua kondisi itu.
   constexpr uint16_t MENU_ACTIVE = 16;  // R, 1 = operator lagi di menu kalibrasi LCD
-  // BARU (2026-09-30): gerakan yang sedang dijalankan (0=Home>Pick 1=Pick>Home 2=Home>Place
-  // 3=Place>Home, 255 = tidak ada) dan slot adegan yang sedang dikerjakan (1-20, 0 = belum
+  // BARU (2026-09-30): gerakan yang sedang dijalankan (sejak 2026-10-01: 0=Home>Ready
+  // 1=Ready>Pick 2=Pick>Home 3=Home>Place 4=Place>Home, 255 = tidak ada) dan slot adegan yang sedang dikerjakan (1-20, 0 = belum
   // mulai). Kalau lengan berhenti di tengah gerakan karena FAULT/E-stop, dua angka ini
   // menunjukkan tepat di adegan mana -- tanpa itu posisinya harus ditebak dari nilai servo.
   constexpr uint16_t GERAKAN_AKTIF = 17;  // R
@@ -53,6 +53,7 @@ enum class ActivityCode : uint16_t {
   // BARU (2026-09-30): sedang menjalankan salah satu adegan sebuah gerakan. Gerakan mana dan
   // adegan ke berapa ada di register GERAKAN_AKTIF / ADEGAN_KE.
   ADEGAN_GERAK = 12,
+  MENUJU_READY = 13,   // BARU (2026-10-01) -- menuju pose 3, titik siaga dekat package
   FAULT_AKTIF = 90, ESTOP_AKTIF = 91
 };
 
@@ -79,8 +80,8 @@ enum class Cmd : uint16_t {
   // TIDAK dipakai ulang -- PICK/PLACE dkk tetap nomor eksplisit di bawah biar gak geser.
   PICK = 5, PLACE = 6,                              // manual override
   RESET_FAULT = 7,
-  MOVE_PACKAGE = 8,  // DIUBAH 2026-09-30: Home -> Pick -> Home -> Place -> Home lewat keempat
-                      // GERAKAN (masing-masing 20 slot adegan, lihat main.cpp). TANPA arg.
+  MOVE_PACKAGE = 8,  // DIUBAH 2026-10-01: Ready -> Pick -> Home -> Place -> Home -> Ready lewat
+                      // lima GERAKAN (masing-masing 20 slot adegan, lihat main.cpp). TANPA arg.
   // BARU -- biar kecepatan trajectory (berlaku SAMA ke semua 6 joint) bisa di-tuning dari
   // Orange Pi langsung, gak wajib lewat LCD/Serial lokal.
   SET_TRAJ_STEP = 9,           // arg: trajStepUs, 1-500
@@ -97,8 +98,11 @@ enum class Cmd : uint16_t {
   // memverifikasi kalibrasi dari jarak jauh, keduanya justru yang paling perlu dilihat.
   // Manual override, jadi DITOLAK selama MAIN aktif seperti GOTO_HOME/PICK/PLACE.
   GOTO_POSE_N = 13,
-  // BARU (2026-09-30): jalankan SATU gerakan, arg 0-3 (0=Home>Pick 1=Pick>Home 2=Home>Place
-  // 3=Place>Home). Lengan lebih dulu dibawa ke pose ASAL gerakan itu, karena adegan-adegannya
+  // BARU (2026-09-30): jalankan SATU gerakan, arg 0-4 (nomornya lihat GERAKAN_AKTIF).
+  // Lengan lebih dulu dibawa ke pose ASAL gerakan itu, karena adegan-adegannya
   // dirancang dari sana. Manual override -- ditolak selama MAIN aktif.
-  RUN_GERAKAN = 14
+  RUN_GERAKAN = 14,
+  // BARU (2026-10-01): ke pose 3 READY lewat HOME + gerakan Home>Ready -- titik siaga lengan
+  // menunggu MOVE_PACKAGE. Manual override, ditolak selama MAIN aktif.
+  GOTO_READY = 15
 };

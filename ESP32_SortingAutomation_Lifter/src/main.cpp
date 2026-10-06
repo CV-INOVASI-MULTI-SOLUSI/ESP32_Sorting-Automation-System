@@ -161,6 +161,9 @@ void updateBuzzerBeep() {
 
 struct RackPos { int32_t x, z; };
 RackPos RACK[6];
+// DIGANTI NAMA (2026-10-01): di panel, Serial dan Orange Pi titik ini sekarang disebut READY,
+// sepadan dengan pose READY Picker. Variabel, kunci NVS "loadPos" dan opcode GOTO_LOAD_POSITION
+// SENGAJA tidak diganti -- kalibrasi yang sudah tersimpan tetap terbaca, nomor opcode tetap 6.
 // BARU: Load Position -- titik tunggal tempat lift "standby" menunggu robot arm
 // meletakkan/mengambil package, BEDA dari Home (limit switch, titik nol fisik)
 // dan Rack (6 slot penyimpanan akhir). Dikalibrasi manual, tersimpan NVS.
@@ -660,7 +663,7 @@ void handleCycle() {
         if (testRackTimingActive) {
           testRackTimingActive = false;
           float elapsedSec = (millis() - testRackCycleStartMs) / 1000.0f;
-          Serial.printf("[TEST-RACK] 1 siklus (Rak->Push->Tarik->Load) selesai dalam %.2f detik\n", elapsedSec);
+          Serial.printf("[TEST-RACK] 1 siklus (Rak->Push->Tarik->Ready) selesai dalam %.2f detik\n", elapsedSec);
           if (menuState == MenuState::TEST_RACK_SELECT) {
             char buf[21];
             snprintf(buf, sizeof(buf), "Siklus: %.2f detik!", elapsedSec);
@@ -912,7 +915,7 @@ bool applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       ackPending = true; pendingAckSeq = seq; return true;
     case Cmd::GOTO_LOAD_POSITION:   // BARU -- manual, menuju titik standby terima package
       if (blockIfFaulted("GOTO_LOAD_POSITION", seq)) return false;
-      if (!homed[0] || !homed[2]) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "GOTO_LOAD_POSITION: axis X/Z belum homing"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
+      if (!homed[0] || !homed[2]) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "GOTO_READY: axis X/Z belum homing"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
       tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z;
       state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
@@ -1026,7 +1029,7 @@ const char* CAL_LABELS[CAL_COUNT] = {
   "Jog X/Y/Z",
   "Test ke Rak",
   "Simpan Slot Rak",
-  "Simpan Load Pos",
+  "Simpan Ready",
   "Simpan Dorong",
   "Kecepatan",
   "Reset Default",
@@ -1089,8 +1092,8 @@ void handleTestRackSelectKey(char key) {
       tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z;
       state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
-      lcdPrint(0, 3, "Ke Load Pos dulu...");
-      Serial.printf("[TEST-RACK] Menuju Load Position, lalu Rak %u (push+tarik+balik)\n", testRackSequenceTarget);
+      lcdPrint(0, 3, "Ke Ready dulu...");
+      Serial.printf("[TEST-RACK] Menuju READY (Load Position), lalu Rak %u (push+tarik+balik)\n", testRackSequenceTarget);
     }
   }
   else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); }
@@ -1234,8 +1237,8 @@ void handleCalListKey(char key) {
       case CalId::SIMPAN_LOAD:   // simpan X,Z SAAT INI sebagai Load Position (satu titik)
         loadPos = {curPos[0], curPos[2]};
         saveLoadPosToNvs();
-        lcdPrint(0, 3, "LoadPos disimpan!");
-        Serial.printf("[CAL] X=%ld Z=%ld -> loadPos\n", (long)curPos[0], (long)curPos[2]);
+        lcdPrint(0, 3, "Ready disimpan!");
+        Serial.printf("[CAL] X=%ld Z=%ld -> READY (Load Position)\n", (long)curPos[0], (long)curPos[2]);
         break;
       case CalId::SIMPAN_DORONG:
         if (curPos[1] <= 0) { lcdPrint(0, 3, "Y harus>0(jog dulu)"); }
@@ -1595,7 +1598,7 @@ CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
   {"RESET_FAULT",     Cmd::RESET_FAULT,              0, GATE_NETRAL},
   {"FULL_CYCLE 1",    Cmd::RUN_FULL_CYCLE,           1, GATE_MAIN},
   {"HOME_ALL",        Cmd::HOME_ALL,                 0, GATE_NETRAL},
-  {"GOTO_LOAD",       Cmd::GOTO_LOAD_POSITION,       0, GATE_NETRAL},
+  {"GOTO_READY",      Cmd::GOTO_LOAD_POSITION,       0, GATE_NETRAL},   // DIGANTI NAMA 2026-10-01 (dulu GOTO_LOAD)
   {"MOVE_TO_RACK 1",  Cmd::MOVE_TO_RACK,             1, GATE_TEST},
   {"PUSH_BOX",        Cmd::PUSH_BOX,                 0, GATE_TEST},
 };
@@ -1679,7 +1682,7 @@ void handleSerialCommand() {
     else Serial.println("[MOVE] Gagal -- cek homing/slot");
   }
   else if (cmd == "PUSH") { applyCommand((uint16_t)Cmd::PUSH_BOX, 0, 0); Serial.println("[PUSH] Extend+retract Y dimulai"); }
-  else if (cmd == "LOADPOS") { applyCommand((uint16_t)Cmd::GOTO_LOAD_POSITION, 0, 0); Serial.println("[LOADPOS] Menuju Load Position dimulai"); }
+  else if (cmd == "READY" || cmd == "LOADPOS") { applyCommand((uint16_t)Cmd::GOTO_LOAD_POSITION, 0, 0); Serial.println("[READY] Menuju READY (Load Position) dimulai"); }
   else if (cmd == "FULLCYCLE") {
     uint8_t slot = line.substring(sp1 + 1).toInt();
     applyCommand((uint16_t)Cmd::RUN_FULL_CYCLE, slot, 0);
@@ -1988,12 +1991,12 @@ void loop() {
           cycleStageStartMs = millis();
           testRackTimingActive = true;
           testRackCycleStartMs = millis();   // BARU -- mulai hitung 1 siklus (Rak->Push->Tarik->Load)
-          Serial.printf("[TEST-RACK] Load Position tercapai, menuju Rak %u\n", testRackSequenceTarget);
+          Serial.printf("[TEST-RACK] READY tercapai, menuju Rak %u\n", testRackSequenceTarget);
         } else {
           // DIUBAH: JANGAN paksa currentState=IDLE di sini -- moveToRackXZ() yang gagal sudah
           // memanggil raiseFault() (currentState=FAULT). Menimpanya dgn IDLE menghapus jejak
           // fault dari register STATE, persis bug yang baru diperbaiki.
-          Serial.println("[TEST-RACK] Gagal menuju rak dari Load Position (cek FaultCode)");
+          Serial.println("[TEST-RACK] Gagal menuju rak dari READY (cek FaultCode)");
         }
       } else {
         currentState = NodeState::IDLE;
