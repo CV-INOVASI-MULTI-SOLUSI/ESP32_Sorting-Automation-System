@@ -173,6 +173,13 @@ def pantau_palang(instr, detik=4.0):
     Dua tanda bahwa palang benar-benar bekerja:
       - ACTIVITY_CODE sempat bernilai 2 (CONVEYOR_JALAN_PALANG_AKTIF), dan
       - REJECT_COUNT naik 1.
+
+    CATATAN (2026-09-28): pada firmware sebelum tanggal ini, kode 2 TIDAK PERNAH
+    MUNCUL. Siklus palang ikut menyetel motorAState = 1 dan activityCode()
+    memeriksanya lebih dulu, jadi yang terbaca 3 (MOTOR_A_JALAN) -- kode yang
+    seharusnya berarti jog manual. Sudah diperbaiki di firmware, tapi selama
+    Sorter belum di-flash ulang, terimalah 2 maupun 3. REJECT_COUNT naik tidak
+    terpengaruh dan tetap bukti terkuat.
     """
     reject_awal = baca(instr, REG_REJECT_COUNT)
     terlihat = set()

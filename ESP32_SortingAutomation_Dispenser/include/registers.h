@@ -4,6 +4,10 @@
 // ============================================================
 // REGISTER MAP MODBUS — FEEDER (docs/07-PROTOCOL.md §7.1, §7.5)
 // ============================================================
+// NOMOR RILIS FIRMWARE -- NAIKKAN setiap kali firmware baru dikirim ke mesin (200 = v2.00,
+// 201 = v2.01, 210 = v2.10). Terbaca Orange Pi di MORE > SYSTEM > NODE, bersama waktu build.
+constexpr uint16_t FIRMWARE_VERSI = 201;   // 201: backup/restore kalibrasi (2026-10-09)
+
 namespace Reg {
   constexpr uint16_t STATE       = 0;
   constexpr uint16_t FAULT_CODE  = 1;
@@ -75,6 +79,26 @@ namespace Reg {
   constexpr uint16_t DISPENSER_READY = 25;  // R
   // Tahap pipeline produksi, untuk diagnosa jarak jauh (lihat PipelineStage di main.cpp).
   constexpr uint16_t PIPELINE_STAGE  = 26;  // R
+  // BARU (2026-10-07): waktu BUILD firmware, diisi otomatis saat compile (__DATE__/__TIME__).
+  // Orange Pi membacanya untuk melacak node mana yang sudah di-flash firmware terbaru.
+  // Firmware lama tidak punya register ini (master menerima ILLEGAL DATA ADDRESS).
+  constexpr uint16_t FW_TAHUN      = 27;  // R, mis. 2026
+  constexpr uint16_t FW_BULAN_HARI = 28;  // R, bulan*100 + hari, mis. 1007
+  constexpr uint16_t FW_JAM_MENIT  = 29;  // R, jam*100 + menit, mis. 1405
+  constexpr uint16_t FW_VERSI      = 30;  // R, nomor rilis FIRMWARE_VERSI, mis. 200 = v2.00
+  // BARU (2026-10-07): alamat IP & kekuatan sinyal WiFi, diperbarui tiap 5 s. Orange Pi memakai
+  // IP ini untuk update firmware OTA tanpa mengetik IP (IP dari DHCP boleh berubah).
+  constexpr uint16_t WIFI_IP_HI    = 31;  // R, oktet 1 << 8 | oktet 2 (0 = WiFi tidak tersambung)
+  constexpr uint16_t WIFI_IP_LO    = 32;  // R, oktet 3 << 8 | oktet 4
+  constexpr uint16_t WIFI_RSSI     = 33;  // R, dBm sebagai int16 (mis. -61), 0 = tidak tersambung
+  // BARU (2026-10-09): backup / restore kalibrasi lewat Modbus -- protokol lengkap di
+  // include/kalibrasi_modbus.h (sama di keempat node). Firmware < v2.01 tidak punya register ini.
+  constexpr uint16_t CAL_FORMAT = 34;  // R, nomor format gambar kalibrasi
+  constexpr uint16_t CAL_UKURAN = 35;  // R, panjang gambar (byte)
+  constexpr uint16_t CAL_CRC    = 36;  // R, CRC16-CCITT gambar (diisi CAL_BACA offset 0)
+  constexpr uint16_t CAL_OFFSET = 37;  // R, offset jendela terakhir
+  constexpr uint16_t CAL_HASIL  = 38;  // R, kode hasil perintah CAL terakhir (CalHasil)
+  constexpr uint16_t CAL_DATA0  = 39;  // RW, 32 register = jendela 64 byte (sampai 70)
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik FEEDER (refillState yg sudah ada) ---
@@ -107,6 +131,9 @@ enum class FaultCode : uint16_t {
 
 // --- Opcode CMD (§7.5) ---
 enum class Cmd : uint16_t {
+  // BARU (2026-10-09): backup / restore kalibrasi (include/kalibrasi_modbus.h), ack langsung.
+  // Opcode SAMA di keempat node. Ditolak selama MAIN aktif / node bergerak.
+  CAL_BACA = 60, CAL_TULIS = 61, CAL_TERAPKAN = 62,
   NONE = 0,
   REQUEST_REFILL = 1,       // DIUBAH MAKNA: sekarang "maju karena package di TENGAH sudah FULL" --
                               // conveyor jalan sampai package itu sampai UJUNG (PACKAGE_READY_FLAG=1)

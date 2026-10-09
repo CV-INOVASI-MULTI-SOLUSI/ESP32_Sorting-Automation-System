@@ -1,7 +1,7 @@
 # Cara Kerja Sistem Sekarang & Analisa Celah/Dobel
 
-Tanggal: 2026-09-19 (update: semua 7 temuan sudah diputuskan & 6 di antaranya sudah diperbaiki)
-Cakupan: hasil audit menyeluruh terhadap firmware 4 node (Sorter, Dispenser, Picker, Stocker/Lifter) dan seluruh script Python di Orange Pi, setelah arsitektur MAIN/TEST mode ditambahkan (commit `ddc0226`) dan orchestrator produksi diperbaiki hari ini (belum di-commit).
+Tanggal dibuat: 2026-09-19. Terakhir diperbarui: 2026-09-30 (Temuan #1-#76; §10 audit Sorter & Stocker, §11 Picker + LCD + menu sistem, §12 uji HuskyLens + tata letak panel, §13 orchestrator produksi gabungan, §14 gerakan & adegan Picker).
+Cakupan: audit menyeluruh firmware 4 node (Sorter, Dispenser, Picker, Stocker/Lifter) dan seluruh script Python di Orange Pi. Dimulai setelah arsitektur MAIN/TEST mode ditambahkan (commit `ddc0226`), berlanjut sampai commit `9e6830f`. Tabel di bawah mencakup Temuan #1-#37; Temuan #38-#50 punya tabelnya sendiri di §11, dan Temuan #51-#66 di §12.
 
 **Status ringkas semua temuan (lihat detail di §6):**
 
@@ -433,3 +433,624 @@ Di keempat node channel ini di-`pinMode` OUTPUT di `setup()` dan terdaftar di me
 ### 10.4 Yang TIDAK disentuh
 
 Logika alur Dispenser (`handleRefillFSM`, guard PROX_2, debounce, placeholder package-full) sengaja tidak diubah sama sekali — node itu sedang dalam pengujian aktif. Dispenser hanya menerima dua tambahan yang murni aditif dan tidak mengubah perilaku apa pun: register `MENU_ACTIVE` dan penulisan `LED_FAULT`.
+
+---
+
+## 11. Picker, LCD, dan menu sistem (2026-09-22 s/d 28) — Temuan #38-#50
+
+Konteks: setelah audit Sorter & Stocker selesai, fokus pindah ke Picker. Di tengah jalan muncul satu temuan yang berlaku di keempat node (#43) dan dua koreksi pemahaman mekanisme yang datang langsung dari user (#48, #49). Semua sudah diperbaiki, `pio run` SUCCESS untuk keempat node, **belum ada yang di-flash sejak 2026-09-20**.
+
+| # | Temuan | Status |
+|---|---|---|
+| 38 | Picker: jalur objek SATUAN tidak punya pemakai sama sekali | ✅ Dihapus -- `RUN_SEQUENCE`, `GOTO_PASS`, menu, command Serial |
+| 39 | Picker: slot pose berlubang di tengah (bekas pass/reject/lift) | ✅ Dinomori ulang rapat 0/1/2 + kunci NVS diganti |
+| 40 | Picker: register `CURRENT_POSE` tidak pernah ditulis sekali pun | ✅ Ditulis saat gerakan selesai |
+| 41 | Picker: menguji gerakan harus lewat Orange Pi/serial | ✅ Layar "Test Gerakan" di menu kalibrasi |
+| 42 | Picker: menu kecepatan tidak menunjukkan akibat gabungan Jelajah×Interval | ✅ Laju hasil + waktu tempuh ditampilkan live |
+| 43 | **Semua node: penulisan LCD menahan `loop()` dan menelan tick gerakan** | ✅ `lcdPrint()` hanya menulis baris yang berubah |
+| 44 | Dispenser: kecepatan conveyor disetel tanpa bisa melihat akibatnya | ✅ Sabuk jalan live di layar Conveyor Speed/Dir |
+| 45 | Semua node: versi firmware & IP hanya terlihat dari Serial USB | ✅ Kategori menu ke-4 "Info Sistem", 3 halaman |
+| 46 | Sorter: `PROX_1` (ch19) menganggur, bahkan belum di-`pinMode` | ✅ Dipakai sebagai garis START uji kecepatan objek |
+| 47 | Sorter: "Mm/s Max" (kalibrasi TOF palang) cuma tebakan | ✅ Bisa diukur, hasilnya diterapkan dengan satu tombol |
+| 48 | Picker: istilah "gripper" salah -- tidak ada penjepit | ✅ Diganti netral mekanisme; sendok dari bawah |
+| 49 | Picker: `POST_PLACE` menentukan untuk sendok, tapi masih nol | ⚠️ Dicatat & diperingatkan -- **menunggu kalibrasi user** |
+| 50 | Picker: pose 1 dan 2 tidak bisa didatangi lewat Modbus | ✅ Opcode `GOTO_POSE_N` (13), arg = nomor slot |
+
+### 11.1 Temuan #43 — penulisan LCD menahan loop. Ini yang paling luas.
+
+Dilaporkan user sebagai "begitu keluar dari menu, gerakannya jadi lebih halus".
+
+Menulis 20 karakter ke LCD lewat I2C memakan beberapa milidetik dan menahan `loop()`. Layar-layar test menggambar ulang seluruh baris tiap 100-250 ms **walau isinya sama persis**, sehingga gerakan yang timing-nya diatur per-tick kehilangan tick. Tick yang hilang tidak pernah dibayar belakangan — `updateTrajectory()` dan `updateSteppers()` masing-masing maju satu langkah per interval, tanpa mekanisme mengejar. Jadi dampaknya langsung terasa sebagai sentakan, tepat di layar yang dipakai untuk mengamatinya.
+
+Paling parah di **Stocker**: layar Jog Posisi di-refresh tiap 200 ms sementara stepper melangkah dengan jeda 600 mikrodetik. Satu penulisan layar menelan belasan langkah. Untuk stepper, timing yang tidak rata bukan cuma terasa kasar — motor bisa benar-benar kehilangan langkah, artinya posisi yang dilaporkan firmware tidak lagi cocok dengan posisi fisik. Justru di layar itulah posisi rak disetel.
+
+Ternyata bisa diperbaiki di satu tempat per node: **seluruh** penulisan layar melewati satu fungsi `lcdPrint()`. Sekarang fungsi itu menyimpan isi terakhir tiap baris dan melewati penulisan kalau tidak ada yang berubah. `lcd.clear()` diganti `lcdClear()` yang membatalkan cache, begitu juga re-init LCD saat hot-plug. Cache per-layar yang sempat ditambahkan di Picker dibuang karena sudah tercakup.
+
+**Konsekuensi yang perlu diingat:** setelan kecepatan apa pun yang disetel sambil mengamati dari dalam layar menu SEBELUM perbaikan ini sebenarnya mengukur sendatan, bukan kemampuan mesin. Layak disetel ulang setelah flash.
+
+### 11.2 Temuan #38-#40 — Picker dirampingkan
+
+User mengonfirmasi arm robot **hanya** memindahkan package penuh dari ujung Dispenser; objek satuan tidak pernah disentuhnya. Seluruh jalur "ambil satu objek dari jalur PASS" karena itu tidak punya pemakai — orchestrator produksi pun hanya mengirim `MOVE_PACKAGE`.
+
+Dihapus: `Cmd::RUN_SEQUENCE` (opcode 1), `Cmd::GOTO_PASS` (opcode 3), command Serial `SEQ`, dua entri menu Test Command, `ActivityCode::MENUJU_PASS`/`MENUJU_LIFT`. Opcode 1 dan 3 sengaja dibiarkan kosong.
+
+Awalnya slot pose dibiarkan 6 dengan tiga lubang di tengah supaya nomor 4 dan 5 tidak bergeser. User menolak: lubangnya cuma menyisakan jebakan saat kalibrasi (operator harus mengingat 1/2/3 tidak boleh dipakai). Dinomori ulang rapat: **0=HOME, 1=PACKAGE_PICKUP, 2=LIFT_LOAD**.
+
+**Kunci NVS diganti `poses` → `poses3`, dan ini penting.** Blob lama berisi 6 pose dengan ARTI BERBEDA per slot. Kalau terbaca ke array 3 slot yang baru, tiga pose pertama (home, pass, reject) masuk sebagai home/pickup/lift dan lengan bergerak ke tempat yang sama sekali salah — tanpa peringatan apa pun. Dengan kunci baru, kalibrasi lama diabaikan dan nilai default yang aman dipakai. Perubahan tata letak slot di masa depan perlu perlakuan sama.
+
+Register `CURRENT_POSE` ternyata cuma di-`addHreg` di setup dan **tidak pernah ditulis**, jadi nilainya selamanya 0. Script uji membacanya dan selalu melaporkan pose 0 — menyesatkan tepat saat memverifikasi kalibrasi.
+
+### 11.3 Temuan #48-#49 — mekanisme sendok, dua koreksi dari user
+
+`config.h` menyebut "5 joint lengan + 1 gripper", dan istilah itu menyebar ke komentar firmware, script uji, serta penjelasan saya. **Picker tidak punya gripper** — keenam servonya joint lengan, dan package diangkat dengan **disendok dari bawah** (user menyebut "sementara", jadi mekanismenya mungkin berubah).
+
+Istilah yang salah itu berbahaya saat kalibrasi: operator yang mengira ada penjepit akan mencari joint yang membuka-menutup, padahal yang perlu disetel adalah pergeseran beberapa joint sekaligus lewat `PICK_OFFSET`/`PLACE_OFFSET`.
+
+Dari mekanisme sendok muncul konsekuensi yang mengubah status satu parameter. Package hanya **duduk** di atas sendok tanpa dijepit. Setelah `PLACE` menurunkannya, sendok masih berada DI BAWAH package. Tanpa `POST_PLACE` menarik sendok keluar, kepulangan ke HOME menyeret atau menjatuhkan package yang baru diletakkan.
+
+Jadi **`POST_PLACE` bukan gerakan opsional di mekanisme ini** — dan nilainya masih `{0,0,0,0,0,0}` bawaan. Artinya siklus `MOVE_PACKAGE` hari ini akan meletakkan package lalu langsung menyeretnya pergi. Script uji memperingatkan ini eksplisit sebelum masuk tahap produksi.
+
+### 11.4 Temuan #46-#47 — uji kecepatan objek di Sorter
+
+`PROX_1` (channel 19) di Sorter menganggur total dan bahkan belum pernah di-`pinMode`, jadi pembacaannya tidak bermakna. Sekarang jadi garis START, `PROX_2` (sensor pass produksi) jadi garis FINISH, jaraknya diatur di menu.
+
+Sepenuhnya pasif: hanya membaca sensor, tidak menyentuh aktuator apa pun, dan jalur produksi `PROX_2` (`handleSensors` → `passCount`) tidak diubah — jadi boleh menyala terus termasuk selama produksi.
+
+Dua hal soal ketelitian: stempel waktu diambil dari **tepi mentah**, bukan dari saat debounce selesai, sehingga jeda debounce tidak ikut terhitung; dan ambang kedua sensor dibuat sama persis supaya sisa kesalahan sistematis saling meniadakan di selisihnya.
+
+Nilai gunanya: firmware ikut menghitung kecepatan yang disetarakan ke PWM penuh, yaitu **saran langsung untuk parameter "Mm/s Max"** — parameter yang menentukan kapan palang mendorong, yang selama ini cuma tebakan. Satu tombol `#` menerapkannya.
+
+Layar "Uji Kecepatan" juga bisa menjalankan conveyor langsung tanpa `START` (tanpa MAIN, jadi hopper tidak ikut menjatuhkan objek), memakai pola `hopperIntervalTestMode` yang sudah ada.
+
+### 11.5 Yang masih menunggu keputusan user
+
+**Jalur bermuatan terlalu rendah.** Di `MOVE_PACKAGE` ada naik sebelum berayun ke pose 1, tapi tidak ada naik **setelah** `PICK`. `PICK_OFFSET` menurunkan joint 2 sebanyak 200, jadi perjalanan membawa package justru terjadi pada ketinggian paling rendah. Dua pilihan diajukan: lewat HOME (menambah waktu menggendong, dan hanya aman kalau HOME membuat sendok tetap datar), atau menerapkan ulang `CLEARANCE` setelah `PICK` (lebih murah, tanpa parameter baru, tanpa bergantung orientasi HOME — ini yang disarankan). Belum dipilih.
+
+**Posisi berhenti package tidak selalu tepat.** Urutan penanganan yang disarankan: penahan mekanis di titik ambil lebih dulu (membuat pose 1 terulang dalam milimeter dan menggugurkan kebutuhan lainnya), lalu memperkecil luncuran conveyor, lalu pemeriksaan gagal-aman bahwa `UJUNG_PACKAGE_PRESENT` masih 1 tepat sebelum `MOVE_PACKAGE`, dan hanya sebagai jalan terakhir kompensasi posisi di software. Picker tidak punya sensor sendiri, jadi pemeriksaan posisi harus datang dari Dispenser lewat master.
+
+**`FW_VERSION` belum pernah dinaikkan** sepanjang sesi, masih `v.01.00.25082026.21.17` di keempat node. Sekarang versinya tampil di panel lewat Info Sistem, jadi menaikkannya akan langsung membedakan node yang sudah di-flash dari yang belum.
+
+### 11.6 Dua aturan diagnosis yang dipelajari dari kesalahan sendiri
+
+**Bedakan "tidak menjawab" dari "register tidak ada".** Script probe saya menyimpulkan "firmware Picker masih lama" padahal semua pembacaan gagal dengan `NoResponseError` — node itu tidak ada di bus sama sekali. `IllegalRequestError` yang berarti register tidak ada. Menyamakan keduanya menghasilkan kesimpulan yang salah tapi terdengar yakin.
+
+**Satu program Modbus saja per waktu di `/dev/ttyS3`.** Probe yang dijalankan sementara script user masih hidup membuat keduanya saling merusak, dan hasilnya muncul sebagai `SerialException` yang mirip kerusakan bus. Uji ulang setelah script dihentikan: 200 kali baca, 0 gagal.
+
+---
+
+## 12. Uji HuskyLens + palang + hopper, dan tata letak panel Sorter (2026-09-28/29) — Temuan #51-#66
+
+Konteks: user sudah punya script produksi HuskyLens yang berjalan di Orange Pi (baca ID dari
+kamera, LED/buzzer, lalu kirim `CLASSIFY_IS_REJECT` ke Sorter) dan meminta dibuatkan versi
+**uji**-nya. Menulis script uji itu memaksa membaca ulang jalur verifikasinya, dan di situ
+muncul satu bug firmware yang sudah ikut menyesatkan dua dokumen yang saya buat sendiri.
+
+| # | Temuan | Status |
+|---|---|---|
+| 51 | **Sorter: `ACTIVITY_CODE` 2 (`CONVEYOR_JALAN_PALANG_AKTIF`) tidak pernah bisa muncul** | ✅ Urutan pemeriksaan di `activityCode()` dibetulkan |
+| 52 | Verifikasi palang dibaca terlalu cepat — sebelum TOF selesai | ✅ Script uji mengamati berjendela, dan mengukur TOF nyatanya |
+| 53 | Pembaca frame HuskyLens membuang buffer tiap pemanggilan | ✅ Buffer dipertahankan antar pembacaan di script uji |
+| 54 | Sorter: palang tidak bisa diperiksa sebagai mekanisme, hanya sebagai siklus 300ms yang ditunda TOF | ✅ Layar kalibrasi "Uji Palang" -- ON/OFF ditahan + conveyor live |
+| 55 | Sorter: perintah manual Motor A tidak punya batas waktu -- mentok bisa ditahan tanpa henti | ✅ `PALANG_MANUAL_MAX_MS` 3000ms, padam sendiri, DAN padam saat FAULT |
+| 56 | **Sorter: conveyor TERUS BERJALAN saat FAULT** | ⚠️ Dilaporkan, belum diperbaiki -- **menunggu keputusan user** |
+| 57 | Sorter: hopper hanya bisa dipicu sebagai siklus, posisinya tidak bisa ditahan | ✅ Layar kalibrasi "Uji Hopper" + hitungan siklus vs objek |
+| 58-61 | Sorter: menu per perangkat, Test I/O, Test Command, layar utama | ✅ Lihat §12.7 |
+| 62-66 | Keempat node disamakan; rak 0, START_MAIN, pin relay | Lihat §12.8 |
+
+### 12.1 Temuan #51 — kode "palang aktif" yang tidak pernah terpakai
+
+`activityCode()` memeriksa `motorAState` **sebelum** `palangActive`:
+
+```cpp
+if (motorAState != 0) return ActivityCode::MOTOR_A_JALAN;              // 3
+if (currentState != NodeState::RUNNING_OR_MOVING) return ActivityCode::DIAM;
+return palangActive ? ActivityCode::CONVEYOR_JALAN_PALANG_AKTIF        // 2
+                    : ActivityCode::CONVEYOR_JALAN;
+```
+
+Masalahnya `handlePalangQueue()` ikut menyetel `motorAState = 1` saat mulai mendorong — itu
+perlu supaya `updateConv1Stby()` tahu motor sedang jalan. Jadi sepanjang siklus palang, baris
+pertama selalu menang, dan kode 2 **tidak bisa dicapai dari jalur mana pun**. Yang dilaporkan
+ke master selalu 3, yaitu kode yang artinya "jog manual Motor A".
+
+Dua hal berbeda arti karena itu tidak bisa dibedakan dari Modbus: palang mendorong objek
+reject (produksi) versus operator menjog motor untuk diagnostik. Dan lebih jauh dari itu,
+**dua dokumen yang saya buat sendiri menyuruh menunggu kode 2 sebagai bukti palang bekerja**
+— `panduan-test-palang-qmodmaster 20260921.md` §10 dan fungsi `pantau_palang()` di
+`contoh-kirim-command-palang 20260921.py`. Petunjuk itu tidak akan pernah terpenuhi, dan
+akibatnya kegagalan yang dilaporkan bukan kegagalan palang, tapi kegagalan cara mengamatinya.
+
+Versi LCD dari fungsi yang sama, `activityText()`, justru sudah benar — ia menangani keempat
+kombinasi conveyor×motorA secara eksplisit dan menampilkan `"Conv+Palang"`. Jadi panel lokal
+menunjukkan yang benar sementara Modbus tidak; perbedaan itulah yang membuat bug ini bisa
+hidup lama tanpa terlihat.
+
+Perbaikannya memindahkan `palangActive` ke atas. Sekarang artinya lebih tegas daripada
+sebelum bug pun: **2 = palang sedang PUSH/RETRACT, apa pun keadaan conveyor** (jadi berguna
+juga saat menguji di TEST mode dengan conveyor diam), **3 = Motor A jalan tanpa siklus
+palang, yaitu benar-benar jog manual**. Nomornya tidak diubah supaya master/script lama tidak
+ikut rusak.
+
+Kedua dokumen di atas sudah dikoreksi, dengan catatan eksplisit bahwa **selama Sorter belum
+di-flash ulang, 2 maupun 3 harus diterima** sebagai tanda palang bergerak.
+
+### 12.2 Temuan #52 — verifikasi yang dibaca sebelum ada yang bisa dilihat
+
+Script produksi user memanggil `baca_status_palang()` persis setelah `kirim_reject()`. Itu
+tidak akan pernah menangkap palang bekerja: firmware **sengaja menunda** dorongan sejauh
+waktu tempuh objek dari titik scan ke palang (`calculateTOF()` = `distMm / kecepatan`, dengan
+kalibrasi bawaan 150 mm ÷ 211 mm/detik ≈ **708 ms**). Pembacaan yang diambil beberapa
+milidetik setelah write selalu terjadi sebelum palang bergerak.
+
+Jadi verifikasi palang harus **berjendela**, bukan sekali baca — dan lebar jendelanya sendiri
+bergantung kalibrasi, yang berarti tidak boleh ditebak. Script uji karena itu dibagi tiga
+tahap, dan tahap kedua **mengukur** jeda command→dorong lalu memberikannya ke tahap ketiga:
+
+- **Tahap A — HuskyLens saja.** Tidak satu pun register ditulis, jadi palang tidak mungkin
+  bergerak. Membuktikan kamera, baud, dan pemetaan ID. Sampel ID mentah ditampilkan, bukan
+  cuma verdict-nya, supaya ID yang goyah (objek di batas bidang pandang) kelihatan.
+- **Tahap B — palang saja.** `TEST_TRIGGER_PALANG` beberapa kali, jeda sampai palang bergerak
+  diukur. Angka inilah TOF nyata pada kalibrasi terpasang; kalau jauh dari
+  (jarak ÷ kecepatan), salah satu dari dua angka kalibrasi itu tidak sesuai kenyataan.
+- **Tahap C — gabungan.** HuskyLens memutuskan, hasilnya dikirim sebagai klasifikasi
+  sungguhan, palang diverifikasi per objek, dan `REJECT_MISSED_COUNT` diikuti.
+
+Empat prasyarat diperiksa lebih dulu, karena semuanya membuat seluruh uji tidak berarti tanpa
+gejala yang jelas: node tidak menjawab, **operator sedang di menu kalibrasi** (sejak
+2026-09-20 klasifikasi ikut diabaikan di sana — HuskyLens terlihat bekerja, write sukses,
+palang tidak akan pernah bergerak), FAULT/ESTOP (`handlePalangQueue()` tidak dipanggil sama
+sekali), dan mode MAIN (`TEST_TRIGGER_PALANG` ditolak selama produksi).
+
+Satu keterbatasan yang disebut eksplisit di script: conveyor Sorter **tidak punya opcode
+nyala/mati sendiri** — ia berjalan selama node `RUNNING`, jadi satu-satunya cara menjalankannya
+dari Modbus adalah `START`, dan `START` berarti MAIN, yang juga menjalankan hopper. Karena itu
+tahap C punya saklar `TAHAP_C_JALANKAN_CONVEYOR`: `False` menguji rantai logika dengan objek
+diam (TOF tidak ada artinya, hanya membuktikan palang bergerak saat diminta), `True` menguji
+kondisi produksi sungguhan dan satu-satunya yang bisa menilai apakah palang mengenai objek
+yang benar.
+
+### 12.3 Temuan #53 — buffer HuskyLens yang dibuang tiap pemanggilan
+
+`baca_id()` di script produksi membuat `buffer = b""` **lokal di dalam fungsi**. Setiap
+pemanggilan berakhir, buffer ikut hilang. Frame yang kebetulan terpotong di tengah — hal
+normal pada serial 9600 — karena itu hilang seluruhnya, bukan tersambung dengan sisa byte yang
+datang di pemanggilan berikutnya.
+
+Akibatnya deteksi kadang meleset tanpa sebab yang kelihatan, dan meleset paling sering justru
+saat objek datang cepat — tepat saat deteksi paling dibutuhkan. Di script uji pembacanya jadi
+kelas dengan buffer yang bertahan, header dicari dengan `find()` (potong sekaligus, bukan
+geser satu byte per iterasi), dan dua byte terakhir disisakan saat header belum ketemu karena
+`55 AA 11` bisa terbelah antar pembacaan.
+
+### 12.4 Temuan #54-#55 — layar kalibrasi "Uji Palang"
+
+Sampai sekarang palang hanya bisa dipicu sebagai **satu siklus otomatis**: push selama
+`palangPushMs` (bawaan 300 ms), retract selama `palangRetractMs`, dan seluruhnya ditunda
+sejauh TOF. Itu benar untuk produksi, tapi tidak cukup untuk memeriksa palang **sebagai
+mekanisme**. Empat hal yang tidak bisa dinilai dalam 300 ms: apakah palang menjulur PENUH,
+apakah arahnya sudah benar terhadap kalibrasi `Palang Dir`, apakah dia macet atau berat, dan
+apakah dorongannya benar-benar menyingkirkan objek **selagi sabuk berjalan**.
+
+Item kalibrasi baru "Uji Palang" (index 19, disisipkan sebelum "Reset ke Default" supaya index
+0-18 tidak bergeser terhadap `selParam`) menahan palang pada satu posisi:
+
+| Tombol | Aksi |
+|---|---|
+| `A` | palang ON — PUSH / julur, **ditahan** |
+| `B` | palang OFF — RETRACT / tarik, **ditahan** |
+| `0` | motor STOP (netral, tidak didorong ke arah mana pun) |
+| `#` | 1 siklus otomatis pakai nilai kalibrasi, **tanpa penundaan TOF** |
+| `C` | conveyor ON / OFF |
+| `D` | kembali — palang dan conveyor dimatikan otomatis |
+
+Tiga keputusan di dalamnya yang bukan sekadar selera:
+
+**Arah mengikuti `cfg.palangDir`, bukan angka mentah `setMotorA()`.** `setMotorA(1)` berarti
+"maju" menurut `motorWrite`, sedangkan `handlePalangQueue()` mendorong ke arah `cfg.palangDir`.
+Kalau layar uji memakai angka mentah, "ON" bisa berarti retract pada kalibrasi tertentu — dan
+operator akan mengkalibrasi ke arah yang salah tanpa pernah tahu. Jadi `palangManual(+1)`
+memetakan PUSH lewat `cfg.palangDir ? 1 : 2`.
+
+**Conveyor memakai saklar yang sama dengan layar Uji Kecepatan (`speedTestConveyorOn`).** Sabuk
+karena itu berjalan **tanpa START/MAIN**: hopper tidak ikut bersiklus dan tidak ada objek yang
+dijatuhkan sendiri, jadi operator meletakkan objek dengan tangan lalu mendorongnya. Ini juga
+berarti satu-satunya alasan menyalakan sabuk dari sini: **dorongan yang berhasil pada sabuk
+diam belum membuktikan apa pun tentang dorongan pada sabuk berjalan.**
+
+**`#` memakai jalur produksi, bukan salinannya.** Satu siklus dijalankan dengan menyetel
+`palangTriggerAt = millis(); palangPending = true;` lalu membiarkan `handlePalangQueue()`
+bekerja seperti biasa — jadi push/retract/buzzer/`rejectCount` berperilaku identik dengan
+produksi, dan yang dihilangkan hanya penundaannya. Menulis ulang siklusnya di dalam layar uji
+akan membuat dua versi yang bisa menyimpang, dan yang diuji bukan lagi yang dipakai.
+
+Perintah manual **ditolak** selama `palangState != IDLE` (guard yang sudah ada di `setMotorA()`),
+dan `#` menghentikan perintah manual lebih dulu — kalau tidak, motor sedang didorong ke satu
+arah sementara siklus otomatis mendorongnya ke arah lain, persis jenis bentrok yang guard itu
+dibuat untuk mencegah. Keadaan palang otomatis juga **menang tampilan** di baris 2: kalau
+siklus produksi sedang jalan, perintah manual memang sedang ditolak, dan itu harus terlihat
+daripada tampil sebagai "diam".
+
+**Temuan #55 — batas waktu bukan kenyamanan, tapi perlindungan.** Palang adalah linear
+actuator. Menahan PUSH setelah dia mentok berarti motor **stall dengan arus penuh** tanpa ada
+yang mematikannya; operator yang menekan `A` lalu meninggalkan panel meninggalkannya begitu
+sampai daya dicabut. `PALANG_MANUAL_MAX_MS = 3000` memadamkannya sendiri, dan sisa waktunya
+ditampilkan di layar supaya matinya tidak terlihat seperti kerusakan.
+
+`updatePalangManual()` sengaja dipanggil **di luar** blok bersyarat `loop()`, bukan di dalamnya
+bersama `handlePalangQueue()`. Alasannya menentukan: FAULT di node ini dipicu **tanpa
+memadamkan motor** (mis. MCP23017 lepas dari I2C), dan seluruh blok gerak dilewati begitu FAULT
+aktif. Kalau batas waktu itu ada di dalam blok tersebut, perintah manual yang sedang ditahan
+tepat saat FAULT terjadi **tidak akan pernah dipadamkan oleh siapa pun**. Pola yang sama dengan
+`updateBuzzerBeep()` yang sudah lebih dulu dipindah keluar karena alasan sejenis. Sebagai
+lapis kedua, fungsi itu juga memadamkan motor begitu melihat FAULT/E-STOP, tidak sekadar
+menunggu batas waktunya habis.
+
+### 12.5 Temuan #56 — conveyor terus berjalan saat FAULT
+
+Ditemukan saat memastikan layar Uji Palang tidak bisa meninggalkan motor hidup. **Ini celah
+yang sudah ada sebelumnya dan tidak berhubungan dengan palang.**
+
+FAULT di Sorter dipicu di dua tempat tanpa memadamkan aktuator apa pun: `IO_EXPANDER_MISSING`
+saat `io.recheckHealth()` gagal, dan `COMM_TIMEOUT` setelah 30 detik tanpa Modbus. Yang terjadi
+sesudahnya:
+
+```cpp
+if (currentState != NodeState::ESTOPPED && currentState != NodeState::FAULT) {
+  ...
+  handleConveyor();      // <-- tidak dipanggil lagi begitu FAULT aktif
+```
+
+`handleConveyor()` adalah satu-satunya tempat yang menulis `ledcWrite(LEDC_CH_CONV1, 0)` dalam
+operasi normal. Begitu ia berhenti dipanggil, **PWM tetap keluar pada nilai terakhirnya** dan
+`CONV1_STBY` tetap HIGH, karena keduanya hardware yang jalan sendiri tanpa CPU. Hanya E-stop
+(`handleSafety`) dan `otaSafeStop()` yang memadamkannya secara langsung, dan FAULT bukan
+keduanya.
+
+Jadi gejalanya: sabuk **terus berjalan** sementara node menolak semua command dan LCD
+menampilkan `FAULT!`. Pada `IO_EXPANDER_MISSING` ini paling buruk — sabuk berjalan justru saat
+firmware sudah menyatakan data sensornya tidak bisa dipercaya.
+
+Bandingkan dengan Stocker, yang justru sudah diperbaiki untuk kasus ini (Temuan #24-#25):
+`raiseFault()` di sana memanggil `haltMotion()` supaya gerak benar-benar berhenti. Sorter belum
+punya padanannya. Perbaikannya kecil — memadamkan conveyor dan Motor A saat FAULT masuk —
+tapi karena ini menyentuh jalur keselamatan dan di luar lingkup permintaan yang sedang
+dikerjakan, **statusnya dilaporkan dan menunggu keputusan user**, tidak diubah sendiri.
+
+### 12.6 Temuan #57 — layar kalibrasi "Uji Hopper"
+
+Alasannya sama dengan Uji Palang, tapi yang tidak bisa diperiksa berbeda. Hopper sudah punya
+tiga cara dipicu sebelum ini — opcode `TEST_HOPPER_CYCLE` (97), tombol fisik `BTN_TEST_HOPPER`,
+dan `hopperIntervalTestMode` yang bersiklus live selagi operator berada di layar parameter
+Hopper Step/Step Interval. Ketiganya menjalankan **siklus**, dan tidak satu pun bisa **menahan
+posisi**.
+
+Empat hal yang hanya kelihatan kalau ditahan: apakah pendorong benar-benar mencapai ujung,
+apakah Titik Awal sudah cukup mundur sehingga objek berikutnya bisa turun, apakah ada objek
+yang tersangkut atau ikut terbawa balik, dan apakah rack-pinion bergerak sejauh yang
+diperkirakan. Titik Dorong hanya ditahan selama `hopperPushHoldMs` (bawaan 300 ms) dalam siklus
+normal — terlalu singkat untuk menilai semua itu.
+
+| Tombol | Aksi |
+|---|---|
+| `A` | tahan di **Titik Awal** |
+| `B` | tahan di **Titik Dorong** |
+| `#` | 1 siklus penuh pakai nilai kalibrasi |
+| `*` | siklus **berulang** on/off, termasuk jeda `hopperCycleGapMs` |
+| `C` | conveyor ON / OFF |
+| `0` | nol-kan penghitung siklus & objek |
+| `D` | kembali — hopper dikembalikan ke Titik Awal, siklus & conveyor dimatikan |
+
+**Dua angka berdampingan, dan itu inti layar ini.** Baris 3 menampilkan `Siklus:` (berapa kali
+hopper mendorong) di sebelah `Objek:` (berapa objek benar-benar melewati PROX_2). Selisihnya
+adalah satu-satunya ukuran keandalan umpan yang dimiliki Sorter: siklus tanpa objek berarti
+**gagal jatuh**, objek lebih banyak dari siklus berarti **jatuh dobel**. Keduanya sama-sama
+merusak laju umpan dan sama-sama tidak terlihat kalau hanya salah satu angka ditampilkan.
+
+Pertanyaan itu juga **tidak bisa dijawab pada sabuk diam** — objek menumpuk di titik yang sama
+dan tidak pernah terbaca sensor. Karena itu conveyor ikut bisa dinyalakan dari layar ini,
+memakai saklar `speedTestConveyorOn` yang sama dengan dua layar uji lainnya.
+
+Tiga hal yang perlu dicatat di implementasinya:
+
+**Tahan posisi memakai `updateHopperTrajectory()` yang sama dengan produksi, bukan lompat
+langsung.** Lompatan 1000 us sekaligus adalah hentakan keras pada servo dan rack-pinion, dan
+yang teramati jadi bukan gerakan yang sebenarnya dipakai saat produksi.
+
+**`hopperUjiBerulang` sengaja TERPISAH dari `hopperIntervalTestMode`** walau perilakunya mirip.
+Flag yang kedua itu milik layar parameter Hopper Step/Step Interval dan dimatikan oleh jalur
+keluar layar-layar tersebut. Kalau dipakai bersama, satu layar bisa mematikan mode milik layar
+lain tanpa ada yang tahu kenapa hopper tiba-tiba berhenti.
+
+**Siklus apa pun menang atas perintah manual.** `updateHopperManual()` melepas targetnya sendiri
+begitu melihat siklus berjalan — tanpa itu, dua pihak menulis satu servo yang sama tiap tick dan
+posisinya jadi tarik-menarik. Keluar dari layar dan mematikan siklus berulang sama-sama
+mengembalikan hopper ke Titik Awal, tidak meninggalkannya di posisi dorong yang menahan objek
+berikutnya.
+
+
+### 12.7 Temuan #58-#61 — tata letak menu & layar utama Sorter (2026-09-29)
+
+Empat perubahan atas permintaan operator yang sedang memakai panel Sorter. Dua di antaranya
+(#59 dan #60) ternyata bukan soal selera tampilan, tapi menutup jebakan yang nyata.
+
+| # | Temuan | Status |
+|---|---|---|
+| 58 | Setting Kalibrasi satu daftar datar 22 item, sebagian label terpotong | ✅ Dua tingkat per perangkat, label muat utuh |
+| 59 | Test Output bisa men-toggle `CONV1_STBY`; relay tersembunyi di Test Modul | ✅ `CONV1_STBY` dibuang, relay pindah ke Test Output, label nama channel lengkap |
+| 60 | **Test Command bisa menimpa kalibrasi dan menahan palang mentok tanpa batas** | ✅ Item berbahaya dibuang; hasil DITERIMA/DITOLAK tampil di panel |
+| 61 | Layar utama tidak menampilkan Mode dan reject yang lolos | ✅ Tata letak baru 4 baris |
+
+**#58 — Setting per perangkat.** Sekarang `Setting Kalibrasi → Conveyor / Palang / Hopper /
+Buzzer / Reset`, lalu parameter perangkat itu, dengan layar uji paling akhir di tiap grup.
+Sebagian label lama **terpotong di layar**: baris daftar hanya menyisakan 15 kolom setelah
+`"> a. "`, sedangkan label seperti "Hopper Step Interval(ms)" 24 karakter. Dengan nama
+perangkat pindah ke judul layar, awalannya tidak perlu lagi.
+
+Yang sengaja **tidak** diubah: nomor parameter (`selParam`). `drawParamMenu()`,
+`handleParamKey()`, dan logika live-test bercabang pada nomor itu, jadi pengelompokan hanya
+memetakan urutan tampil ke nomor lama — tidak satu pun layar parameter disentuh. Nomornya
+sekarang punya nama (`namespace CalId`), dan `handleCalListKey()` bercabang pada ID, bukan
+posisi. Dulu cabangnya `calCursor == 18/19/20/21`, dan setiap sisipan item baru memaksa semua
+angka itu digeser — tiga kali dalam sepuluh hari terakhir. `drawCalList()` dan state
+`CAL_LIST` dipertahankan namanya supaya semua jalur keluar layar uji (`menuState = CAL_LIST;
+drawCalList();`) otomatis kembali ke grup yang tadi dibuka tanpa diubah.
+
+**#59 — Test Output.** Relay sempat dibuang dari Test Output dan Test Modul, lalu atas
+permintaan operator **dipindah ke Test Output** sebagai `RELAY_1`/`RELAY_2` — sempat tidak ada
+satu tempat pun untuk mengujinya. Relay adalah output digital biasa, jadi di Test Output ia
+diuji dengan cara yang sama dengan LED dan buzzer (rate-limit 300 ms beban induktif, hanya
+saat IDLE); layar Test Modul → Relay yang terpisah dihapus. `CONV1_STBY` dibuang karena
+alasan yang lebih serius: pin itu dikendalikan
+`updateConv1Stby()` lewat cache `lastConv1StbyState`, dan men-toggle-nya dari menu membuat
+cache itu **berbohong** — pin fisik berubah, software yakin belum. Conveyor atau palang lalu
+bisa mati senyap sampai ada perubahan state yang kebetulan memaksa penulisan ulang. Itu bug
+yang persis sama dengan yang sudah diperbaiki di `otaSafeStop()` pada 2026-09-20; menu ini
+adalah jalan masuk kedua ke bug yang sama. Label LED jadi nama channel lengkap (`LED_OPR`,
+`LED_RUN`, ...) supaya cocok dengan skema.
+
+**#60 — Test Command.** Empat item dibuang:
+
+- `SET_SPEED (test=200)` dan `SET_DIR (test=0)` **menimpa kalibrasi** — speed jadi 200 dan
+  conveyor jadi **mundur** — tanpa item untuk mengembalikannya. Lebih buruk: menekan `#` di
+  layar parameter mana pun menyimpan **seluruh** `cfg` ke NVS, jadi nilai uji itu ikut
+  tersimpan permanen tanpa operator sadar. Conveyor yang tiba-tiba berjalan mundur setelah
+  reboot akan sangat sulit ditelusuri balik ke sini.
+- `MOTOR_A Maju` / `MOTOR_A Stop` menggerakkan palang dengan arah **mentah** (mengabaikan
+  kalibrasi Palang Dir) dan **tanpa batas waktu** — Maju tanpa Stop menahan linear actuator
+  mentok dengan arus penuh. Layar Uji Palang melakukan hal yang sama dengan arah yang benar
+  dan padam sendiri setelah 3 detik (#55). Tetap tersedia lewat Modbus untuk master.
+
+Dua cacat tampilan juga diperbaiki. Petunjuk `"C=kirim D=kembali"` ditulis di baris 4 dan
+**menimpa baris daftar ketiga**, jadi item terakhir tidak pernah terlihat saat kursor berada
+di situ. Dan layar menulis `"Terkirim, amati aksi"` **persis sama** untuk command yang
+dijalankan maupun yang ditolak — penolakan hanya tercetak di Serial. `applyCommand()` dan
+`startTestHopperCycle()` sekarang mengembalikan `bool`, dan hasilnya tampil di baris judul:
+`OK, amati aksinya` / `TOLAK: MAIN aktif` / `TOLAK: FAULT/ESTOP`. Pemanggil lama (Modbus,
+Serial) mengabaikan nilai itu, perilakunya tidak berubah.
+
+**#61 — layar utama.**
+
+```
+SORTER [AUTO]   Diam
+Mode : TEST Miss : 0
+State : IDLE
+Pass : 0  Reject : 0
+```
+
+Baris 2 diisi dua hal yang sebelumnya tidak terlihat di panel sama sekali:
+
+- **Mode** — MAIN/TEST tidak selalu sama dengan State. `RESET_FAULT` mengembalikan State ke
+  IDLE tapi **tidak** mematikan MAIN, jadi node terlihat IDLE sementara semua command TEST
+  ditolak dengan alasan "MAIN aktif". Tanpa baris ini alasannya tidak kelihatan dari panel.
+- **Miss** — `REJECT_MISSED_COUNT`: objek reject yang lolos tanpa didorong palang. Kegagalan
+  mutu yang sebelumnya hanya terbaca lewat Modbus. Harusnya 0.
+
+Satu batas fisik yang perlu dicatat: format persis `Pass : xxx … Reject : xxx` **tidak muat**
+begitu kedua angka mencapai 3 digit (`"Pass : 123"` + `"Reject : 123"` = 22 karakter, LCD 20
+kolom). `lcdPasangan()` karena itu mencoba bertingkat — lengkap, lalu tanpa spasi di sekitar
+`:`, lalu label satu huruf — dan memakai tingkat pertama yang muat. Yang dikorbankan selalu
+labelnya, bukan angkanya; sampai 7 digit per angka, angka tidak pernah terpotong.
+
+Baris 1 memakai `activityPendek()`, bukan `activityText()`: `"SORTER [AUTO]"` sudah memakan
+13 kolom dan `activityText()` bisa sampai 13 karakter, jadi terpotong di tengah kata. Urutan
+prioritasnya disamakan persis dengan `activityCode()` supaya panel dan Modbus tidak pernah
+saling bertentangan. Hasil uji kecepatan yang dulu menempati baris 2 tetap terbaca di layar
+Uji Kecepatan dan di register 20–23.
+
+### 12.8 Temuan #62-#66 — keempat node disamakan (2026-09-29)
+
+Atas permintaan operator, perubahan #58–#61 diterapkan ke Dispenser, Picker, dan Stocker.
+Memeriksa ulang menu ketiganya memunculkan tiga cacat yang tidak ada hubungannya dengan tata
+letak, dan satu keganjilan wiring yang perlu dicek di hardware.
+
+| # | Temuan | Status |
+|---|---|---|
+| 62 | **Stocker: item Test Command "MOVE_TO_RACK(rak0)" langsung membuat node FAULT** | ✅ Ke Rak 1 |
+| 63 | Dispenser/Picker/Stocker: command produksi tidak bisa diuji dari panel (START_MAIN tidak ada) | ✅ START_MAIN & STOP_MAIN ditambahkan |
+| 64 | Dispenser: layar utama menampilkan `refillState`, FSM yang sudah mati | ✅ Diganti tahap pipeline |
+| 65 | Dispenser: `SET_SPEED`/`SET_DIR` di Test Command menimpa kalibrasi | ✅ Dibuang (sama dengan #60) |
+| 66 | **Dispenser: nomor pin relay tertukar dibanding tiga node lain** | ⚠️ Dilaporkan, **perlu dicek di hardware** |
+
+**#62 — rak 0 yang tidak ada.** Test Command Stocker punya `MOVE_TO_RACK(rak0)` dan
+`RUN_FULL_CYCLE(rak0)` — keduanya mengirim argumen 0. Sejak rak dinomori 1–4 (#22), rak 0 tidak
+ada: `moveToRackXZ(0)` memanggil `raiseFault(RACK_IDX_INVALID)`. Jadi menekan item uji itu dari
+panel **membuat node FAULT**, dan tampilan "Terkirim, amati aksi" tidak memberi tanda apa pun
+bahwa itu akibat item ujinya sendiri. Item uji yang ditulis sebelum #22 dan tidak ikut
+diperbarui saat penomoran berubah. Sekarang `MOVE_TO_RACK 1` dan `FULL_CYCLE 1`.
+
+**#63 — command produksi yang tidak bisa diuji.** Test Command ketiga node berisi command yang
+hanya diterima di MAIN — `REQUEST_REFILL`/`ACK_PACKAGE_TAKEN`/`FORCE_MIDDLE_REFILL` (Dispenser),
+`MOVE_PACKAGE` (Picker), `RUN_FULL_CYCLE` (Stocker) — tapi tidak satu pun punya `START_MAIN`.
+Node selalu boot di TEST, jadi dari panel command-command itu **selalu ditolak**, dan dengan
+"Terkirim, amati aksi" yang sama untuk diterima maupun ditolak, operator tidak punya cara
+mengetahuinya. Sekarang `START_MAIN`/`STOP_MAIN` ada di awal daftar, dan tiap item punya kolom
+`gate` (NETRAL/MAIN/TEST) sehingga penolakan menyebut alasannya: `TOLAK: belum MAIN` atau
+`TOLAK: MAIN aktif`. `applyCommand()` dan fungsi `start*()` yang dipanggilnya kini
+mengembalikan `bool` di keempat node.
+
+**#64 — angka yang diam di 0.** Baris 3 layar utama Dispenser menulis `Refill:<angka>` dari
+`refillState`. Sejak pipeline produksi pindah ke firmware (`PipelineStage`), `refillState`
+tidak dipakai jalur produksi lagi — angkanya diam di 0 apa pun yang terjadi. Diganti tahap
+pipeline (`SIAP ISI (ready)`, `maju ke ujung`, `tunggu diambil arm`, ...), yang memang
+menunjukkan di mana siklus berada. `activityText()` dan `servoRefillStageText()` ikut mati
+karenanya dan dihapus.
+
+**#66 — relay tertukar.** Di `config.h` Sorter, Picker, dan Stocker: `RLY1 = 16`, `RLY2 = 17`.
+Di Dispenser: **`RLY1 = 17`, `RLY2 = 16`**. Pin-pin ini seharusnya mengikuti konvensi universal
+yang sama di keempat node. Kalau keempat board identik, `RELAY_1` di Test Output Dispenser
+sebenarnya menggerakkan terminal yang di node lain disebut RELAY_2. Tidak diubah karena
+wiring fisiknya tidak diketahui dari kode — bisa jadi board Dispenser memang dirakit berbeda.
+Cara memastikannya sekarang mudah: Test I/O → Test Output → `RELAY_1`, lihat terminal mana yang
+berbunyi.
+
+**Setting per perangkat di tiap node:**
+
+| Node | Grup |
+|---|---|
+| Sorter | Conveyor, Palang, Hopper, Buzzer, Reset |
+| Dispenser | Conveyor, Servo 1, Servo 2, Buzzer, Waktu, Reset |
+| Picker | Lengan, Reset |
+| Stocker | Gerak, Rak, Reset |
+
+Dua yang bukan murni "per perangkat", dan alasannya. Dispenser punya grup **Waktu** untuk batas
+waktu proses yang bukan milik satu perangkat (konfirmasi TENGAH, push, tunda force-refill,
+retry test loop). Stocker adalah **satu mekanisme tiga sumbu** yang dihoming dan dijog
+bersamaan, jadi pemisahan per sumbu justru memecah alur kalibrasi; grupnya mengikuti alur itu —
+*Gerak* (AutoHome, Jog, Kecepatan) untuk membawa mekanisme ke posisi, *Rak* (Simpan
+Slot/Load/Dorong, Test ke Rak) untuk merekam posisi itu lalu mengujinya. Picker hanya punya satu
+perangkat, tapi tetap dua tingkat supaya cara menavigasi Setting sama di keempat panel.
+
+**Layar utama tiap node:**
+
+```
+SORTER [AUTO]   Diam      DISPENSER [AUTO]        PICKER [AUTO]   Diam      STOCKER [AUTO]  Diam
+Mode : TEST Miss : 0      SIAP ISI (ready)        Mode : TEST Pose : 0      Mode : TEST  Rak : 1
+State : IDLE              State : IDLE            State : IDLE              State : IDLE
+Pass : 0  Reject : 0      Tengah:ADA   Ujung:--   Tahan* utk kalibrasi      X0Y0Z0
+```
+
+Dispenser satu-satunya yang tidak mengikuti pola baris 1: `"DISPENSER [AUTO]"` sudah 16 kolom,
+jadi aktivitasnya tidak muat. Baris 2 mengambil alih — tahap pipeline saat MAIN, `TEST :
+<aktivitas>` saat TEST — dan karena itu juga menunjukkan mode. Picker tidak punya penghitung
+produksi, jadi baris 4 tetap petunjuk masuk kalibrasi. Stocker mempertahankan posisi XYZ di
+baris 4.
+
+### 12.9 Status setelah sesi ini
+
+`pio run` **SUCCESS** di keempat node dengan seluruh perubahan §12. **Belum ada yang di-flash.**
+
+Koreksi atas catatan sebelumnya, dari probe bus langsung 2026-09-29: klaim "tidak ada node yang
+di-flash sejak 2026-09-20" **salah**. Sorter membawa register yang ditambahkan 2026-09-21, jadi
+di-flash pada/sesudah tanggal itu; Picker dan Dispenser membawa register 2026-09-20. **Stocker
+satu-satunya yang benar-benar tertinggal** — firmwarenya lebih tua dari 2026-09-18 (tidak punya
+`MAIN_MODE_ACTIVE` maupun `MENU_ACTIVE`), jadi pemisahan MAIN/TEST dan seluruh perbaikan
+#22–#37 belum ada di sana. Orange Pi kembali terjangkau 2026-09-29.
+
+Sejak 2026-09-29 (#58) menu Setting Kalibrasi Sorter dikelompokkan per perangkat. Tiga layar
+uji ada di akhir grupnya masing-masing: Conveyor → Uji Kecepatan, Palang → Uji Palang,
+Hopper → Uji Hopper. Ketiganya menyalakan conveyor lewat saklar `speedTestConveyorOn` yang
+sama, jadi sabuk berjalan tanpa START/MAIN dan hopper tidak ikut menjatuhkan objek kecuali
+memang diminta.
+
+
+---
+
+## 13. Orchestrator produksi digabung dengan HuskyLens (2026-09-30) — Temuan #67-#75
+
+`orangepi-orchestrator-batch.py` dan script HuskyLens produksi (yang hanya ada di Orange Pi,
+tidak di repo) diganti **satu** program: `orangepi-orchestrator.py`. File lama dihapus supaya
+tidak ada dua orchestrator yang bisa salah dijalankan.
+
+| # | Temuan | Status |
+|---|---|---|
+| 67 | **Dua program memegang `/dev/ttyS3` bersamaan** (orchestrator + HuskyLens) | ✅ Satu program, satu objek `Bus` dengan lock |
+| 68 | **Watchdog komunikasi node hanya diperbarui oleh command** — Sorter pasti FAULT 30 s setelah START | ✅ Firmware: setiap request sukses dihitung (`onRequestSuccess`) |
+| 69 | Script HuskyLens menulis REJECT **setelah** buzzer (~0,9 s) | ✅ Tulis dulu, lampu & bunyi di thread terpisah |
+| 70 | Satu objek bisa menghasilkan beberapa klasifikasi | ✅ Kamera wajib melihat bidang kosong dulu |
+| 71 | Startup Dispenser: `FORCE_MIDDLE_REFILL` di atas pipeline yang sudah berjalan | ✅ Tunggu `DISPENSER_READY` |
+| 72 | `REQUEST_REFILL` dikirim tanpa menunggu `SIAP ISI` | ✅ Tunggu `DISPENSER_READY` dulu |
+| 73 | Batas waktu lebih pendek dari firmware (UJUNG 15 vs 20 s; `MOVE_PACKAGE` 15 s) | ✅ 30 s dan 180 s |
+| 74 | `RESET_COUNTERS` tiap batch menghapus objek yang lewat selama batch | ✅ Titik acuan maju `BATCH_SIZE` |
+| 75 | Batch gagal diulang tiap ~5 s (bertentangan dengan komentarnya sendiri) | ✅ Gagal = Sorter dihentikan, tunggu operator |
+
+### 13.1 Temuan #68 — watchdog yang tidak mengenal pembacaan
+
+Di keempat node, `lastRs485Rx` hanya diperbarui oleh `onCmdWrite()`. Membaca register dan menulis
+`CLASSIFY_IS_REJECT` tidak dihitung. Di produksi, Sorter `RUNNING` sepanjang shift sementara di
+antara dua batch master hanya membaca `PASS_COUNT` dan menulis klasifikasi — **tidak ada satu pun
+command selama puluhan detik**. Sorter karena itu pasti jatuh `COMM_TIMEOUT` 30 detik setelah
+`START`. Hal yang sama menimpa siklus `MOVE_PACKAGE` Picker yang lebih dari 30 detik dan homing
+Stocker — di tengah gerakan.
+
+Komentar di firmware menunjukkan perilaku ini sudah diketahui (timeout pernah diperlebar dari 5 s
+ke 30 s karena "testing manual baca status berulang"), tapi yang diperbaiki gejalanya, bukan
+penyebabnya. Maksud watchdog ini adalah "master masih hidup", dan request apa pun membuktikannya.
+Sekarang `mb.onRequestSuccess()` memperbaruinya — dipanggil library setelah cek slave ID, jadi
+hanya request untuk node itu yang dihitung. Orchestrator menambah thread keepalive yang membaca
+`STATE` tiap 5 detik.
+
+Alternatif yang dipertimbangkan lalu ditolak: keepalive berupa command kosong (opcode 0). Itu
+menulis `CMD_ACK_SEQ` seketika, dan kalau jatuh tepat setelah ack tertunda `MOVE_PACKAGE` ditulis
+tapi sebelum master sempat membacanya, ack itu tertimpa dan master menunggu sampai timeout.
+
+**Konsekuensi: firmware lama tidak punya perbaikan ini, dan tidak bisa dibedakan dari Modbus** —
+register penandanya tetap sama. Semua node wajib di-flash sebelum orchestrator dipakai.
+
+### 13.2 Temuan #69-#70 — waktu dan jumlah klasifikasi
+
+Firmware mencatat waktu scan saat tulisan `CLASSIFY_IS_REJECT` **tiba** (`enqueueClassification(
+..., millis())`). Script lama membunyikan pola buzzer invalid (~0,9 s, semuanya `sleep`) sebelum
+menulis, jadi palang mendorong 0,9 s terlambat dari seharusnya — kalibrasi TOF apa pun sebelumnya
+diam-diam ikut mengkompensasi keterlambatan ini, dan perlu dicek ulang setelah pindah.
+
+Script lama juga langsung mengambil sampel lagi begitu satu keputusan selesai (±0,3 s). Objek
+yang masih di depan kamera lebih lama dari itu dihitung lagi. Uji tiruan: objek invalid terlihat
+1,5 s → program lama ±4 REJECT, program baru **tepat 1**.
+
+### 13.3 Diuji dengan simulator, belum dengan hardware
+
+Keempat node dipalsukan di level `minimalmodbus` dan bereaksi terhadap command seperti firmware:
+startup + 2 batch + shutdown berjalan benar dengan 0 transaksi tumpang tindih; Picker yang menolak
+`MOVE_PACKAGE` → ditahan setelah **satu** percobaan; rak penuh dan firmware lama → ditolak di
+pemeriksaan awal tanpa satu pun gerakan. Parser HuskyLens diuji dengan frame yang dipotong-potong.
+
+**Masih terbuka:** selama batch berjalan, Sorter terus mengumpan. Kalau package di TENGAH sedang
+ditukar, ke mana objek jatuh belum dijawab. Firmware tidak punya command untuk menjeda hopper saja
+(`STOP` Sorter juga mengosongkan antrian klasifikasi), jadi kalau memang perlu dijeda, itu
+perubahan firmware tersendiri.
+
+---
+
+## 14. Picker: gerakan & adegan (2026-09-30) — Temuan #76
+
+Atas permintaan operator, `MOVE_PACKAGE` tidak lagi memakai pose + offset (CLEARANCE → pose 1 →
+PICK → pose 2 → PLACE → POST_PLACE → home). Satu siklus sekarang **Home → Pick → Home → Place →
+Home**, terdiri dari empat **gerakan**. Tiap gerakan punya **20 slot adegan** yang masing-masing
+ON/OFF; adegan yang ON menggerakkan **satu joint** ke **satu nilai** (µs absolut). Slot dijalankan
+berurutan, yang OFF dilewati, lalu lengan menuju pose tujuan gerakan itu. Kalau yang dipakai
+13 adegan, 7 sisanya OFF.
+
+Alasannya mekanis: `GOTO_POSE` menggerakkan semua joint bersamaan, jadi jalur di antara dua pose
+ditentukan kebetulan. Dengan sendok yang mengangkat dari bawah, **urutan** gerak justru yang
+menentukan berhasil tidaknya.
+
+**Default: semua adegan OFF, nilai = pose HOME yang tersimpan. Tidak ada angka yang ditanam di
+kode.** Versi pertama sempat menanam tabel pengamatan operator sebagai default — operator
+menolaknya: angka yang tidak berasal dari lengan itu sendiri membuat joint **melompat**. Pose
+default juga dikembalikan netral. Dengan semua adegan OFF, gerakan = `GOTO_POSE` biasa.
+
+- **Setting → Lengan → Adegan Gerak**: daftar 20 slot. C setel, `*` ON/OFF, `1` sisip slot kosong
+  (geser turun; syarat slot 20 OFF), `0` dua kali hapus (geser naik). Di layar satu adegan, `*`
+  membawa lengan ke keadaan **tepat sebelum** adegan itu lalu A/B menggerakkan joint secara
+  LIVE; tanpa `*`, mengubah angka tidak menggerakkan apa pun.
+- **Setting → Lengan → Test Adegan**: `A` menjalankan satu adegan per tekan (tekan pertama ke pose
+  asal, tekan sesudah adegan terakhir ke pose tujuan), `B` ulang, `#` dua kali gerakan penuh.
+- Serial: `GERAKAN <g> SET j:us ...`, `GERAKAN <g> SLOT <s> j:us|OFF`, `GERAKAN <g> JALAN`.
+  Satu token salah = seluruh perintah ditolak.
+- Modbus: opcode 14 `RUN_GERAKAN`, register 17/18 `GERAKAN_AKTIF`/`ADEGAN_KE`, aktivitas 12.
+- Data tidak bisa diubah selagi lengan bergerak (panel maupun Serial).
+- Offset CLEARANCE & POST_PLACE tidak dipakai lagi; dikeluarkan dari menu.
+- Sekalian diperbaiki: Reset Default dulu mengisi pose 1 & 2 dengan nilai lain dari default saat
+  boot. Sekarang satu sumber, `POSES_DEFAULT`.
+
+Build SUCCESS, **belum dijalankan di hardware.**

@@ -7,6 +7,24 @@ Palang secara fisik adalah linear actuator (motor DC) di channel Motor A — buk
 solenoid. Ia harus di-drive aktif dua arah: maju (push) lalu mundur (retract).
 Tidak ada pegas yang menariknya balik.
 
+> **Sejak firmware 2026-09-28 ada cara yang lebih langsung: layar kalibrasi
+> "Uji Palang" di panel Sorter** (Setting Kalibrasi → Palang → Uji Palang; sejak
+> 2026-09-29 menu Setting dikelompokkan per perangkat). Di sana palang bisa **ditahan** pada posisi julur atau
+> tarik (`A`/`B`, `0` untuk stop), satu siklus otomatis bisa dijalankan tanpa
+> penundaan TOF (`#`), dan **conveyor bisa dinyalakan dari layar yang sama**
+> (`C`) tanpa perlu START/MAIN — jadi hopper tidak ikut menjatuhkan objek.
+>
+> Pakai layar itu untuk memeriksa **mekanismenya**: apakah palang menjulur
+> penuh, apakah arahnya benar, apakah macet, dan apakah dorongannya benar-benar
+> menyingkirkan objek selagi sabuk berjalan. Dorongan yang berhasil pada sabuk
+> diam belum membuktikan apa pun tentang sabuk berjalan.
+>
+> Pakai QModMaster (dokumen ini) untuk memeriksa **jalur perintahnya**: bahwa
+> master di ujung sana benar-benar bisa menggerakkan palang lewat Modbus.
+>
+> Perintah manual `A`/`B` padam sendiri setelah 3 detik. Itu bukan kerusakan —
+> menahan linear actuator setelah mentok berarti motor stall dengan arus penuh.
+
 ---
 
 ## 1. Sebelum mulai — satu bus, satu master
@@ -149,7 +167,7 @@ utama.
 
 **b. Fault** — baca addr **1**. Kalau bukan 0, command gerak akan ditolak.
 Kirim `RESET_FAULT` (lihat langkah 4), atau lewat LCD: *Setting Kalibrasi →
-Reset Fault*.
+Reset → Reset Fault*.
 
 **c. Mode MAIN/TEST** — baca addr **17**. Kalau `1`, command uji akan ditolak.
 Kirim `STOP` dulu.
@@ -242,6 +260,13 @@ Dua tanda palang benar-benar bekerja:
 
 1. `ACTIVITY_CODE` (addr 13) sempat bernilai **2** = `CONVEYOR_JALAN_PALANG_AKTIF`
 2. `REJECT_COUNT` (addr 11) **naik 1**
+
+> **Pada firmware sebelum 2026-09-28, tanda nomor 1 tidak akan pernah muncul.**
+> Siklus palang ikut menyetel `motorAState = 1` dan `activityCode()` memeriksa itu
+> lebih dulu, jadi yang terbaca **3** (`MOTOR_A_JALAN`) — kode yang seharusnya
+> berarti jog manual. Bug-nya sudah diperbaiki di firmware, tapi selama Sorter
+> belum di-flash ulang, **terimalah 2 maupun 3** sebagai tanda palang bergerak.
+> Tanda nomor 2 (`REJECT_COUNT` naik) tidak terpengaruh dan tetap bukti terkuat.
 
 Kalau keduanya tidak terlihat, baca addr **19** (`REJECT_MISSED_COUNT`). Kalau
 angkanya naik, berarti reject-nya dibuang — antrian penuh, atau gilirannya sudah

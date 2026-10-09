@@ -9,7 +9,7 @@ Instalasi dulu (sekali saja):
 
 Ini versi MINIMAL untuk belajar konsep dasarnya (cuma SORTER, START/STOP +
 tulis CLASSIFY_IS_REJECT). Untuk skrip PRODUKSI ASLI (4 node, MAIN/TEST mode,
-batch penuh Sorter->Dispenser->Picker->Stocker), pakai orangepi-orchestrator-batch.py.
+batch penuh Sorter->Dispenser->Picker->Stocker), pakai orangepi-orchestrator.py.
 Untuk uji manual per-node, pakai test-stocker-rack-sequence*.py atau
 test-dispenser-pipeline*.py. Untuk contoh khusus palang SORTER (4 cara
 menggerakkannya + jebakan MAIN/TEST dan menu LCD), lihat

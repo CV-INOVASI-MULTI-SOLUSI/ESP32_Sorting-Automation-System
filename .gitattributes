@@ -1,0 +1,6 @@
+# Script yang dijalankan di Orange Pi (Linux) WAJIB berakhiran baris LF.
+# Repo ini dipakai dari Windows dengan core.autocrlf=true, yang mengubah LF jadi CRLF saat
+# checkout. Script bash ber-CRLF gagal di Linux dengan "$'\r': command not found", dan
+# shebang "#!/usr/bin/env python3\r" membuat script Python tidak bisa dijalankan langsung.
+*.sh text eol=lf
+*.py text eol=lf

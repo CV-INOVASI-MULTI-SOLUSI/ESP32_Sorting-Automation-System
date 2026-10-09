@@ -13,6 +13,7 @@
 #include <ArduinoOTA.h>
 #include "config.h"
 #include "registers.h"
+#include "kalibrasi_modbus.h"   // BARU 2026-10-09: backup/restore kalibrasi
 #include "keypad4x4.h"
 #include "io_expander.h"
 #include "wifi_credentials.h"
@@ -57,6 +58,32 @@ void lcdClear() {
   if (lcdPresent) lcd.clear();
   for (uint8_t i = 0; i < LcdCfg::ROWS; i++) lcdCacheValid[i] = false;
 }
+
+// BARU (2026-09-29): teks kiri rata kiri, teks kanan rata kanan, dalam satu baris.
+void lcdKiriKanan(uint8_t row, const String& kiri, const String& kanan) {
+  int celah = (int)LcdCfg::COLS - (int)kiri.length() - (int)kanan.length();
+  if (celah < 1) celah = 1;   // tetap dipisah; lcdPrint() memotong sisanya di kolom terakhir
+  String baris = kiri;
+  for (int i = 0; i < celah; i++) baris += ' ';
+  lcdPrint(0, row, baris + kanan);
+}
+
+// BARU (2026-09-29): dua pasangan "label : nilai" -- kiri rata kiri, kanan rata kanan.
+// Format lengkap "Label : nilai" sering tidak muat di 20 kolom, jadi dicoba bertingkat --
+// lengkap, lalu tanpa spasi di sekitar ':', lalu label singkat -- dan dipakai tingkat pertama
+// yang muat. Yang dikorbankan selalu labelnya, bukan nilainya. Sama persis dengan Sorter.
+void lcdPasangan(uint8_t row, const char* labelKiri, const char* singkatKiri, const String& nilaiKiri,
+                 const char* labelKanan, const char* singkatKanan, const String& nilaiKanan) {
+  String kiri, kanan;
+  for (uint8_t tingkat = 0; tingkat < 3; tingkat++) {
+    const char* pemisah = (tingkat == 0) ? " : " : ":";
+    kiri  = String(tingkat < 2 ? labelKiri  : singkatKiri)  + pemisah + nilaiKiri;
+    kanan = String(tingkat < 2 ? labelKanan : singkatKanan) + pemisah + nilaiKanan;
+    if (kiri.length() + kanan.length() + 1 <= LcdCfg::COLS) break;
+  }
+  lcdKiriKanan(row, kiri, kanan);
+}
+
 
 #define FW_VERSION "v.01.00.25082026.21.17"
 constexpr const char* FW_BUILD = __DATE__ " " __TIME__;
@@ -135,6 +162,9 @@ void updateBuzzerBeep() {
 
 struct RackPos { int32_t x, z; };
 RackPos RACK[6];
+// DIGANTI NAMA (2026-10-01): di panel, Serial dan Orange Pi titik ini sekarang disebut READY,
+// sepadan dengan pose READY Picker. Variabel, kunci NVS "loadPos" dan opcode GOTO_LOAD_POSITION
+// SENGAJA tidak diganti -- kalibrasi yang sudah tersimpan tetap terbaca, nomor opcode tetap 6.
 // BARU: Load Position -- titik tunggal tempat lift "standby" menunggu robot arm
 // meletakkan/mengambil package, BEDA dari Home (limit switch, titik nol fisik)
 // dan Rack (6 slot penyimpanan akhir). Dikalibrasi manual, tersimpan NVS.
@@ -158,10 +188,10 @@ uint16_t rampSteps = 300;
 uint8_t microstepMode = 8;   // 8 (MS1=GND,MS2=GND) = default fisik TMC2209 & paling cepat lewat jumper
 
 // --- Menu state (dideklarasikan awal, dipakai onCmdWrite) ---
-enum class MenuState { NONE, TOP_SELECT, CAL_LIST, MOVE_AXIS, WAIT_SAVE_SLOT, JOG_SPEED, TEST_RACK_SELECT,
+enum class MenuState { NONE, TOP_SELECT, CAL_GROUP, CAL_LIST, MOVE_AXIS, WAIT_SAVE_SLOT, JOG_SPEED, TEST_RACK_SELECT,
                         TEST_IO_CATEGORY, TEST_IO_I2CSCAN, TEST_OUTPUT_LIST, TEST_OUTPUT_ITEM,
                         TEST_INPUT_CATEGORY, TEST_INPUT_LIST, TEST_RS485, TEST_MODULE_SELECT, TEST_MOD_STEPPER, TEST_MOD_MOTORDC,
-                        TEST_MOD_RELAY, TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET , SYS_INFO};
+                        TEST_MOD_SERVO, TEST_CMD_LIST, CONFIRM_RESET , SYS_INFO};
 MenuState menuState = MenuState::NONE;
 
 // BARU (2026-09-22): layar Info Sistem didefinisikan tepat sebelum loop() -- di titik itu
@@ -634,7 +664,7 @@ void handleCycle() {
         if (testRackTimingActive) {
           testRackTimingActive = false;
           float elapsedSec = (millis() - testRackCycleStartMs) / 1000.0f;
-          Serial.printf("[TEST-RACK] 1 siklus (Rak->Push->Tarik->Load) selesai dalam %.2f detik\n", elapsedSec);
+          Serial.printf("[TEST-RACK] 1 siklus (Rak->Push->Tarik->Ready) selesai dalam %.2f detik\n", elapsedSec);
           if (menuState == MenuState::TEST_RACK_SELECT) {
             char buf[21];
             snprintf(buf, sizeof(buf), "Siklus: %.2f detik!", elapsedSec);
@@ -759,7 +789,21 @@ void setupOTA() {
 
 // Dipanggil TIAP loop() -- NON-BLOCKING (tidak ada delay()), supaya polling Modbus dari
 // Orange Pi tidak pernah telat/timeout gara-gara WiFi reconnect.
+// BARU (2026-10-07): IP & kekuatan sinyal WiFi ke Modbus, paling sering tiap 5 s (bukan tiap
+// loop) -- satu WiFi.RSSI() puluhan mikrodetik, tidak terasa oleh loop utama.
+void laporWifiKeModbus() {
+  static uint32_t terakhir = 0;
+  if (millis() - terakhir < 5000) return;
+  terakhir = millis();
+  bool tersambung = WiFi.status() == WL_CONNECTED;
+  IPAddress ip = tersambung ? WiFi.localIP() : IPAddress(0, 0, 0, 0);
+  mb.Hreg(Reg::WIFI_IP_HI, (uint16_t)((ip[0] << 8) | ip[1]));
+  mb.Hreg(Reg::WIFI_IP_LO, (uint16_t)((ip[2] << 8) | ip[3]));
+  mb.Hreg(Reg::WIFI_RSSI, tersambung ? (uint16_t)(int16_t)WiFi.RSSI() : 0);
+}
+
 void updateOTA() {
+  laporWifiKeModbus();
   if (WiFi.status() == WL_CONNECTED) {
     if (!otaBegun) beginOtaService();
     otaReady = true;
@@ -787,20 +831,24 @@ const char* stateText(NodeState s) {
   }
 }
 
-// BARU: teks aktivitas spesifik -- cycleStage SUDAH persis memetakan ke tahapan "menyimpan box"
-String activityText() {
-  if (currentState == NodeState::FAULT) return "FAULT!";
-  if (currentState == NodeState::ESTOPPED) return "E-STOP!";
-  if (state == LiftState::HOMING) return "Homing Axis " + String(homingAxis);
+// DIHAPUS (2026-09-29): activityText() -- teks panjang ("Homing Axis 2", "Mendorong Box")
+// yang dulu tampil di baris 1 layar utama. Digantikan activityPendek() di bawah.
+
+// BARU (2026-09-29): teks aktivitas untuk baris 1 layar utama, maksimal 5 karakter --
+// "STOCKER [AUTO]" sudah 14 kolom. Cabang dan urutannya sama persis dengan activityCode(),
+// supaya panel dan Modbus tidak pernah berbeda pendapat.
+const char* activityPendek() {
+  if (currentState == NodeState::FAULT) return "FAULT";
+  if (currentState == NodeState::ESTOPPED) return "ESTOP";
+  if (state == LiftState::HOMING) return "Home";
   switch (cycleStage) {
-    case CycleStage::NONE:
-      return (state == LiftState::MOVING) ? "Gerak manual" : "Diam";
-    case CycleStage::MOVING_XZ:        return "Menuju Rak";
-    case CycleStage::PUSHING_Y:        return "Mendorong Box";
-    case CycleStage::RETRACT_Y:        return "Tarik Pusher";
-    case CycleStage::RETURNING_XZ:     return "Kembali Home";
-    case CycleStage::PUSHING_Y_STANDALONE: return "Test Dorong";
-    case CycleStage::RETRACT_Y_STANDALONE: return "Test Tarik";
+    case CycleStage::NONE: return (state == LiftState::MOVING) ? "Jog" : "Diam";
+    case CycleStage::MOVING_XZ: return "KeRak";
+    case CycleStage::PUSHING_Y: return "Push";
+    case CycleStage::RETRACT_Y: return "Tarik";
+    case CycleStage::RETURNING_XZ: return "Balik";
+    case CycleStage::PUSHING_Y_STANDALONE: return "Push";
+    case CycleStage::RETRACT_Y_STANDALONE: return "Tarik";
   }
   return "?";
 }
@@ -833,13 +881,42 @@ bool blockIfFaulted(const char* opName, uint16_t seq) {
   return false;
 }
 
-void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
+// DIUBAH (2026-09-29): true = diterima & dijalankan, false = DITOLAK -- dipakai layar
+// Test Command untuk menampilkan hasilnya di panel. Pemanggil lama boleh mengabaikannya.
+// Penulisan CMD_ACK_SEQ tidak berubah sama sekali.
+// ============================================================
+// BARU (2026-10-09): BACKUP / RESTORE KALIBRASI lewat Modbus (include/kalibrasi_modbus.h).
+// Orange Pi menyimpan kalibrasi node ini ke file dan bisa memuatnya ke ESP32 pengganti.
+// CAL_FORMAT: NAIKKAN kalau isi CAL_SEG atau struct di dalamnya berubah -- Orange Pi menolak
+// restore dari backup yang formatnya berbeda (layout byte tidak cocok lagi).
+// ============================================================
+KalibrasiModbus kal;
+constexpr uint16_t CAL_FORMAT_NODE = 1;
+const CalSeg CAL_SEG[] = {
+  {RACK, sizeof(RACK)}, {&loadPos, sizeof(loadPos)}, {&pushExtendSteps, sizeof(pushExtendSteps)},
+  {&stepIntervalUs, sizeof(stepIntervalUs)}, {&homingStepIntervalUs, sizeof(homingStepIntervalUs)},
+  {&rampMinIntervalUs, sizeof(rampMinIntervalUs)}, {&rampSteps, sizeof(rampSteps)},
+  {&microstepMode, sizeof(microstepMode)},
+  {&buzzerOnMs, sizeof(buzzerOnMs)}, {&buzzerOffMs, sizeof(buzzerOffMs)} };
+bool calBoleh() { return !mainModeActive && currentState != NodeState::RUNNING_OR_MOVING; }
+void calSimpanSemua() {
+  saveRackToNvs(); saveLoadPosToNvs(); savePushExtendToNvs(); saveStepIntervalToNvs();
+  saveHomingIntervalToNvs(); saveRampToNvs(); saveMicrostepToNvs(); saveBuzzerToNvsStocker();
+}
+// microstep hanya 8/16/32/64 (sama dengan Serial MICROSTEP)
+bool calValid(const uint8_t* g) {
+  uint8_t m = g[sizeof(RACK) + sizeof(loadPos) + sizeof(pushExtendSteps) + sizeof(stepIntervalUs) +
+                sizeof(homingStepIntervalUs) + sizeof(rampMinIntervalUs) + sizeof(rampSteps)];
+  return m == 8 || m == 16 || m == 32 || m == 64;
+}
+
+bool applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
   switch ((Cmd)opcode) {
     case Cmd::START_MAIN:
-      if (blockIfFaulted("START_MAIN", seq)) return;
+      if (blockIfFaulted("START_MAIN", seq)) return false;
       mainModeActive = true;
       Serial.println("[CMD] START_MAIN -- MAIN aktif, MOVE_TO_RACK/PUSH_BOX diblokir sampai STOP_MAIN");
-      mb.Hreg(Reg::CMD_ACK_SEQ, seq); return;
+      mb.Hreg(Reg::CMD_ACK_SEQ, seq); return true;
     case Cmd::STOP_MAIN:
       mainModeActive = false;
       // DIUBAH (2026-09-20): STOP_MAIN sekarang BENAR-BENAR menghentikan. Dulu cuma mematikan
@@ -847,44 +924,44 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       // shutdown_sequence() Orange Pi mengirim STOP_MAIN justru untuk menghentikan node.
       abortCycle();
       Serial.println("[CMD] STOP_MAIN -- MAIN mati, siklus dibatalkan, MOVE_TO_RACK/PUSH_BOX boleh dipakai lagi");
-      mb.Hreg(Reg::CMD_ACK_SEQ, seq); return;
+      mb.Hreg(Reg::CMD_ACK_SEQ, seq); return true;
     case Cmd::HOME_ALL:
-      if (blockIfFaulted("HOME_ALL", seq)) return;
+      if (blockIfFaulted("HOME_ALL", seq)) return false;
       startHomingInternal();
       currentState = NodeState::RUNNING_OR_MOVING;
-      ackPending = true; pendingAckSeq = seq; return;
+      ackPending = true; pendingAckSeq = seq; return true;
     case Cmd::RUN_FULL_CYCLE:
-      if (blockIfFaulted("RUN_FULL_CYCLE", seq)) return;
-      if (!mainModeActive) { Serial.println("[CMD] RUN_FULL_CYCLE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
-      if (!homed[1] || curPos[1] != 0) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "RUN_FULL_CYCLE: axis Y belum homing / pusher belum di posisi 0"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
-      if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
+      if (blockIfFaulted("RUN_FULL_CYCLE", seq)) return false;
+      if (!mainModeActive) { Serial.println("[CMD] RUN_FULL_CYCLE ditolak -- MAIN belum aktif, kirim START_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
+      if (!homed[1] || curPos[1] != 0) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "RUN_FULL_CYCLE: axis Y belum homing / pusher belum di posisi 0"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
+      if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
       currentState = NodeState::RUNNING_OR_MOVING;
       cycleStage = CycleStage::MOVING_XZ;
       cycleStageStartMs = millis();
       triggerBuzzerBeep();   // BARU -- notifikasi: package sudah di lift, cycle mulai
-      ackPending = true; pendingAckSeq = seq; return;
+      ackPending = true; pendingAckSeq = seq; return true;
     case Cmd::MOVE_TO_RACK:
-      if (blockIfFaulted("MOVE_TO_RACK", seq)) return;
-      if (mainModeActive) { Serial.println("[CMD] MOVE_TO_RACK ditolak -- MAIN aktif, STOP_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
-      if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
+      if (blockIfFaulted("MOVE_TO_RACK", seq)) return false;
+      if (mainModeActive) { Serial.println("[CMD] MOVE_TO_RACK ditolak -- MAIN aktif, STOP_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
+      if (!moveToRackXZ((uint8_t)arg)) { mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
       currentState = NodeState::RUNNING_OR_MOVING;
-      ackPending = true; pendingAckSeq = seq; return;
+      ackPending = true; pendingAckSeq = seq; return true;
     case Cmd::PUSH_BOX:
-      if (blockIfFaulted("PUSH_BOX", seq)) return;
-      if (mainModeActive) { Serial.println("[CMD] PUSH_BOX ditolak -- MAIN aktif, STOP_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
+      if (blockIfFaulted("PUSH_BOX", seq)) return false;
+      if (mainModeActive) { Serial.println("[CMD] PUSH_BOX ditolak -- MAIN aktif, STOP_MAIN dulu"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
       tgtPos[1] = curPos[1] + pushExtendSteps;
       state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
       cycleStage = CycleStage::PUSHING_Y_STANDALONE;
-      ackPending = true; pendingAckSeq = seq; return;
+      ackPending = true; pendingAckSeq = seq; return true;
     case Cmd::GOTO_LOAD_POSITION:   // BARU -- manual, menuju titik standby terima package
-      if (blockIfFaulted("GOTO_LOAD_POSITION", seq)) return;
-      if (!homed[0] || !homed[2]) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "GOTO_LOAD_POSITION: axis X/Z belum homing"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return; }
+      if (blockIfFaulted("GOTO_LOAD_POSITION", seq)) return false;
+      if (!homed[0] || !homed[2]) { raiseFault((uint16_t)FaultCode::NOT_HOMED, "GOTO_READY: axis X/Z belum homing"); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false; }
       tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z;
       state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
       mb.Hreg(Reg::CURRENT_RACK_IDX, 0xFF);
-      ackPending = true; pendingAckSeq = seq; return;
+      ackPending = true; pendingAckSeq = seq; return true;
     case Cmd::RESET_FAULT:
       if (faultCode != 0) lastFaultCode = faultCode;   // BARU -- breadcrumb sebelum di-nol-kan
       faultCode = 0; currentState = NodeState::IDLE; state = LiftState::IDLE;
@@ -902,9 +979,33 @@ void applyCommand(uint16_t opcode, uint16_t arg, uint16_t seq) {
       saveHomingIntervalToNvs();
       Serial.printf("[CMD] SET_HOMING_STEP_INTERVAL -- homingStepIntervalUs=%u\n", homingStepIntervalUs);
       break;
-    default: break;
+    // BARU (2026-10-09): backup / restore kalibrasi -- ack langsung, hasil di Reg::CAL_HASIL
+    case Cmd::CAL_BACA:     { bool ok = kal.baca(arg, calBoleh());     mb.Hreg(Reg::CMD_ACK_SEQ, seq); return ok; }
+    case Cmd::CAL_TULIS:    { bool ok = kal.tulis(arg, calBoleh());    mb.Hreg(Reg::CMD_ACK_SEQ, seq); return ok; }
+    case Cmd::CAL_TERAPKAN: { bool ok = kal.terapkan(arg, calBoleh()); mb.Hreg(Reg::CMD_ACK_SEQ, seq); return ok; }
+    default: mb.Hreg(Reg::CMD_ACK_SEQ, seq); return false;
   }
   mb.Hreg(Reg::CMD_ACK_SEQ, seq);
+  return true;
+}
+
+// BARU (2026-09-30): watchdog komunikasi (COMM_TIMEOUT) diperbarui oleh SETIAP request Modbus
+// yang sukses untuk node ini -- baca maupun tulis -- bukan hanya command.
+//
+// Dulu hanya onCmdWrite() yang memperbaruinya. Akibatnya node yang RUNNING lama tanpa menerima
+// command jatuh ke FAULT COMM_TIMEOUT setelah 30 detik, walaupun master hidup dan terus
+// membacanya. Di produksi itu PASTI terjadi: Sorter RUNNING sepanjang shift, sementara di
+// antara dua batch master hanya MEMBACA PASS_COUNT dan MENULIS CLASSIFY_IS_REJECT -- tidak ada
+// satu pun command. Arm Picker yang siklus MOVE_PACKAGE-nya lebih dari 30 detik, dan homing
+// Stocker, kena masalah yang sama di tengah gerakan.
+//
+// Maksud watchdog ini adalah "master masih hidup", dan request apa pun membuktikannya.
+// onRequestSuccess() dipanggil library SETELAH cek slave ID, jadi hanya request untuk node ini
+// yang dihitung. modbusEverUsed SENGAJA tidak disetel di sini: watchdog tetap baru aktif
+// setelah command pertama, sama seperti sebelumnya.
+Modbus::ResultCode onModbusRequestSukses(Modbus::FunctionCode fc, const Modbus::RequestData data) {
+  lastRs485Rx = millis();
+  return Modbus::EX_SUCCESS;
 }
 
 uint16_t onCmdWrite(TRegister* reg, uint16_t val) {
@@ -954,13 +1055,58 @@ void drawTopMenuStocker() {
 }
 
 // --- LEVEL 1a: SETTING KALIBRASI ---
-// BARU: "Reset Fault" jadi item pertama -- dulu cuma bisa dipicu lewat menu "Test Command"
-// yang terkubur, gak gampang ditemukan operator pas node FAULT.
+// DIUBAH TOTAL (2026-09-29): dua tingkat -- sama dengan Sorter. Stocker SATU mekanisme dengan
+// tiga sumbu (X/Z lift, Y pusher) yang dihoming dan dijog bersamaan, jadi pemisahan murni per
+// sumbu justru memecah alur kerja kalibrasi. Grupnya mengikuti alur itu:
+//   Gerak  AutoHome, Jog X/Y/Z, Kecepatan         -- menggerakkan mekanisme ke posisi
+//   Rak    Simpan Slot/Load/Dorong, Test ke Rak   -- merekam posisi itu, lalu mengujinya
+//   Reset  Reset Fault, Reset Default
+// Label lama yang terpotong ("Simpan Jarak Dorong" 19, "AutoHome (wajib dulu)" 21) kini muat.
+// "wajib dulu" tidak hilang maknanya: Jog tetap menolak dengan pesan "Home dulu!".
+namespace CalId {
+  constexpr uint8_t RESET_FAULT = 0, AUTOHOME = 1, JOG = 2, TEST_RAK = 3, SIMPAN_SLOT = 4, SIMPAN_LOAD = 5, SIMPAN_DORONG = 6, KECEPATAN = 7, RESET_DEFAULT = 8;
+}
 constexpr uint8_t CAL_COUNT = 9;
-const char* CAL_LABELS[CAL_COUNT] = { "Reset Fault", "AutoHome (wajib dulu)", "Jog Posisi (X/Y/Z)", "Test ke Rak",
-                                        "Simpan ke Slot Rak", "Simpan Load Position", "Simpan Jarak Dorong", "Kecepatan", "Reset ke Default" };
-uint8_t calCursor = 0;
-void drawCalList() { drawListMenu("SETTING KALIBRASI", CAL_LABELS, CAL_COUNT, calCursor); }
+// Label per ID, tanpa awalan nama perangkat -- nama perangkat ada di judul layar. Maks 15 karakter.
+const char* CAL_LABELS[CAL_COUNT] = {
+  "Reset Fault",
+  "AutoHome",
+  "Jog X/Y/Z",
+  "Test ke Rak",
+  "Simpan Slot Rak",
+  "Simpan Ready",
+  "Simpan Dorong",
+  "Kecepatan",
+  "Reset Default",
+};
+
+const uint8_t CAL_GRP_GERAK[] = { CalId::AUTOHOME, CalId::JOG, CalId::KECEPATAN };
+const uint8_t CAL_GRP_RAK[] = { CalId::SIMPAN_SLOT, CalId::SIMPAN_LOAD, CalId::SIMPAN_DORONG, CalId::TEST_RAK };
+const uint8_t CAL_GRP_RESET[] = { CalId::RESET_FAULT, CalId::RESET_DEFAULT };
+
+struct CalGroup { const char* judul; const uint8_t* id; uint8_t jumlah; };
+constexpr uint8_t CAL_GROUP_COUNT = 3;
+const CalGroup CAL_GROUPS[CAL_GROUP_COUNT] = {
+  { "SETTING: GERAK", CAL_GRP_GERAK, sizeof(CAL_GRP_GERAK) },
+  { "SETTING: RAK", CAL_GRP_RAK, sizeof(CAL_GRP_RAK) },
+  { "SETTING: RESET", CAL_GRP_RESET, sizeof(CAL_GRP_RESET) },
+};
+const char* CAL_GROUP_LABELS[CAL_GROUP_COUNT] = { "Gerak", "Rak", "Reset" };
+
+uint8_t calGroupCursor = 0;   // perangkat yang sedang dibuka
+uint8_t calCursor = 0;        // posisi DI DALAM perangkat itu
+
+void drawCalGroup() { drawListMenu("SETTING KALIBRASI", CAL_GROUP_LABELS, CAL_GROUP_COUNT, calGroupCursor); }
+
+// Nama dan state-nya SENGAJA dipertahankan (drawCalList / CAL_LIST): semua layar di bawahnya
+// kembali lewat `menuState = CAL_LIST; drawCalList();`, dan dengan begini mereka kembali ke
+// daftar perangkat yang tadi dibuka tanpa satu pun jalur keluar itu perlu diubah.
+void drawCalList() {
+  const CalGroup &g = CAL_GROUPS[calGroupCursor];
+  static const char* labels[CAL_COUNT];
+  for (uint8_t i = 0; i < g.jumlah; i++) labels[i] = CAL_LABELS[g.id[i]];
+  drawListMenu(g.judul, labels, g.jumlah, calCursor);
+}
 
 // BARU: Test ke Rak -- selalu HOME dulu, baru menuju rak (sesuai permintaan: "test rack 1
 // selalu urutannya ke home dulu baru ke tempat rack"). Homing + pindah-ke-rak digabung
@@ -991,8 +1137,8 @@ void handleTestRackSelectKey(char key) {
       tgtPos[0] = loadPos.x; tgtPos[2] = loadPos.z;
       state = LiftState::MOVING;
       currentState = NodeState::RUNNING_OR_MOVING;
-      lcdPrint(0, 3, "Ke Load Pos dulu...");
-      Serial.printf("[TEST-RACK] Menuju Load Position, lalu Rak %u (push+tarik+balik)\n", testRackSequenceTarget);
+      lcdPrint(0, 3, "Ke Ready dulu...");
+      Serial.printf("[TEST-RACK] Menuju READY (Load Position), lalu Rak %u (push+tarik+balik)\n", testRackSequenceTarget);
     }
   }
   else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); }
@@ -1096,17 +1242,26 @@ void handleSaveSlotKeyStocker(char key) {
   } else if (key == 'D') { menuState = MenuState::CAL_LIST; drawCalList(); }
 }
 
+void handleCalGroupKey(char key) {
+  if (key == 'A') { calGroupCursor = (calGroupCursor == 0) ? CAL_GROUP_COUNT - 1 : calGroupCursor - 1; drawCalGroup(); }
+  else if (key == 'B') { calGroupCursor = (calGroupCursor + 1) % CAL_GROUP_COUNT; drawCalGroup(); }
+  else if (key == 'C') { menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); }
+  else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuStocker(); }
+}
+
 void handleCalListKey(char key) {
-  if (key == 'A') { calCursor = (calCursor == 0) ? CAL_COUNT - 1 : calCursor - 1; drawCalList(); }
-  else if (key == 'B') { calCursor = (calCursor + 1) % CAL_COUNT; drawCalList(); }
+  const CalGroup &g = CAL_GROUPS[calGroupCursor];
+  if (key == 'A') { calCursor = (calCursor == 0) ? g.jumlah - 1 : calCursor - 1; drawCalList(); }
+  else if (key == 'B') { calCursor = (calCursor + 1) % g.jumlah; drawCalList(); }
   else if (key == 'C') {
-    switch (calCursor) {
-      case 0:   // BARU -- Reset Fault, langsung eksekusi (tidak destruktif, gak perlu konfirmasi)
+    // Bercabang pada ID, bukan posisi -- posisi berubah tiap daftar disusun ulang, ID tidak.
+    switch (g.id[calCursor]) {
+      case CalId::RESET_FAULT:   // langsung eksekusi (tidak destruktif, tanpa konfirmasi)
         applyCommand((uint16_t)Cmd::RESET_FAULT, 0, 0);
         lcdPrint(0, 3, "Fault direset!      ");
         Serial.println("[CAL] Reset Fault dari menu LCD");
         break;
-      case 1:   // AutoHome
+      case CalId::AUTOHOME:
         if (faultCode != 0 || currentState == NodeState::FAULT || currentState == NodeState::ESTOPPED) {
           lcdPrint(0, 3, "Tak bisa:FAULT/ESTOP");
         } else {
@@ -1116,28 +1271,28 @@ void handleCalListKey(char key) {
           Serial.println("[CAL] AUTO HOME dari menu dimulai");
         }
         break;
-      case 2:   // Jog Posisi
-        if (!homed[0] || !homed[1] || !homed[2]) { lcdPrint(0, 3, "Home dulu! (opsi a)"); }
+      case CalId::JOG:
+        if (!homed[0] || !homed[1] || !homed[2]) { lcdPrint(0, 3, "Home dulu! (Gerak>a)"); }
         else { menuState = MenuState::MOVE_AXIS; lcdClear(); drawMoveAxisMenu(); }
         break;
-      case 3:   // BARU: Test ke Rak -- selalu home dulu, baru menuju rak
+      case CalId::TEST_RAK:   // selalu home dulu, baru menuju rak
         menuState = MenuState::TEST_RACK_SELECT; testRackCursor = 1; lcdClear(); drawTestRackSelect();
         break;
-      case 4: menuState = MenuState::WAIT_SAVE_SLOT; lcdPrint(0, 3, "Simpan(X,Z)slot?1-4"); break;
-      case 5:   // BARU: Simpan Load Position -- simpan X,Z SAAT INI, cuma 1 titik (bukan slot 0-5)
+      case CalId::SIMPAN_SLOT: menuState = MenuState::WAIT_SAVE_SLOT; lcdPrint(0, 3, "Simpan(X,Z)slot?1-4"); break;
+      case CalId::SIMPAN_LOAD:   // simpan X,Z SAAT INI sebagai Load Position (satu titik)
         loadPos = {curPos[0], curPos[2]};
         saveLoadPosToNvs();
-        lcdPrint(0, 3, "LoadPos disimpan!");
-        Serial.printf("[CAL] X=%ld Z=%ld -> loadPos\n", (long)curPos[0], (long)curPos[2]);
+        lcdPrint(0, 3, "Ready disimpan!");
+        Serial.printf("[CAL] X=%ld Z=%ld -> READY (Load Position)\n", (long)curPos[0], (long)curPos[2]);
         break;
-      case 6:
+      case CalId::SIMPAN_DORONG:
         if (curPos[1] <= 0) { lcdPrint(0, 3, "Y harus>0(jog dulu)"); }
         else { pushExtendSteps = curPos[1]; savePushExtendToNvs(); lcdPrint(0, 3, "PushExtend disimpan!"); Serial.printf("[CAL] pushExtendSteps=%ld\n", (long)pushExtendSteps); }
         break;
-      case 7: menuState = MenuState::JOG_SPEED; lcdClear(); drawSpeedMenuStocker(); break;
-      case 8: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
+      case CalId::KECEPATAN: menuState = MenuState::JOG_SPEED; lcdClear(); drawSpeedMenuStocker(); break;
+      case CalId::RESET_DEFAULT: menuState = MenuState::CONFIRM_RESET; drawConfirmReset(); break;
     }
-  } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuStocker(); }
+  } else if (key == 'D') { menuState = MenuState::CAL_GROUP; drawCalGroup(); }
 }
 
 // --- LEVEL 1b: TEST I/O -- direstruktur jadi 4 kategori (I2C Scan / Test Output / Test
@@ -1148,13 +1303,21 @@ struct IOTestItem { const char* label; uint8_t ch; bool autoControlled; };
 void drawTestIoCategory();   // forward declaration -- dipakai di banyak handler 'D' sebelum definisinya di bawah
 
 // --- Kategori: Test Output (semua output, penamaan disederhanakan) ---
-constexpr uint8_t OUTPUT_TEST_COUNT = 5;
+// DIUBAH (2026-09-29, disamakan dengan Sorter atas permintaan operator):
+//   - Label memakai nama channel lengkap (LED_OPR, LED_RUN, ...) supaya sama dengan yang
+//     tertulis di skema/wiring, bukan singkatan yang harus diterjemahkan dulu.
+//   - RELAY_1 dan RELAY_2 dipindah ke SINI dari Test Modul -> Relay (layar itu dihapus).
+//     Relay adalah output digital biasa; di sini ia diuji dengan cara yang sama persis dengan
+//     LED dan buzzer, termasuk rate-limit 300ms beban induktif dan syarat IDLE.
+constexpr uint8_t OUTPUT_TEST_COUNT = 7;
 IOTestItem OUTPUT_TEST_ITEMS[OUTPUT_TEST_COUNT] = {
-  {"OPR",    CH::LED_OPERATION, true},
-  {"RUN",    CH::LED_RUN,       true},
-  {"MANUAL", CH::LED_MANUAL,    true},
-  {"FAULT",  CH::LED_FAULT,     true},   // DIUBAH -- sekarang auto-controlled (lihat updateUniversalIndicators)
-  {"BUZZER", CH::BUZZER,        false},
+  {"LED_OPR",    CH::LED_OPERATION, true},
+  {"LED_RUN",    CH::LED_RUN,       true},
+  {"LED_MANUAL", CH::LED_MANUAL,    true},
+  {"LED_FAULT",  CH::LED_FAULT,     true},   // auto-controlled (lihat updateUniversalIndicators)
+  {"BUZZER",     CH::BUZZER,        false},
+  {"RELAY_1",    CH::RLY1,          false},
+  {"RELAY_2",    CH::RLY2,          false},
 };
 uint8_t outputTestCursor = 0;
 bool testOutputLastVal = false, testOutputFirstDraw = true;
@@ -1324,8 +1487,9 @@ void pcaSetServoUs(uint8_t channel, uint16_t us) {
 }
 
 // --- Sub-menu pilihan jenis modul ---
-constexpr uint8_t MODULE_TYPE_COUNT = 4;
-const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Relay", "Servo" };
+// DIUBAH (2026-09-29): "Relay" dipindah ke Test I/O -> Test Output (RELAY_1/RELAY_2).
+constexpr uint8_t MODULE_TYPE_COUNT = 3;
+const char* MODULE_TYPE_LABELS[MODULE_TYPE_COUNT] = { "Stepper", "Motor DC", "Servo" };
 uint8_t moduleTypeCursor = 0;
 void drawModuleTypeSelect() { drawListMenu("TEST MODUL", MODULE_TYPE_LABELS, MODULE_TYPE_COUNT, moduleTypeCursor); }
 void handleModuleTypeKey(char key);   // forward declaration -- dipakai di handleTestIoCategoryKey() sebelum definisi
@@ -1389,31 +1553,6 @@ void handleTestModMotorDCKey(char key) {
   drawTestModMotorDC();
 }
 
-// --- Modul: Relay (RLY1/RLY2) -- toggle, rate-limit 300ms (beban induktif) ---
-uint8_t testModRelaySel = 0;   // 0=RLY1, 1=RLY2
-void drawTestModRelay() {
-  if (testModFirstDraw) {
-    lcdClear(); lcdPrint(0, 0, "MODUL: RELAY");
-    lcdPrint(0, 3, "C=pilih A=tgl D=kmb");
-    testModFirstDraw = false; testModLine1 = "\x01";
-  }
-  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
-  bool val = io.read(ch);
-  String line1 = "RLY" + String(testModRelaySel + 1) + " = " + String(val ? "HIGH" : "LOW");
-  if (line1 != testModLine1) { testModLine1 = line1; lcdPrint(0, 1, line1 + "   "); }
-}
-void handleTestModRelayKey(char key) {
-  static uint32_t lastToggleMs = 0;
-  uint8_t ch = (testModRelaySel == 0) ? CH::RLY1 : CH::RLY2;
-  if (key == 'C') { testModRelaySel = (testModRelaySel + 1) % 2; }
-  else if (key == 'A') {
-    if (millis() - lastToggleMs < 300) return;   // rate-limit -- beban induktif, sama alasan Test Output
-    lastToggleMs = millis();
-    io.write(ch, !io.read(ch));
-  } else if (key == 'D') { menuState = MenuState::TEST_MODULE_SELECT; drawModuleTypeSelect(); return; }
-  drawTestModRelay();
-}
-
 // --- Modul: Servo (PCA9685) -- cek deteksi I2C dulu, baru izinkan gerak ---
 uint8_t testModServoCh = 0;
 bool testModServoDetected = false;
@@ -1446,8 +1585,7 @@ void handleModuleTypeKey(char key) {
     switch (moduleTypeCursor) {
       case 0: menuState = MenuState::TEST_MOD_STEPPER; drawTestModStepper(); break;
       case 1: menuState = MenuState::TEST_MOD_MOTORDC; drawTestModMotorDC(); break;
-      case 2: menuState = MenuState::TEST_MOD_RELAY; drawTestModRelay(); break;
-      case 3: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
+      case 2: menuState = MenuState::TEST_MOD_SERVO; drawTestModServo(); break;
     }
   } else if (key == 'D') { menuState = MenuState::TEST_IO_CATEGORY; drawTestIoCategory(); }
 }
@@ -1474,33 +1612,66 @@ void handleTestIoCategoryKey(char key) {
 // Test I/O baru. Infonya (FW/uptime/heap/i2cErr/lastFault) tetap tersedia via Serial STATUS.
 
 // --- LEVEL 1c: TEST COMMAND ---
-struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; };
-constexpr uint8_t CMD_TEST_COUNT = 6;
+// DIPERIKSA ULANG (2026-09-29), disamakan dengan Sorter:
+//   DIPERBAIKI "MOVE_TO_RACK(rak0)" dan "RUN_FULL_CYCLE(rak0)" mengirim rak 0. Sejak rak
+//            dinomori 1-4 (temuan #22), rak 0 TIDAK ADA -- moveToRackXZ(0) memanggil
+//            raiseFault(RACK_IDX_INVALID). Menekan item uji itu dari panel langsung membuat
+//            node FAULT. Sekarang keduanya ke Rak 1.
+//   DITAMBAH START_MAIN dan STOP_MAIN. FULL_CYCLE butuh MAIN dan tanpa ini SELALU ditolak
+//            dari panel; MOVE_TO_RACK/PUSH_BOX sebaliknya ditolak selama MAIN.
+// Dipanggil dengan seq=0 seperti sebelumnya, jadi CMD_ACK_SEQ ikut tertulis 0 -- tidak
+// berpengaruh: selama operator di menu, command Modbus diabaikan seluruhnya.
+// Label maksimal 15 karakter supaya muat setelah "> a. ". Petunjuk "C=kirim D=kembali" yang dulu
+// ditulis di baris 4 dibuang: ia MENIMPA baris daftar ketiga, sehingga item terakhir tidak
+// pernah terlihat saat kursor ada di situ. Tombolnya sama dengan semua layar daftar lain.
+//
+// Hasil ditulis di baris JUDUL: "OK, amati aksinya" atau "TOLAK: <alasan>". Dulu layar
+// menulis "Terkirim, amati aksi" PERSIS SAMA untuk command yang dijalankan maupun yang
+// ditolak -- penolakan hanya tercetak di Serial, jadi operator di panel tidak bisa
+// membedakan keduanya. Kolom `gate` dipakai untuk menyebut alasan penolakan yang paling
+// mungkin tanpa harus membuka Serial.
+enum CmdGate : uint8_t { GATE_NETRAL, GATE_MAIN, GATE_TEST, GATE_LOKAL };
+struct CmdTestItem { const char* label; Cmd opcode; uint16_t testArg; CmdGate gate; };
+// URUTAN BAKU (2026-09-30) -- SAMA di keempat node dan di sorting_automation.py (file acuan):
+//   a START_MAIN   b STOP_MAIN   c RESET_FAULT      <- huruf ini tetap di SEMUA node
+//   lalu kelompok Produksi (hanya MAIN) -> Aksi (bebas mode) -> Uji (ditolak saat MAIN).
+// Jangan menyisipkan item di tengah tanpa menyamakan OPCODES di sorting_automation.py.
+constexpr uint8_t CMD_TEST_COUNT = 8;
 CmdTestItem CMD_TEST_ITEMS[CMD_TEST_COUNT] = {
-  {"HOME_ALL",             Cmd::HOME_ALL,       0},
-  {"RUN_FULL_CYCLE(rak0)", Cmd::RUN_FULL_CYCLE, 0},
-  {"MOVE_TO_RACK(rak0)",   Cmd::MOVE_TO_RACK,   0},
-  {"PUSH_BOX",             Cmd::PUSH_BOX,       0},
-  {"GOTO_LOAD_POSITION",   Cmd::GOTO_LOAD_POSITION, 0},
-  {"RESET_FAULT",          Cmd::RESET_FAULT,    0},
+  {"START_MAIN",      Cmd::START_MAIN,               0, GATE_NETRAL},
+  {"STOP_MAIN",       Cmd::STOP_MAIN,                0, GATE_NETRAL},
+  {"RESET_FAULT",     Cmd::RESET_FAULT,              0, GATE_NETRAL},
+  {"FULL_CYCLE 1",    Cmd::RUN_FULL_CYCLE,           1, GATE_MAIN},
+  {"HOME_ALL",        Cmd::HOME_ALL,                 0, GATE_NETRAL},
+  {"GOTO_READY",      Cmd::GOTO_LOAD_POSITION,       0, GATE_NETRAL},   // DIGANTI NAMA 2026-10-01 (dulu GOTO_LOAD)
+  {"MOVE_TO_RACK 1",  Cmd::MOVE_TO_RACK,             1, GATE_TEST},
+  {"PUSH_BOX",        Cmd::PUSH_BOX,                 0, GATE_TEST},
 };
 const char* CMD_TEST_LABELS_ONLY[CMD_TEST_COUNT];
 void buildCmdTestLabels() { for (uint8_t i = 0; i < CMD_TEST_COUNT; i++) CMD_TEST_LABELS_ONLY[i] = CMD_TEST_ITEMS[i].label; }
 uint8_t cmdTestCursor = 0;
+
 void drawTestCmdList() {
   buildCmdTestLabels();
   drawListMenu("TEST COMMAND", CMD_TEST_LABELS_ONLY, CMD_TEST_COUNT, cmdTestCursor);
-  lcdPrint(0, 3, "C=kirim D=kembali");
 }
+
 void handleTestCmdListKey(char key) {
   if (key == 'A') { cmdTestCursor = (cmdTestCursor == 0) ? CMD_TEST_COUNT - 1 : cmdTestCursor - 1; drawTestCmdList(); }
   else if (key == 'B') { cmdTestCursor = (cmdTestCursor + 1) % CMD_TEST_COUNT; drawTestCmdList(); }
   else if (key == 'C') {
     CmdTestItem &item = CMD_TEST_ITEMS[cmdTestCursor];
-    Serial.printf("[TEST-CMD] Simulasi command dari 'node lain': opcode=%u (%s) arg=%u -- amati aksi fisik SEKARANG\n",
+    Serial.printf("[TEST-CMD] Simulasi command dari 'node lain': opcode=%u (%s) arg=%u\n",
                   (uint16_t)item.opcode, item.label, item.testArg);
-    applyCommand((uint16_t)item.opcode, item.testArg, 0);
-    lcdPrint(0, 3, "Terkirim, amati aksi");
+    bool diterima = applyCommand((uint16_t)item.opcode, item.testArg, 0);
+    String hasil;
+    if (diterima)                                          hasil = "OK, amati aksinya";
+    else if (faultCode != 0 || currentState == NodeState::FAULT ||
+             currentState == NodeState::ESTOPPED)          hasil = "TOLAK: FAULT/ESTOP";
+    else if (item.gate == GATE_MAIN && !mainModeActive)    hasil = "TOLAK: belum MAIN";
+    else if (item.gate == GATE_TEST && mainModeActive)     hasil = "TOLAK: MAIN aktif";
+    else                                                   hasil = "TOLAK: lihat Serial";
+    lcdPrint(0, 0, hasil);
   } else if (key == 'D') { menuState = MenuState::TOP_SELECT; drawTopMenuStocker(); }
 }
 
@@ -1509,7 +1680,7 @@ void handleTopMenuKeyStocker(char key) {
   else if (key == 'B') { topCursor = (topCursor + 1) % TOP_COUNT; drawTopMenuStocker(); }
   else if (key == 'C') {
     switch (topCursor) {
-      case 0: menuState = MenuState::CAL_LIST; calCursor = 0; drawCalList(); break;
+      case 0: menuState = MenuState::CAL_GROUP; calGroupCursor = 0; drawCalGroup(); break;
       case 1: menuState = MenuState::TEST_IO_CATEGORY; testIoCatCursor = 0; drawTestIoCategory(); break;
       case 2: menuState = MenuState::TEST_CMD_LIST; cmdTestCursor = 0; drawTestCmdList(); break;
       case 3: menuState = MenuState::SYS_INFO; sysInfoPage = 0; lcdClear(); drawSysInfo(); break;
@@ -1556,7 +1727,7 @@ void handleSerialCommand() {
     else Serial.println("[MOVE] Gagal -- cek homing/slot");
   }
   else if (cmd == "PUSH") { applyCommand((uint16_t)Cmd::PUSH_BOX, 0, 0); Serial.println("[PUSH] Extend+retract Y dimulai"); }
-  else if (cmd == "LOADPOS") { applyCommand((uint16_t)Cmd::GOTO_LOAD_POSITION, 0, 0); Serial.println("[LOADPOS] Menuju Load Position dimulai"); }
+  else if (cmd == "READY" || cmd == "LOADPOS") { applyCommand((uint16_t)Cmd::GOTO_LOAD_POSITION, 0, 0); Serial.println("[READY] Menuju READY (Load Position) dimulai"); }
   else if (cmd == "FULLCYCLE") {
     uint8_t slot = line.substring(sp1 + 1).toInt();
     applyCommand((uint16_t)Cmd::RUN_FULL_CYCLE, slot, 0);
@@ -1694,7 +1865,26 @@ void setup() {
   mb.addHreg(Reg::LAST_FAULT_CODE, 0); mb.addHreg(Reg::UPTIME_SEC, 0);
   mb.addHreg(Reg::MAIN_MODE_ACTIVE, 0);   // BARU -- status live MAIN vs TEST mode
   mb.addHreg(Reg::MENU_ACTIVE, 0);        // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
+  // BARU (2026-10-07): versi firmware = waktu BUILD (__DATE__/__TIME__ compiler), dibaca Orange Pi
+  // di MORE > SYSTEM supaya ketahuan node mana yang sudah di-flash firmware terbaru.
+  {
+    const char* d = __DATE__;   // "Oct  7 2026"
+    const char* t = __TIME__;   // "14:05:09"
+    static const char BLN[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    uint16_t bulan = 0;
+    for (uint8_t i = 0; i < 12; i++) if (strncmp(d, BLN + i * 3, 3) == 0) bulan = i + 1;
+    uint16_t hari = (d[4] == ' ' ? 0 : (d[4] - '0') * 10) + (d[5] - '0');
+    mb.addHreg(Reg::FW_TAHUN, (uint16_t)atoi(d + 7));
+    mb.addHreg(Reg::FW_BULAN_HARI, (uint16_t)(bulan * 100 + hari));
+    mb.addHreg(Reg::FW_JAM_MENIT, (uint16_t)(((t[0] - '0') * 10 + (t[1] - '0')) * 100 + (t[3] - '0') * 10 + (t[4] - '0')));
+    mb.addHreg(Reg::FW_VERSI, FIRMWARE_VERSI);
+    mb.addHreg(Reg::WIFI_IP_HI, 0); mb.addHreg(Reg::WIFI_IP_LO, 0); mb.addHreg(Reg::WIFI_RSSI, 0);
+    Serial.printf("[BOOT] Firmware v%u.%02u, build %s %s\n", FIRMWARE_VERSI / 100, FIRMWARE_VERSI % 100, d, t);
+  }
+  kal.begin(mb, Reg::CAL_FORMAT, CAL_FORMAT_NODE, CAL_SEG, sizeof(CAL_SEG) / sizeof(CAL_SEG[0]),
+            loadRackFromNvs, calSimpanSemua, calValid);
   mb.onSetHreg(Reg::CMD, onCmdWrite);
+  mb.onRequestSuccess(onModbusRequestSukses);   // BARU -- watchdog dari request apa pun
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
   lcdBootProgress("Modbus RS485");
 
@@ -1756,6 +1946,7 @@ void handleSysInfoKey(char key) {
 }
 
 void loop() {
+  kal.loop();   // BARU 2026-10-09: buffer backup kalibrasi & restart setelah restore
   mb.task();
   updateOTA();
 
@@ -1768,6 +1959,7 @@ void loop() {
         if (lcdPresent) drawTopMenuStocker();
         Serial.println("[CAL] Masuk mode kalibrasi (command eksternal dijeda, logic fisik TETAP jalan)");
       } else if (menuState == MenuState::TOP_SELECT) handleTopMenuKeyStocker(key);
+      else if (menuState == MenuState::CAL_GROUP) handleCalGroupKey(key);
       else if (menuState == MenuState::CAL_LIST) handleCalListKey(key);
       else if (menuState == MenuState::MOVE_AXIS) handleMoveAxisKey(key);
       else if (menuState == MenuState::WAIT_SAVE_SLOT) handleSaveSlotKeyStocker(key);
@@ -1783,7 +1975,6 @@ void loop() {
       else if (menuState == MenuState::TEST_MODULE_SELECT) handleModuleTypeKey(key);
       else if (menuState == MenuState::TEST_MOD_STEPPER) handleTestModStepperKey(key);
       else if (menuState == MenuState::TEST_MOD_MOTORDC) handleTestModMotorDCKey(key);
-      else if (menuState == MenuState::TEST_MOD_RELAY) handleTestModRelayKey(key);
       else if (menuState == MenuState::TEST_MOD_SERVO) handleTestModServoKey(key);
       else if (menuState == MenuState::TEST_CMD_LIST) handleTestCmdListKey(key);
       else if (menuState == MenuState::CONFIRM_RESET) handleConfirmResetKey(key);
@@ -1864,12 +2055,12 @@ void loop() {
           cycleStageStartMs = millis();
           testRackTimingActive = true;
           testRackCycleStartMs = millis();   // BARU -- mulai hitung 1 siklus (Rak->Push->Tarik->Load)
-          Serial.printf("[TEST-RACK] Load Position tercapai, menuju Rak %u\n", testRackSequenceTarget);
+          Serial.printf("[TEST-RACK] READY tercapai, menuju Rak %u\n", testRackSequenceTarget);
         } else {
           // DIUBAH: JANGAN paksa currentState=IDLE di sini -- moveToRackXZ() yang gagal sudah
           // memanggil raiseFault() (currentState=FAULT). Menimpanya dgn IDLE menghapus jejak
           // fault dari register STATE, persis bug yang baru diperbaiki.
-          Serial.println("[TEST-RACK] Gagal menuju rak dari Load Position (cek FaultCode)");
+          Serial.println("[TEST-RACK] Gagal menuju rak dari READY (cek FaultCode)");
         }
       } else {
         currentState = NodeState::IDLE;
@@ -1911,10 +2102,6 @@ void loop() {
     static uint32_t lastTestModRefresh2 = 0;
     if (millis() - lastTestModRefresh2 > 150) { lastTestModRefresh2 = millis(); drawTestModMotorDC(); }
   }
-  if (menuState == MenuState::TEST_MOD_RELAY && lcdPresent) {
-    static uint32_t lastTestModRefresh3 = 0;
-    if (millis() - lastTestModRefresh3 > 150) { lastTestModRefresh3 = millis(); drawTestModRelay(); }
-  }
   // Uptime berjalan terus, jadi layar ini harus hidup sendiri tanpa menunggu tombol.
   // Aman dari masalah LCD-menahan-loop: lcdPrint() hanya menulis baris yang benar-benar
   // berubah, dan di halaman ini cuma baris detik yang bergerak.
@@ -1928,13 +2115,9 @@ void loop() {
 
   handleSerialCommand();
 
-  // DIPERBAIKI: timeout diperlebar dari 5000ms -- watchdog ini cuma reset saat command
-  // BARU dikirim (lastRs485Rx di-update di onCmdWrite()), TIDAK ikut ter-reset oleh
-  // pembacaan status (Modbus read register) yang tidak lewat callback itu. Testing manual
-  // via menu interaktif (baca status berulang sambil menunggu progres) WAJAR jeda lebih
-  // dari 5 detik antar command baru -- nilai lama terlalu ketat, sering false-trigger.
-  // 30 detik cukup toleran utk homing/gerak fisik + jeda manual, TAPI tetap berfungsi
-  // sbg pengaman kalau komunikasi BENAR-BENAR terputus total (kabel RS485 lepas, dst).
+  // Batas 30 detik tanpa request APA PUN dari master (baca atau tulis -- lihat
+  // onModbusRequestSukses()). Dulu hanya command yang dihitung, sehingga node yang RUNNING
+  // lama tanpa command jatuh FAULT walaupun master terus membacanya.
   constexpr uint32_t COMM_TIMEOUT_MS = 30000;
   if (modbusEverUsed && currentState == NodeState::RUNNING_OR_MOVING && millis() - lastRs485Rx > COMM_TIMEOUT_MS) {
     // DIUBAH: lewat raiseFault() -- dulu cuma set register, gerakan tetap lanjut sampai selesai
@@ -1954,13 +2137,24 @@ void loop() {
     static uint32_t lastLcdRefresh = 0;
     if (millis() - lastLcdRefresh > 500) {
       lastLcdRefresh = millis();
-      lcdPrint(0, 0, "[AUTO] " + activityText());
-      lcdPrint(0, 1, "State:" + String(stateText(currentState)));
+      // DIUBAH (2026-09-29), pola sama dengan Sorter:
+      //   baris 1  STOCKER [AUTO]  Diam
+      //   baris 2  Mode : TEST   Rak : 1
+      //   baris 3  State : IDLE
+      //   baris 4  X..Y..Z..  (posisi, tidak berubah)
+      // Mode: MAIN/TEST tidak selalu sama dengan State -- RESET_FAULT mengembalikan State ke
+      // IDLE tapi tidak mematikan MAIN, sehingga MOVE_TO_RACK/PUSH_BOX ditolak dengan alasan
+      // yang tidak kelihatan. Rak: register CURRENT_RACK_IDX, sama dengan yang dibaca Orange
+      // Pi; 0xFF (sedang pindah / bukan di rak) ditampilkan "-".
+      uint16_t rakSekarang = mb.Hreg(Reg::CURRENT_RACK_IDX);
+      lcdKiriKanan(0, "STOCKER [AUTO]", activityPendek());
+      lcdPasangan(1, "Mode", "M", mainModeActive ? "MAIN" : "TEST",
+                     "Rak", "R", (rakSekarang == 0xFF) ? String("-") : String(rakSekarang));
+      lcdPrint(0, 2, "State : " + String(stateText(currentState)));
       // DIPERBAIKI: format dipersingkat (tanpa spasi/titik dua) -- posisi microstep tinggi +
       // jarak jauh bisa 5-6 digit, format lama ("X:... Y:... Z:...") overflow 20 kolom LCD
       // untuk kasus itu. Batas praktis TAMPILAN LCD (bukan batas nilai internal curPos).
-      lcdPrint(0, 2, "X" + String(curPos[0]) + "Y" + String(curPos[1]) + "Z" + String(curPos[2]));
-      lcdPrint(0, 3, "Tahan* utk kalibrasi");
+      lcdPrint(0, 3, "X" + String(curPos[0]) + "Y" + String(curPos[1]) + "Z" + String(curPos[2]));
     }
   }
 }
