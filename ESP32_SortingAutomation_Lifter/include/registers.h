@@ -4,6 +4,10 @@
 // ============================================================
 // REGISTER MAP MODBUS — STOCKER (docs/07-PROTOCOL.md §7.1, §7.6)
 // ============================================================
+// NOMOR RILIS FIRMWARE -- NAIKKAN setiap kali firmware baru dikirim ke mesin (200 = v2.00,
+// 201 = v2.01, 210 = v2.10). Terbaca Orange Pi di MORE > SYSTEM > NODE, bersama waktu build.
+constexpr uint16_t FIRMWARE_VERSI = 201;   // 201: backup/restore kalibrasi (2026-10-09)
+
 namespace Reg {
   constexpr uint16_t STATE       = 0;
   constexpr uint16_t FAULT_CODE  = 1;
@@ -33,6 +37,26 @@ namespace Reg {
   // kirim CMD_ACK_SEQ -- dari sisi master itu kelihatan identik dgn "node mati/kabel putus".
   // Register ini bikin master bisa bedain dua kondisi itu.
   constexpr uint16_t MENU_ACTIVE = 18;  // R, 1 = operator lagi di menu kalibrasi LCD
+  // BARU (2026-10-07): waktu BUILD firmware, diisi otomatis saat compile (__DATE__/__TIME__).
+  // Orange Pi membacanya untuk melacak node mana yang sudah di-flash firmware terbaru.
+  // Firmware lama tidak punya register ini (master menerima ILLEGAL DATA ADDRESS).
+  constexpr uint16_t FW_TAHUN      = 19;  // R, mis. 2026
+  constexpr uint16_t FW_BULAN_HARI = 20;  // R, bulan*100 + hari, mis. 1007
+  constexpr uint16_t FW_JAM_MENIT  = 21;  // R, jam*100 + menit, mis. 1405
+  constexpr uint16_t FW_VERSI      = 22;  // R, nomor rilis FIRMWARE_VERSI, mis. 200 = v2.00
+  // BARU (2026-10-07): alamat IP & kekuatan sinyal WiFi, diperbarui tiap 5 s. Orange Pi memakai
+  // IP ini untuk update firmware OTA tanpa mengetik IP (IP dari DHCP boleh berubah).
+  constexpr uint16_t WIFI_IP_HI    = 23;  // R, oktet 1 << 8 | oktet 2 (0 = WiFi tidak tersambung)
+  constexpr uint16_t WIFI_IP_LO    = 24;  // R, oktet 3 << 8 | oktet 4
+  constexpr uint16_t WIFI_RSSI     = 25;  // R, dBm sebagai int16 (mis. -61), 0 = tidak tersambung
+  // BARU (2026-10-09): backup / restore kalibrasi lewat Modbus -- protokol lengkap di
+  // include/kalibrasi_modbus.h (sama di keempat node). Firmware < v2.01 tidak punya register ini.
+  constexpr uint16_t CAL_FORMAT = 26;  // R, nomor format gambar kalibrasi
+  constexpr uint16_t CAL_UKURAN = 27;  // R, panjang gambar (byte)
+  constexpr uint16_t CAL_CRC    = 28;  // R, CRC16-CCITT gambar (diisi CAL_BACA offset 0)
+  constexpr uint16_t CAL_OFFSET = 29;  // R, offset jendela terakhir
+  constexpr uint16_t CAL_HASIL  = 30;  // R, kode hasil perintah CAL terakhir (CalHasil)
+  constexpr uint16_t CAL_DATA0  = 31;  // RW, 32 register = jendela 64 byte (sampai 62)
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik STOCKER (cycleStage yg sudah ada) ---
@@ -54,6 +78,9 @@ enum class FaultCode : uint16_t {
 
 // --- Opcode CMD (§7.6) ---
 enum class Cmd : uint16_t {
+  // BARU (2026-10-09): backup / restore kalibrasi (include/kalibrasi_modbus.h), ack langsung.
+  // Opcode SAMA di keempat node. Ditolak selama MAIN aktif / node bergerak.
+  CAL_BACA = 60, CAL_TULIS = 61, CAL_TERAPKAN = 62,
   NONE = 0,
   HOME_ALL = 1,
   RUN_FULL_CYCLE = 2,     // arg: rack_idx 0-5 -- move->push->home, chaining penuh (O8)

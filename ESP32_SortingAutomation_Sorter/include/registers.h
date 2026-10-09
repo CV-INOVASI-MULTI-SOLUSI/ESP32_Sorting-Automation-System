@@ -6,6 +6,10 @@
 // Base register (0-9) SAMA di semua node kalau nanti PICKER/FEEDER/STOCKER dibuat menyusul.
 // Address 10+ spesifik SORTER.
 // ============================================================
+// NOMOR RILIS FIRMWARE -- NAIKKAN setiap kali firmware baru dikirim ke mesin (200 = v2.00,
+// 201 = v2.01, 210 = v2.10). Terbaca Orange Pi di MORE > SYSTEM > NODE, bersama waktu build.
+constexpr uint16_t FIRMWARE_VERSI = 201;   // 201: backup/restore kalibrasi (2026-10-09)
+
 namespace Reg {
   // --- Base, universal ---
   constexpr uint16_t STATE       = 0;   // R
@@ -51,6 +55,26 @@ namespace Reg {
   constexpr uint16_t SPEED_MM_S_AT_MAX_PWM  = 23;  // R
   // BARU (2026-10-05): 1 = hopper dijeda lewat Cmd::SET_HOPPER_JEDA (conveyor tetap jalan).
   constexpr uint16_t HOPPER_DIJEDA          = 24;  // R
+  // BARU (2026-10-07): waktu BUILD firmware, diisi otomatis saat compile (__DATE__/__TIME__).
+  // Orange Pi membacanya untuk melacak node mana yang sudah di-flash firmware terbaru.
+  // Firmware lama tidak punya register ini (master menerima ILLEGAL DATA ADDRESS).
+  constexpr uint16_t FW_TAHUN      = 25;  // R, mis. 2026
+  constexpr uint16_t FW_BULAN_HARI = 26;  // R, bulan*100 + hari, mis. 1007
+  constexpr uint16_t FW_JAM_MENIT  = 27;  // R, jam*100 + menit, mis. 1405
+  constexpr uint16_t FW_VERSI      = 28;  // R, nomor rilis FIRMWARE_VERSI, mis. 200 = v2.00
+  // BARU (2026-10-07): alamat IP & kekuatan sinyal WiFi, diperbarui tiap 5 s. Orange Pi memakai
+  // IP ini untuk update firmware OTA tanpa mengetik IP (IP dari DHCP boleh berubah).
+  constexpr uint16_t WIFI_IP_HI    = 29;  // R, oktet 1 << 8 | oktet 2 (0 = WiFi tidak tersambung)
+  constexpr uint16_t WIFI_IP_LO    = 30;  // R, oktet 3 << 8 | oktet 4
+  constexpr uint16_t WIFI_RSSI     = 31;  // R, dBm sebagai int16 (mis. -61), 0 = tidak tersambung
+  // BARU (2026-10-09): backup / restore kalibrasi lewat Modbus -- protokol lengkap di
+  // include/kalibrasi_modbus.h (sama di keempat node). Firmware < v2.01 tidak punya register ini.
+  constexpr uint16_t CAL_FORMAT = 32;  // R, nomor format gambar kalibrasi
+  constexpr uint16_t CAL_UKURAN = 33;  // R, panjang gambar (byte)
+  constexpr uint16_t CAL_CRC    = 34;  // R, CRC16-CCITT gambar (diisi CAL_BACA offset 0)
+  constexpr uint16_t CAL_OFFSET = 35;  // R, offset jendela terakhir
+  constexpr uint16_t CAL_HASIL  = 36;  // R, kode hasil perintah CAL terakhir (CalHasil)
+  constexpr uint16_t CAL_DATA0  = 37;  // RW, 32 register = jendela 64 byte (sampai 68)
 }
 
 // --- BARU: ActivityCode -- Lapis 2, aktivitas spesifik (bukan cuma IDLE/RUNNING generik) ---
@@ -80,6 +104,9 @@ enum class FaultCode : uint16_t {
 
 // --- Opcode CMD (§7.3) ---
 enum class Cmd : uint16_t {
+  // BARU (2026-10-09): backup / restore kalibrasi (include/kalibrasi_modbus.h), ack langsung.
+  // Opcode SAMA di keempat node. Ditolak selama MAIN aktif / node bergerak.
+  CAL_BACA = 60, CAL_TULIS = 61, CAL_TERAPKAN = 62,
   NONE = 0, START = 1, STOP = 2, RESET_FAULT = 3, SET_HOPPER_INTERVAL = 4,
   SET_CONVEYOR_SPEED = 5, SET_CONVEYOR_DIR = 6, RESET_COUNTERS = 7,
   SET_MOTOR_A = 8,   // BARU -- arg: 0=stop,1=maju,2=mundur (channel A chip TB6612FNG yg sama dgn conveyor)

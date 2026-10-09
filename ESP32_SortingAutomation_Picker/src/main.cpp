@@ -12,6 +12,7 @@
 #include <ArduinoOTA.h>
 #include "config.h"
 #include "registers.h"
+#include "kalibrasi_modbus.h"   // BARU 2026-10-09: backup/restore kalibrasi
 #include "keypad4x4.h"
 #include "io_expander.h"
 #include "wifi_credentials.h"
@@ -737,6 +738,44 @@ void handleTestButtons() {
 
 // DIUBAH (2026-09-29): true = diterima & dijalankan, false = DITOLAK -- dipakai layar
 // Test Command untuk menampilkan hasilnya di panel. Pemanggil lama boleh mengabaikannya.
+// ============================================================
+// BARU (2026-10-09): BACKUP / RESTORE KALIBRASI lewat Modbus (include/kalibrasi_modbus.h).
+// Orange Pi menyimpan kalibrasi node ini ke file dan bisa memuatnya ke ESP32 pengganti.
+// CAL_FORMAT: NAIKKAN kalau isi CAL_SEG atau struct di dalamnya berubah -- Orange Pi menolak
+// restore dari backup yang formatnya berbeda (layout byte tidak cocok lagi).
+// ============================================================
+KalibrasiModbus kal;
+constexpr uint16_t CAL_FORMAT_NODE = 1;
+// GERAKAN SENGAJA pertama -- calValid() membacanya dari awal gambar.
+const CalSeg CAL_SEG[] = {
+  {GERAKAN, sizeof(GERAKAN)}, {POSES, sizeof(POSES)},
+  {PICK_OFFSET, sizeof(PICK_OFFSET)}, {PLACE_OFFSET, sizeof(PLACE_OFFSET)},
+  {CLEARANCE_OFFSET, sizeof(CLEARANCE_OFFSET)}, {POST_PLACE_OFFSET, sizeof(POST_PLACE_OFFSET)},
+  {&trajStepUs, sizeof(trajStepUs)}, {&trajStepIntervalMs, sizeof(trajStepIntervalMs)},
+  {&rampMinStepUs, sizeof(rampMinStepUs)}, {&rampSteps, sizeof(rampSteps)},
+  {&buzzerOnMs, sizeof(buzzerOnMs)}, {&buzzerOffMs, sizeof(buzzerOffMs)} };
+bool calBoleh() { return !mainModeActive && !moving && gerakanJalan < 0 && qHead == qTail; }
+void calSimpanSemua() {
+  savePosesToNvs(); saveGerakanToNvs();
+  saveOffsetToNvs("pick", PICK_OFFSET, sizeof(PICK_OFFSET));
+  saveOffsetToNvs("place", PLACE_OFFSET, sizeof(PLACE_OFFSET));
+  saveOffsetToNvs("clear", CLEARANCE_OFFSET, sizeof(CLEARANCE_OFFSET));
+  saveOffsetToNvs("postplace", POST_PLACE_OFFSET, sizeof(POST_PLACE_OFFSET));
+  saveSpeedToNvs(); saveRampToNvs(); saveBuzzerToNvs();
+}
+// Data gerakan & pose dari file yang rusak tidak boleh menggerakkan servo ke luar batas.
+bool calValid(const uint8_t* g) {
+  Gerakan tg[NUM_GERAKAN];
+  memcpy(tg, g, sizeof(tg));
+  if (!gerakanValid(tg)) return false;
+  Pose tp[NUM_POSES];
+  memcpy(tp, g + sizeof(GERAKAN), sizeof(tp));
+  for (uint8_t p = 0; p < NUM_POSES; p++)
+    for (uint8_t j = 0; j < ServoCfg::NUM_JOINTS; j++)
+      if (tp[p].us[j] < ServoCfg::MIN_US || tp[p].us[j] > ServoCfg::MAX_US) return false;
+  return true;
+}
+
 bool applyCommand(uint16_t opcode, uint16_t arg) {
   switch ((Cmd)opcode) {
     case Cmd::START_MAIN:
@@ -819,6 +858,10 @@ bool applyCommand(uint16_t opcode, uint16_t arg) {
     // kalau mau bertahan setelah reboot, lihat saveSpeedToNvs()).
     case Cmd::SET_TRAJ_STEP:          trajStepUs = (uint16_t)constrain(arg, 1, 500); break;
     case Cmd::SET_TRAJ_STEP_INTERVAL: trajStepIntervalMs = (uint16_t)constrain(arg, 5, 200); break;
+    // BARU (2026-10-09): backup / restore kalibrasi -- hasil di Reg::CAL_HASIL
+    case Cmd::CAL_BACA:     return kal.baca(arg, calBoleh());
+    case Cmd::CAL_TULIS:    return kal.tulis(arg, calBoleh());
+    case Cmd::CAL_TERAPKAN: return kal.terapkan(arg, calBoleh());
     default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); return false;
   }
   return true;
@@ -2147,7 +2190,21 @@ void setupOTA() {
 
 // Dipanggil TIAP loop() -- NON-BLOCKING (tidak ada delay()), supaya polling Modbus dari
 // Orange Pi tidak pernah telat/timeout gara-gara WiFi reconnect.
+// BARU (2026-10-07): IP & kekuatan sinyal WiFi ke Modbus, paling sering tiap 5 s (bukan tiap
+// loop) -- satu WiFi.RSSI() puluhan mikrodetik, tidak terasa oleh loop utama.
+void laporWifiKeModbus() {
+  static uint32_t terakhir = 0;
+  if (millis() - terakhir < 5000) return;
+  terakhir = millis();
+  bool tersambung = WiFi.status() == WL_CONNECTED;
+  IPAddress ip = tersambung ? WiFi.localIP() : IPAddress(0, 0, 0, 0);
+  mb.Hreg(Reg::WIFI_IP_HI, (uint16_t)((ip[0] << 8) | ip[1]));
+  mb.Hreg(Reg::WIFI_IP_LO, (uint16_t)((ip[2] << 8) | ip[3]));
+  mb.Hreg(Reg::WIFI_RSSI, tersambung ? (uint16_t)(int16_t)WiFi.RSSI() : 0);
+}
+
 void updateOTA() {
+  laporWifiKeModbus();
   if (WiFi.status() == WL_CONNECTED) {
     if (!otaBegun) beginOtaService();
     otaReady = true;
@@ -2268,6 +2325,24 @@ void setup() {
   mb.addHreg(Reg::MENU_ACTIVE, 0);        // BARU -- 1 = operator di menu kalibrasi, command Modbus diabaikan
   mb.addHreg(Reg::GERAKAN_AKTIF, 0xFF);   // BARU 2026-09-30 -- 255 = tidak ada gerakan berjalan
   mb.addHreg(Reg::ADEGAN_KE, 0);
+  // BARU (2026-10-07): versi firmware = waktu BUILD (__DATE__/__TIME__ compiler), dibaca Orange Pi
+  // di MORE > SYSTEM supaya ketahuan node mana yang sudah di-flash firmware terbaru.
+  {
+    const char* d = __DATE__;   // "Oct  7 2026"
+    const char* t = __TIME__;   // "14:05:09"
+    static const char BLN[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    uint16_t bulan = 0;
+    for (uint8_t i = 0; i < 12; i++) if (strncmp(d, BLN + i * 3, 3) == 0) bulan = i + 1;
+    uint16_t hari = (d[4] == ' ' ? 0 : (d[4] - '0') * 10) + (d[5] - '0');
+    mb.addHreg(Reg::FW_TAHUN, (uint16_t)atoi(d + 7));
+    mb.addHreg(Reg::FW_BULAN_HARI, (uint16_t)(bulan * 100 + hari));
+    mb.addHreg(Reg::FW_JAM_MENIT, (uint16_t)(((t[0] - '0') * 10 + (t[1] - '0')) * 100 + (t[3] - '0') * 10 + (t[4] - '0')));
+    mb.addHreg(Reg::FW_VERSI, FIRMWARE_VERSI);
+    mb.addHreg(Reg::WIFI_IP_HI, 0); mb.addHreg(Reg::WIFI_IP_LO, 0); mb.addHreg(Reg::WIFI_RSSI, 0);
+    Serial.printf("[BOOT] Firmware v%u.%02u, build %s %s\n", FIRMWARE_VERSI / 100, FIRMWARE_VERSI % 100, d, t);
+  }
+  kal.begin(mb, Reg::CAL_FORMAT, CAL_FORMAT_NODE, CAL_SEG, sizeof(CAL_SEG) / sizeof(CAL_SEG[0]),
+            loadPosesFromNvs, calSimpanSemua, calValid);
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   mb.onRequestSuccess(onModbusRequestSukses);   // BARU -- watchdog dari request apa pun
   Serial.printf("[BOOT] Modbus siap, slave ID=%d\n", Rs485Cfg::SLAVE_ID);
@@ -2331,6 +2406,7 @@ void handleSysInfoKey(char key) {
 }
 
 void loop() {
+  kal.loop();   // BARU 2026-10-09: buffer backup kalibrasi & restart setelah restore
   mb.task();
   updateOTA();
   handleTestButtons();

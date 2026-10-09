@@ -20,6 +20,7 @@
 #include <ArduinoOTA.h>
 #include "config.h"
 #include "registers.h"
+#include "kalibrasi_modbus.h"   // BARU 2026-10-09: backup/restore kalibrasi
 #include "keypad4x4.h"
 #include "io_expander.h"
 #include "wifi_credentials.h"
@@ -905,7 +906,21 @@ void setupOTA() {
 
 // Dipanggil TIAP loop() -- NON-BLOCKING (tidak ada delay()), supaya polling Modbus dari
 // Orange Pi tidak pernah telat/timeout gara-gara WiFi reconnect.
+// BARU (2026-10-07): IP & kekuatan sinyal WiFi ke Modbus, paling sering tiap 5 s (bukan tiap
+// loop) -- satu WiFi.RSSI() puluhan mikrodetik, tidak terasa oleh loop utama.
+void laporWifiKeModbus() {
+  static uint32_t terakhir = 0;
+  if (millis() - terakhir < 5000) return;
+  terakhir = millis();
+  bool tersambung = WiFi.status() == WL_CONNECTED;
+  IPAddress ip = tersambung ? WiFi.localIP() : IPAddress(0, 0, 0, 0);
+  mb.Hreg(Reg::WIFI_IP_HI, (uint16_t)((ip[0] << 8) | ip[1]));
+  mb.Hreg(Reg::WIFI_IP_LO, (uint16_t)((ip[2] << 8) | ip[3]));
+  mb.Hreg(Reg::WIFI_RSSI, tersambung ? (uint16_t)(int16_t)WiFi.RSSI() : 0);
+}
+
 void updateOTA() {
+  laporWifiKeModbus();
   if (WiFi.status() == WL_CONNECTED) {
     if (!otaBegun) beginOtaService();
     otaReady = true;
@@ -951,6 +966,17 @@ const char* stateText(NodeState s);
 // "Terkirim, amati aksi" persis sama untuk command yang dijalankan maupun yang ditolak.
 // Operator di panel tidak punya cara membedakan keduanya. Pemanggil lama (Modbus, Serial)
 // boleh mengabaikan nilai ini; perilakunya tidak berubah.
+// ============================================================
+// BARU (2026-10-09): BACKUP / RESTORE KALIBRASI lewat Modbus (include/kalibrasi_modbus.h).
+// Orange Pi menyimpan kalibrasi node ini ke file dan bisa memuatnya ke ESP32 pengganti.
+// CAL_FORMAT: NAIKKAN kalau isi CAL_SEG atau struct di dalamnya berubah -- Orange Pi menolak
+// restore dari backup yang formatnya berbeda (layout byte tidak cocok lagi).
+// ============================================================
+KalibrasiModbus kal;
+constexpr uint16_t CAL_FORMAT_NODE = 1;
+const CalSeg CAL_SEG[] = { {&cfg, sizeof(cfg)} };
+bool calBoleh() { return !mainModeActive && currentState != NodeState::RUNNING_OR_MOVING; }
+
 bool applyCommand(uint16_t opcode, uint16_t arg) {
   switch ((Cmd)opcode) {
     case Cmd::START:
@@ -1026,6 +1052,10 @@ bool applyCommand(uint16_t opcode, uint16_t arg) {
       break;
     // DIHAPUS (2026-09-20): Cmd::TEST_FAULT (opcode 99) -- memaksa node ke FAULT palsu.
     // Komentar aslinya di registers.h sudah menyuruh menghapusnya sebelum produksi.
+    // BARU (2026-10-09): backup / restore kalibrasi -- hasil di Reg::CAL_HASIL
+    case Cmd::CAL_BACA:     return kal.baca(arg, calBoleh());
+    case Cmd::CAL_TULIS:    return kal.tulis(arg, calBoleh());
+    case Cmd::CAL_TERAPKAN: return kal.terapkan(arg, calBoleh());
     default: Serial.printf("[CMD] opcode %u tidak dikenal\n", opcode); return false;
   }
   return true;
@@ -2443,6 +2473,24 @@ void setup() {
   mb.addHreg(Reg::SPEED_SAMPLE_COUNT, 0);
   mb.addHreg(Reg::SPEED_MM_S_AT_MAX_PWM, 0);
   mb.addHreg(Reg::HOPPER_DIJEDA, 0);         // BARU 2026-10-05
+  // BARU (2026-10-07): versi firmware = waktu BUILD (__DATE__/__TIME__ compiler), dibaca Orange Pi
+  // di MORE > SYSTEM supaya ketahuan node mana yang sudah di-flash firmware terbaru.
+  {
+    const char* d = __DATE__;   // "Oct  7 2026"
+    const char* t = __TIME__;   // "14:05:09"
+    static const char BLN[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    uint16_t bulan = 0;
+    for (uint8_t i = 0; i < 12; i++) if (strncmp(d, BLN + i * 3, 3) == 0) bulan = i + 1;
+    uint16_t hari = (d[4] == ' ' ? 0 : (d[4] - '0') * 10) + (d[5] - '0');
+    mb.addHreg(Reg::FW_TAHUN, (uint16_t)atoi(d + 7));
+    mb.addHreg(Reg::FW_BULAN_HARI, (uint16_t)(bulan * 100 + hari));
+    mb.addHreg(Reg::FW_JAM_MENIT, (uint16_t)(((t[0] - '0') * 10 + (t[1] - '0')) * 100 + (t[3] - '0') * 10 + (t[4] - '0')));
+    mb.addHreg(Reg::FW_VERSI, FIRMWARE_VERSI);
+    mb.addHreg(Reg::WIFI_IP_HI, 0); mb.addHreg(Reg::WIFI_IP_LO, 0); mb.addHreg(Reg::WIFI_RSSI, 0);
+    Serial.printf("[BOOT] Firmware v%u.%02u, build %s %s\n", FIRMWARE_VERSI / 100, FIRMWARE_VERSI % 100, d, t);
+  }
+  kal.begin(mb, Reg::CAL_FORMAT, CAL_FORMAT_NODE, CAL_SEG, sizeof(CAL_SEG) / sizeof(CAL_SEG[0]),
+            loadConfigFromNvs, saveConfigToNvs);
   mb.onSetHreg(Reg::CMD, onCmdWrite);
   mb.onRequestSuccess(onModbusRequestSukses);   // BARU -- watchdog dari request apa pun
   mb.onSetHreg(Reg::CLASSIFY_IS_REJECT, onClassifyWrite);
@@ -2508,6 +2556,7 @@ void handleSysInfoKey(char key) {
 }
 
 void loop() {
+  kal.loop();   // BARU 2026-10-09: buffer backup kalibrasi & restart setelah restore
   mb.task();
   updateOTA();
 
