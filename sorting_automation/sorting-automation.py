@@ -31,6 +31,7 @@ import argparse
 import os
 import signal
 import sys
+import time
 
 FOLDER = os.path.dirname(os.path.abspath(__file__))
 _kurang = [n for n in ('applib.py', 'sorting.config') if not os.path.exists(os.path.join(FOLDER, n))]
@@ -58,10 +59,10 @@ def main():
                     help=f'berhenti rapi setelah N siklus (sorting.config: {A.JUMLAH_SIKLUS}; 0 = semua rak kosong)')
     ap.add_argument('--simulasi', action='store_true',
                     help='keempat node DITIRU di dalam program -- tanpa RS485, tanpa ESP32 (butuh simulasi-node.py)')
-    ap.add_argument('--sim-cepat', type=float, default=1.0, metavar='X',
-                    help='simulasi: gerakan X kali lebih cepat (bawaan 1)')
-    ap.add_argument('--sim-objek', type=float, default=2.0, metavar='DETIK',
-                    help='simulasi: hopper melepas 1 objek tiap DETIK (bawaan 2)')
+    ap.add_argument('--sim-cepat', type=float, default=None, metavar='X',
+                    help='simulasi: semua durasi X kali lebih cepat (bawaan: simulasi-waktu.config)')
+    ap.add_argument('--sim-objek', type=float, default=None, metavar='DETIK',
+                    help='simulasi: paksa hopper melepas 1 objek tiap DETIK (bawaan: siklus hopper)')
     args = ap.parse_args()
     if args.simulasi:
         siapkan_simulasi(args)
@@ -93,7 +94,13 @@ def main():
         signal.signal(signal.SIGTERM, lambda *_: A.berhenti.set())
         signal.signal(signal.SIGINT, lambda *_: A.berhenti.set())
         kamera = A.PAKAI_KAMERA and not args.tanpa_kamera
-        if not A.jalankan_produksi(A.Bus(), kamera, hanya_cek=args.cek):
+        A.log_info_awal('cek' if args.cek else 'terminal (--tanpa-lcd)')
+        try:
+            lolos = A.jalankan_produksi(A.Bus(), kamera, hanya_cek=args.cek, bunyi_cek=True)
+        finally:
+            time.sleep(2)              # beri waktu bunyi boot / alarm terakhir
+            A.INDIKATOR.berhenti()
+        if not lolos:
             sys.exit(1)
         return
 
@@ -121,12 +128,14 @@ def siapkan_simulasi(args):
     A.rak_terisi.clear()
     A.simpan_rak_terisi()
     A.FILE_ALARM = os.path.join(FOLDER, 'alarm_riwayat_simulasi.json')
+    A.FILE_PRODUKSI = os.path.join(FOLDER, 'produksi_riwayat_simulasi.json')
+    A.FOLDER_KALIBRASI = os.path.join(FOLDER, 'kalibrasi_simulasi')    # backup kalibrasi tiruan terpisah
     A.PAKAI_KAMERA = 0                                      # HuskyLens tidak ikut disimulasikan
     A.log("=" * 70)
-    A.log(f"MODE SIMULASI -- 4 node ditiru di dalam program (gerakan x{args.sim_cepat:g}, "
-          f"objek tiap {args.sim_objek:g} s). TIDAK ada yang dikirim ke RS485.")
+    A.log("MODE SIMULASI -- 4 node ditiru di dalam program dengan timing firmware "
+          "(simulasi-waktu.config). TIDAK ada yang dikirim ke RS485.")
     if not args.uji:
-        A.log("Perintah simulasi (ketik + Enter): s status | f <id> <kode> fault | r <id> reset | "
+        A.log("Perintah simulasi (ketik + Enter): s status | w timing | f <id> <kode> fault | r <id> reset | "
               "e <id> e-stop | m <id> menu | x <id> mati/hidup | n <id> restart | b objek")
     A.log("=" * 70)
 

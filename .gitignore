@@ -5,3 +5,11 @@ touch_kalibrasi.json
 alarm_riwayat.json
 rak_terisi_simulasi.txt
 alarm_riwayat_simulasi.json
+resep.json
+produksi_riwayat.json
+produksi_riwayat_simulasi.json
+kamera_hasil.csv
+kalibrasi/
+kalibrasi_simulasi/
+firmware/
+ota_password.txt

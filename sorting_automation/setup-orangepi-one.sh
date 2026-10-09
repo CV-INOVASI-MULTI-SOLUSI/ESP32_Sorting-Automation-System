@@ -9,7 +9,8 @@
 #
 #  Yang dikerjakan:
 #    1. cek model board
-#    2. aktifkan overlay UART1 (HuskyLens, /dev/ttyS1) dan UART3 (RS485, /dev/ttyS3)
+#    2. aktifkan overlay UART3 (RS485, /dev/ttyS3). UART1 TIDAK lagi: HuskyLens lewat USB-TTL
+#       (/dev/ttyUSB0) dan pin 38/40 (UART1) dipakai LED OPR & LED RUN.
 #    3. pasang python3, minimalmodbus, pyserial, fuser
 #    4. siapkan folder /root/sorting
 #    5. (opsional) wiringOP + binding Python, dipakai script HuskyLens untuk LED & buzzer
@@ -66,26 +67,26 @@ if [[ "$MODEL" != *"One"* ]]; then
 fi
 
 echo
-echo "== 2. Overlay UART  (uart1 = HuskyLens -> /dev/ttyS1,  uart3 = RS485 -> /dev/ttyS3)"
+echo "== 2. Overlay UART  (uart3 = RS485 -> /dev/ttyS3; HuskyLens lewat USB, uart1 tidak dipakai)"
 ENV=""
 for f in /boot/armbianEnv.txt /boot/orangepiEnv.txt; do
   if [[ -f "$f" ]]; then ENV="$f"; break; fi
 done
 if [[ -z "$ENV" ]]; then
   echo "   !! /boot/armbianEnv.txt maupun /boot/orangepiEnv.txt tidak ada."
-  echo "      Aktifkan UART1 dan UART3 manual lewat armbian-config / orangepi-config"
+  echo "      Aktifkan UART3 manual lewat armbian-config / orangepi-config"
   echo "      (System -> Hardware), lalu reboot."
 else
   [[ -f "$ENV.sebelum-sorting" ]] || cp "$ENV" "$ENV.sebelum-sorting"
   if grep -q '^overlays=' "$ENV"; then
-    for o in uart1 uart3; do
+    for o in uart3; do
       if ! grep -qE "^overlays=(.*[[:space:]])?$o([[:space:]]|$)" "$ENV"; then
         sed -i "s/^overlays=\(.*\)$/overlays=\1 $o/" "$ENV"
       fi
     done
     sed -i 's/^overlays=[[:space:]]*/overlays=/' "$ENV"
   else
-    echo "overlays=uart1 uart3" >> "$ENV"
+    echo "overlays=uart3" >> "$ENV"
   fi
   if [[ $PASANG_PANEL -eq 1 ]]; then
     # Panel LCD sorting-automation.py: SPI0 sebagai /dev/spidev0.0. Batas frekuensi bawaan overlay
@@ -162,7 +163,7 @@ echo " SELESAI. Langkah berikutnya:"
 echo "   1. reboot                       (overlay UART baru aktif setelah ini)"
 echo "   2. ls -l /dev/ttyS1 /dev/ttyS3  (dua-duanya harus ada)"
 echo "   3. salin script ke /root/sorting, lalu:"
-echo "      python3 /root/sorting/cek-orangepi.py"
+echo "      python3 /root/sorting_automation/cek-orangepi.py"
 if [[ $PASANG_PANEL -eq 1 ]]; then
   echo "   4. panel LCD: ls -l /dev/spidev0.0, cocokkan [lcd] di display.config dengan"
   echo "      'gpio readall', lalu: python3 sorting-automation.py  (lihat sorting-automation.service)"
