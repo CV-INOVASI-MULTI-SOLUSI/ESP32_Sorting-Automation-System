@@ -9,6 +9,9 @@ DI PC, setelah build:
 hasilnya ada di sorting_automation/firmware/, lalu salin ke Orange Pi:
     scp -r firmware root@<IP-OrangePi>:/root/sorting_automation/
 
+Folder firmware/ IKUT git (sejak 2026-10-10): setelah menjalankan script ini, commit keempat
+.bin bersama perubahan source-nya, supaya bin di GitHub selalu sama dengan kode di commit itu.
+
 Hanya file yang ada yang disalin. Nomor rilis (FIRMWARE_VERSI di include/registers.h) ikut
 ditampilkan -- naikkan nomor itu sebelum build kalau ingin rilis baru mudah dibedakan.
 """

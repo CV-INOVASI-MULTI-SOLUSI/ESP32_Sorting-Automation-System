@@ -4,3 +4,7 @@
 # shebang "#!/usr/bin/env python3\r" membuat script Python tidak bisa dijalankan langsung.
 *.sh text eol=lf
 *.py text eol=lf
+
+# File firmware ESP32 hasil build (sorting_automation/firmware/*.bin) -- disimpan apa adanya,
+# tidak pernah diubah akhir barisnya.
+*.bin binary
